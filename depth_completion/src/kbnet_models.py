@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join('external_src', 'depth_completion', 'kbnet', 'sr
 from kbnet_model import KBNetModel as KBNet
 from posenet_model import PoseNetModel as PoseNet
 from outlier_removal import OutlierRemoval
+from utils.src import loss_utils
 
 
 class KBNetModel(object):
@@ -236,6 +237,52 @@ class KBNetModel(object):
             w_smoothness=w_smoothness)
 
         return loss, loss_info
+
+    def compute_loss_supervised(self,
+                                target_depth,
+                                output_depth,
+                                w_losses):
+        '''
+        Computes supervised log L1 loss for KBNet.
+
+        Arg(s):
+            target_depth : torch.Tensor[float32]
+                N x 1 x H x W ground-truth depth
+            output_depth : list[torch.Tensor[float32]]
+                list containing the N x 1 x H x W predicted depth
+            w_losses : dict[str, float]
+                dictionary containing optional w_supervised weight
+        Returns:
+            torch.Tensor[float32] : supervised loss
+            dict[str, torch.Tensor[float32]] : loss information
+        '''
+
+        output_depth = output_depth[0]
+
+        target_depth = torch.where(
+            target_depth > self.model_depth.max_predict_depth,
+            torch.full_like(
+                target_depth,
+                fill_value=self.model_depth.max_predict_depth),
+            target_depth)
+
+        validity_map = torch.where(
+            target_depth > 0.0,
+            torch.ones_like(target_depth),
+            torch.zeros_like(target_depth))
+
+        loss_log_l1 = loss_utils.log_l1_loss_func(
+            src=output_depth,
+            tgt=target_depth,
+            w=validity_map)
+
+        w_supervised = w_losses.get('w_supervised', 1.0)
+        loss = w_supervised * loss_log_l1
+
+        return loss, {
+            'loss': loss,
+            'loss_log_l1': loss_log_l1
+        }
 
     def parameters(self):
         '''
