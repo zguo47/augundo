@@ -218,7 +218,11 @@ def log_l1_loss_func(src, tgt, w, epsilon=EPSILON):
     '''
     src = torch.clamp(src, min=epsilon)
     tgt = torch.clamp(tgt, min=epsilon)
-    loss = w * torch.abs(torch.log(tgt) - torch.log(src))
+    loss = w * torch.log(torch.abs(src - tgt) + 1)
+    loss = torch.sum(loss, dim=[1, 2, 3])
+    n_elem = torch.sum(w, dim=[1, 2, 3])
+
+    loss = loss / (n_elem + epsilon)
 
     return torch.mean(loss)
 

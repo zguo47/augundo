@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/kitti/supervised/kitti_train_image.txt \
@@ -15,14 +15,14 @@ python depth_completion/src/train_depth_completion.py \
 --n_height 320 \
 --n_width 768 \
 --model_name kbnet_kitti \
---network_modules depth pose \
+--network_modules depth \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
---learning_rates 5e-5 1e-4 2e-4 1e-4 5e-5 \
---learning_schedule 2 8 30 45 60 \
+--learning_rates ${LR:-1e-3} \
+--learning_schedule 100 \
 --augmentation_probabilities 1.0 \
 --augmentation_schedule -1 \
 --augmentation_random_brightness 0.50 1.50 \
@@ -36,7 +36,7 @@ python depth_completion/src/train_depth_completion.py \
 --augmentation_random_crop_type horizontal bottom anchored \
 --augmentation_random_crop_to_shape -1 -1 -1 -1 \
 --augmentation_random_flip_type horizontal \
---augmentation_random_rotate_max 30 \
+--augmentation_random_rotate_max -1 \
 --augmentation_random_crop_and_pad 0.90 1.00 \
 --augmentation_random_resize_and_pad -1 -1 \
 --augmentation_random_resize_and_crop -1 -1 \
@@ -56,6 +56,8 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 5000 \
 --start_step_validation 100000 \
 --checkpoint_path \
-    trained_models/depth_completion/kbnet/kitti/kbnet_augundo \
+    trained_models/depth_completion/kbnet/kitti/supervised_lr_${LR:-1e-3} \
+--restore_paths \
+    trained_models/depth_completion/kbnet/kitti/supervised_lr_${LR:-1e-3}/checkpoints-5000/kbnet-5000.pth \
 --device gpu \
 --n_thread 8
