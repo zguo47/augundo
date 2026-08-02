@@ -14,7 +14,7 @@ python depth_completion/src/train_depth_completion.py \
 --n_batch 8 \
 --n_height 320 \
 --n_width 768 \
---model_name kbnet_kitti \
+--model_name dinov2_guided \
 --network_modules depth \
 --input_channels_image 3 \
 --input_channels_depth 2 \
@@ -56,6 +56,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/kbnet/kitti/supervised_lr_${LR:-1e-3} \
+    trained_models/depth_completion/dinov2_guided/kitti/supervised_lr_${LR:-1e-3} \
 --device gpu \
 --n_thread 8
