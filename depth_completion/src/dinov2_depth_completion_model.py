@@ -23,7 +23,7 @@ class DINOv2GuidedModel(object):
         network_modules = [] if network_modules is None else network_modules
 
         dinov2_model_name = 'dinov2_vits14'
-        dinov2_repository = 'facebookresearch/dinov2'
+        dinov2_repository = 'facebookresearch/dinov2:f896929'
 
         self.model_depth = DINOv2DepthCompletionModel(
             min_predict_depth=min_predict_depth,
@@ -116,7 +116,8 @@ class DINOv2GuidedModel(object):
         self.model_depth.to(device)
 
     def data_parallel(self):
-        self.model_depth.data_parallel()
+        if not isinstance(self.model_depth, nn.DataParallel):
+            self.model_depth = nn.DataParallel(self.model_depth)
 
     def _model_state_dict(self):
         if isinstance(self.model_depth, nn.DataParallel):
@@ -127,12 +128,28 @@ class DINOv2GuidedModel(object):
         '''
         Saves model checkpoint
         '''
-        self.model_depth.save_model(
-            checkpoint_path=model_depth_checkpoint_path,
-            step=step,
-            optimizer=optimizer_depth)
+        checkpoint = {
+            'train_step': step,
+            'model_state_dict': self._model_state_dict()
+        }
+
+        if optimizer is not None:
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+
+        torch.save(checkpoint, checkpoint_path)
 
     def restore_model(self, restore_path, optimizer=None):
-        train_step, optimizer_depth = self.model_depth.restore_model(
-            checkpoint_path=model_depth_restore_path,
-            optimizer=optimizer_depth)
+        checkpoint = torch.load(restore_path, map_location=self.device)
+        model = self.model_depth.module \
+            if isinstance(self.model_depth, nn.DataParallel) \
+            else self.model_depth
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as error:
+                warnings.warn(
+                    'Unable to restore optimizer state: {}'.format(error))
+
+        return checkpoint.get('train_step', 0), optimizer

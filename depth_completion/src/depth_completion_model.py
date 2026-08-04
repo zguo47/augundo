@@ -279,9 +279,10 @@ class DepthCompletionModel(object):
         '''
 
         if 'dinov2_guided' in self.model_name:
-            return self.model.restore_model(
-                model_depth_restore_path=restore_paths[0],
-                optimizer_depth=optimizer_depth)
+            train_step, optimizer_depth = self.model.restore_model(
+                restore_path=restore_paths[0],
+                optimizer=optimizer_depth)
+            return train_step, optimizer_depth, optimizer_pose
         elif 'kbnet' in self.model_name:
             return self.model.restore_model(
                 model_depth_restore_path=restore_paths[0],
