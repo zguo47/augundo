@@ -74,46 +74,13 @@ class DINOv2Encoder(nn.Module):
                 parameter.requires_grad = False
             self.model.eval()
 
-    def _reshape_tokens(self, feature, image_shape):
-        if isinstance(feature, tuple):
-            feature = feature[0]
-
-        if feature.ndim == 4:
-            return feature
-
-        patch_size = getattr(self.model, 'patch_size', 14)
-        if isinstance(patch_size, tuple):
-            patch_height, patch_width = patch_size
-        else:
-            patch_height = patch_width = patch_size
-
-        n_height = image_shape[-2] // patch_height
-        n_width = image_shape[-1] // patch_width
-
-        if feature.shape[1] == n_height * n_width + 1:
-            feature = feature[:, 1:, :]
-
-        if feature.shape[1] != n_height * n_width:
-            raise ValueError(
-                'Cannot reshape {} tokens into {} x {} patches'.format(
-                    feature.shape[1], n_height, n_width))
-
-        return feature.transpose(1, 2).reshape(
-            feature.shape[0],
-            feature.shape[2],
-            n_height,
-            n_width)
-
     def _forward(self, image):
-        try:
-            feature = self.model.get_intermediate_layers(
-                image,
-                n=1,
-                reshape=True)[0]
-        except TypeError:
-            feature = self.model.get_intermediate_layers(image, n=1)[0]
+        feature = self.model.get_intermediate_layers(
+            image,
+            n=1,
+            reshape=True)[0]
 
-        return self._reshape_tokens(feature, image.shape)
+        return feature
 
     def forward(self, image):
         # DINOv2 requires image dimensions to be divisible by its patch size.
@@ -149,10 +116,7 @@ class DINOv2Encoder(nn.Module):
 
 class ImageGuidedDensifier(nn.Module):
     '''
-    Densifies sparse metric corrections using RGB decoder guidance.
-
-    Sparse depth is treated only as a set of metric measurements. No learned
-    convolution is applied to sparse depth or its validity map.
+    Densifies sparse metric depth using RGB decoder guidance.
     '''
 
     OFFSETS = [

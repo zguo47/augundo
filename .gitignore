@@ -3,3 +3,6 @@ data
 training
 testing
 validation
+*.log
+trained_models
+depth_completion/src/__pycache__

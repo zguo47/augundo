@@ -116,12 +116,9 @@ class DINOv2GuidedModel(object):
         self.model_depth.to(device)
 
     def data_parallel(self):
-        if not isinstance(self.model_depth, nn.DataParallel):
-            self.model_depth = nn.DataParallel(self.model_depth)
+        self.model_depth = nn.DataParallel(self.model_depth)
 
     def _model_state_dict(self):
-        if isinstance(self.model_depth, nn.DataParallel):
-            return self.model_depth.module.state_dict()
         return self.model_depth.state_dict()
 
     def save_model(self, checkpoint_path, step, optimizer=None):
@@ -130,11 +127,9 @@ class DINOv2GuidedModel(object):
         '''
         checkpoint = {
             'train_step': step,
-            'model_state_dict': self._model_state_dict()
+            'model_state_dict': self._model_state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
         }
-
-        if optimizer is not None:
-            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
 
         torch.save(checkpoint, checkpoint_path)
 
@@ -144,12 +139,6 @@ class DINOv2GuidedModel(object):
             if isinstance(self.model_depth, nn.DataParallel) \
             else self.model_depth
         model.load_state_dict(checkpoint['model_state_dict'])
-
-        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except (ValueError, RuntimeError) as error:
-                warnings.warn(
-                    'Unable to restore optimizer state: {}'.format(error))
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         return checkpoint.get('train_step', 0), optimizer
