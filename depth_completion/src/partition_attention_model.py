@@ -76,52 +76,35 @@ class PartitionPyramid(nn.Module):
         return outputs
 
 
-class PartitionAttentionBlock(nn.Module):
-    '''Local fine-window attention followed by hierarchical cross-attention.'''
+class LocalPartitionAttentionBlock(nn.Module):
+    '''Local fine-window attention with full-resolution boundary refinement.'''
 
     def __init__(self,
                  n_channels,
                  n_head,
-                 n_scale=4,
                  max_local_tokens=32,
-                 max_context_tokens=16,
                  dropout=0.0):
-        super(PartitionAttentionBlock, self).__init__()
-
-        if n_channels % n_head != 0:
-            raise ValueError(
-                'n_channels ({}) must be divisible by n_head ({})'.format(
-                    n_channels, n_head))
+        super(LocalPartitionAttentionBlock, self).__init__()
 
         self.max_local_tokens = max_local_tokens
-        self.max_context_tokens = max_context_tokens
-
         self.local_norm = nn.LayerNorm(n_channels)
         self.local_attention = nn.MultiheadAttention(
             embed_dim=n_channels,
             num_heads=n_head,
             dropout=dropout,
             batch_first=True)
-
-        self.query_norm = nn.LayerNorm(n_channels)
-        self.context_norm = nn.LayerNorm(n_channels)
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=n_channels,
-            num_heads=n_head,
-            dropout=dropout,
-            batch_first=True)
-        self.scale_embedding = nn.Parameter(torch.zeros(
-            n_scale, 1, n_channels))
-
-        self.feedforward_norm = nn.LayerNorm(n_channels)
-        self.feedforward = nn.Sequential(
-            nn.Linear(n_channels, 4 * n_channels),
+        self.attention_gate = nn.Parameter(torch.tensor(0.1))
+        self.refinement_gate = nn.Parameter(torch.tensor(0.1))
+        self.boundary_refinement = nn.Sequential(
+            nn.GroupNorm(1, n_channels),
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=7,
+                padding=3,
+                groups=n_channels),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * n_channels, n_channels),
-            nn.Dropout(dropout))
-
-        nn.init.normal_(self.scale_embedding, std=0.02)
+            nn.Conv2d(n_channels, n_channels, kernel_size=1))
 
     @staticmethod
     def _to_windows(x, n_grid):
@@ -195,7 +178,9 @@ class PartitionAttentionBlock(nn.Module):
 
         return windows.flatten(2).transpose(1, 2)
 
-    def _local_forward(self, fine_windows, metadata):
+    def forward(self, fine_feature, fine_grid=8):
+        fine_windows, metadata = self._to_windows(
+            fine_feature, fine_grid)
         window_height, window_width = metadata[-2:]
         normalized_windows = self.local_norm(fine_windows)
         local_context = self._pool_windows(
@@ -208,74 +193,268 @@ class PartitionAttentionBlock(nn.Module):
             key=local_context,
             value=local_context,
             need_weights=False)
+        attended = self._from_windows(attended, metadata)
+        fine_feature = fine_feature + \
+            torch.tanh(self.attention_gate) * attended
 
-        return fine_windows + attended
+        # This convolution is evaluated after windows are reassembled, so it
+        # explicitly mixes features on opposite sides of every grid boundary.
+        return fine_feature + torch.tanh(self.refinement_gate) * \
+            self.boundary_refinement(fine_feature)
 
-    def _hierarchical_context(self, partitions, fine_grid):
-        context_by_scale = []
 
-        for scale_index, (scale, partition) in enumerate(zip(
-                PartitionPyramid.SCALES, partitions)):
-            context_grid = fine_grid // scale
-            context_windows, metadata = self._to_windows(
-                partition, context_grid)
-            window_height, window_width = metadata[-2:]
-            context_windows = self._pool_windows(
-                context_windows,
-                window_height,
-                window_width,
-                self.max_context_tokens)
+class FineToCoarseAttentionBlock(nn.Module):
+    '''Updates each coarse token from its corresponding 2 x 2 finer region.'''
 
-            n_batch = partition.shape[0]
-            n_token = context_windows.shape[1]
-            n_channel = context_windows.shape[2]
-            context_windows = context_windows.reshape(
-                n_batch,
-                context_grid,
-                context_grid,
-                n_token,
-                n_channel)
+    def __init__(self, n_channels, n_head, dropout=0.0):
+        super(FineToCoarseAttentionBlock, self).__init__()
 
-            # A coarse window is shared by each fine window whose image-space
-            # support lies inside it. At scale eight, the one coarse window is
-            # therefore shared by all 64 fine windows.
-            context_windows = context_windows.repeat_interleave(
-                scale, dim=1).repeat_interleave(scale, dim=2)
-            context_windows = context_windows.reshape(
-                n_batch * fine_grid * fine_grid,
-                n_token,
-                n_channel)
-            context_windows = context_windows + \
-                self.scale_embedding[scale_index]
-            context_by_scale.append(context_windows)
+        self.query_norm = nn.LayerNorm(n_channels)
+        self.context_norm = nn.LayerNorm(n_channels)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=n_channels,
+            num_heads=n_head,
+            dropout=dropout,
+            batch_first=True)
+        self.attention_gate = nn.Parameter(torch.tensor(0.1))
+        self.feedforward_gate = nn.Parameter(torch.tensor(0.1))
+        self.feedforward_norm = nn.LayerNorm(n_channels)
+        self.feedforward = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * n_channels, n_channels),
+            nn.Dropout(dropout))
 
-        return torch.cat(context_by_scale, dim=1)
+    def forward(self, fine_feature, coarse_feature):
+        n_batch, n_channel, fine_height, fine_width = fine_feature.shape
+        coarse_height, coarse_width = coarse_feature.shape[-2:]
 
-    def forward(self, fine_feature, partitions, fine_grid=8):
-        fine_windows, metadata = self._to_windows(
-            fine_feature, fine_grid)
-        fine_windows = self._local_forward(fine_windows, metadata)
+        if fine_height != 2 * coarse_height or \
+                fine_width != 2 * coarse_width:
+            raise ValueError(
+                'Fine and coarse features must differ by exactly 2x')
 
-        context = self._hierarchical_context(partitions, fine_grid)
-        attended, _ = self.cross_attention(
-            query=self.query_norm(fine_windows),
+        # Each coarse query reads the four finer tokens with the same image
+        # support. Repeating this at every level forms the bottom-up path.
+        fine_context = functional.unfold(
+            fine_feature,
+            kernel_size=2,
+            stride=2)
+        fine_context = fine_context.reshape(
+            n_batch, n_channel, 4, coarse_height * coarse_width)
+        fine_context = fine_context.permute(0, 3, 2, 1).reshape(
+            n_batch * coarse_height * coarse_width, 4, n_channel)
+        coarse_queries = coarse_feature.flatten(2).transpose(1, 2).reshape(
+            n_batch * coarse_height * coarse_width, 1, n_channel)
+
+        attended, _ = self.attention(
+            query=self.query_norm(coarse_queries),
+            key=self.context_norm(fine_context),
+            value=self.context_norm(fine_context),
+            need_weights=False)
+        coarse_queries = coarse_queries + \
+            torch.tanh(self.attention_gate) * attended
+        coarse_queries = coarse_queries + \
+            torch.tanh(self.feedforward_gate) * self.feedforward(
+                self.feedforward_norm(coarse_queries))
+
+        return coarse_queries.reshape(
+            n_batch,
+            coarse_height * coarse_width,
+            n_channel).transpose(1, 2).reshape(
+                n_batch, n_channel, coarse_height, coarse_width)
+
+
+class GlobalPartitionAttentionBlock(nn.Module):
+    '''Global attention over the complete 1/8-resolution feature map.'''
+
+    def __init__(self,
+                 n_channels,
+                 n_head,
+                 max_global_tokens=256,
+                 dropout=0.0):
+        super(GlobalPartitionAttentionBlock, self).__init__()
+
+        self.max_global_tokens = max_global_tokens
+        self.query_norm = nn.LayerNorm(n_channels)
+        self.context_norm = nn.LayerNorm(n_channels)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=n_channels,
+            num_heads=n_head,
+            dropout=dropout,
+            batch_first=True)
+        self.attention_gate = nn.Parameter(torch.tensor(0.1))
+        self.feedforward_gate = nn.Parameter(torch.tensor(0.1))
+        self.feedforward_norm = nn.LayerNorm(n_channels)
+        self.feedforward = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * n_channels, n_channels),
+            nn.Dropout(dropout))
+
+    def _global_context(self, feature):
+        n_height, n_width = feature.shape[-2:]
+        if n_height * n_width <= self.max_global_tokens:
+            return feature.flatten(2).transpose(1, 2)
+
+        target_height = max(1, min(
+            n_height,
+            int(math.sqrt(
+                self.max_global_tokens * n_height / float(n_width)))))
+        target_width = max(1, min(
+            n_width,
+            self.max_global_tokens // target_height))
+        context = functional.adaptive_avg_pool2d(
+            feature,
+            output_size=(target_height, target_width))
+
+        return context.flatten(2).transpose(1, 2)
+
+    def forward(self, feature):
+        n_batch, n_channel, n_height, n_width = feature.shape
+        queries = feature.flatten(2).transpose(1, 2)
+        context = self._global_context(feature)
+        attended, _ = self.attention(
+            query=self.query_norm(queries),
             key=self.context_norm(context),
             value=self.context_norm(context),
             need_weights=False)
-        fine_windows = fine_windows + attended
-        fine_windows = fine_windows + self.feedforward(
-            self.feedforward_norm(fine_windows))
+        queries = queries + torch.tanh(self.attention_gate) * attended
+        queries = queries + torch.tanh(self.feedforward_gate) * \
+            self.feedforward(self.feedforward_norm(queries))
 
-        return self._from_windows(fine_windows, metadata)
+        return queries.transpose(1, 2).reshape(
+            n_batch, n_channel, n_height, n_width)
+
+
+class CoarseToFineAttentionBlock(nn.Module):
+    '''Top-down attention using overlapping 3 x 3 coarse neighborhoods.'''
+
+    def __init__(self,
+                 n_channels,
+                 n_head,
+                 max_groups_per_chunk=4096,
+                 dropout=0.0):
+        super(CoarseToFineAttentionBlock, self).__init__()
+
+        self.max_groups_per_chunk = max_groups_per_chunk
+        self.query_norm = nn.LayerNorm(n_channels)
+        self.context_norm = nn.LayerNorm(n_channels)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=n_channels,
+            num_heads=n_head,
+            dropout=dropout,
+            batch_first=True)
+        self.attention_gate = nn.Parameter(torch.tensor(0.1))
+        self.refinement_gate = nn.Parameter(torch.tensor(0.1))
+        self.context_refinement = nn.Sequential(
+            nn.GroupNorm(1, n_channels),
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                padding=1,
+                groups=n_channels),
+            nn.GELU(),
+            nn.Conv2d(n_channels, n_channels, kernel_size=1))
+
+    def forward(self, fine_feature, coarse_feature):
+        n_batch, n_channel, fine_height, fine_width = fine_feature.shape
+        coarse_height, coarse_width = coarse_feature.shape[-2:]
+
+        if fine_height != 2 * coarse_height or \
+                fine_width != 2 * coarse_width:
+            raise ValueError(
+                'Fine and coarse features must differ by exactly 2x')
+
+        # Four fine queries share a coarse center, but each reads an overlapping
+        # 3 x 3 neighborhood. Adjacent groups therefore share most context
+        # instead of receiving a blockwise-constant replicated feature.
+        fine_queries = fine_feature.reshape(
+            n_batch,
+            n_channel,
+            coarse_height,
+            2,
+            coarse_width,
+            2)
+        fine_queries = fine_queries.permute(0, 2, 4, 3, 5, 1).reshape(
+            n_batch, coarse_height * coarse_width, 4, n_channel)
+
+        # Construct and attend to neighborhoods in chunks. This avoids
+        # materializing a full H/2 x W/2 x 9 x C unfolded tensor at the
+        # highest-resolution top-down stage.
+        padded_coarse = functional.pad(
+            coarse_feature,
+            pad=(1, 1, 1, 1),
+            mode='replicate').permute(0, 2, 3, 1)
+        offset_y = torch.tensor(
+            [-1, -1, -1, 0, 0, 0, 1, 1, 1],
+            device=coarse_feature.device)
+        offset_x = torch.tensor(
+            [-1, 0, 1, -1, 0, 1, -1, 0, 1],
+            device=coarse_feature.device)
+        n_group = coarse_height * coarse_width
+        attended_chunks = []
+
+        for start in range(0, n_group, self.max_groups_per_chunk):
+            end = min(start + self.max_groups_per_chunk, n_group)
+            position = torch.arange(start, end, device=coarse_feature.device)
+            center_y = position // coarse_width + 1
+            center_x = position % coarse_width + 1
+            neighbor_y = center_y.unsqueeze(1) + offset_y.unsqueeze(0)
+            neighbor_x = center_x.unsqueeze(1) + offset_x.unsqueeze(0)
+            coarse_context = padded_coarse[
+                :, neighbor_y, neighbor_x, :]
+
+            query_chunk = fine_queries[:, start:end, ...]
+            n_chunk = end - start
+            query_chunk = query_chunk.reshape(
+                n_batch * n_chunk, 4, n_channel)
+            coarse_context = coarse_context.reshape(
+                n_batch * n_chunk, 9, n_channel)
+            normalized_context = self.context_norm(coarse_context)
+            attended, _ = self.attention(
+                query=self.query_norm(query_chunk),
+                key=normalized_context,
+                value=normalized_context,
+                need_weights=False)
+            attended_chunks.append(attended.reshape(
+                n_batch, n_chunk, 4, n_channel))
+
+        attended = torch.cat(attended_chunks, dim=1).reshape(
+            n_batch,
+            coarse_height,
+            coarse_width,
+            2,
+            2,
+            n_channel)
+        attended = attended.permute(0, 5, 1, 3, 2, 4).reshape(
+            n_batch, n_channel, fine_height, fine_width)
+
+        smooth_context = functional.interpolate(
+            coarse_feature,
+            size=(fine_height, fine_width),
+            mode='bilinear',
+            align_corners=False)
+        context_update = self.context_refinement(
+            attended + smooth_context)
+
+        # The original-resolution feature is always the identity path. Coarse
+        # context is an explicitly gated residual, never a replacement.
+        return fine_feature + torch.tanh(self.attention_gate) * attended + \
+            torch.tanh(self.refinement_gate) * context_update
 
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
     RGB-only dense depth model with local and hierarchical partition attention.
 
-    Dense queries stay at image resolution. Keys and values are adaptively
-    pooled within their spatial windows to bound attention memory while keeping
-    the correspondence between fine and coarse image regions exact.
+    A full-resolution identity path retains spatial detail. A bidirectional
+    attention pyramid carries information down to a globally communicating
+    1/8 map and back through overlapping top-down neighborhoods. Global keys
+    and values are pooled to bound memory without compressing the output path.
     '''
 
     def __init__(self,
@@ -286,7 +465,7 @@ class PartitionAttentionDepthModel(nn.Module):
                  n_head=4,
                  n_attention_block=1,
                  max_local_tokens=32,
-                 max_context_tokens=16):
+                 max_global_tokens=256):
         super(PartitionAttentionDepthModel, self).__init__()
 
         if min_predict_depth <= 0.0:
@@ -312,15 +491,40 @@ class PartitionAttentionDepthModel(nn.Module):
                 groups=n_channels)
             for _ in PartitionPyramid.SCALES
         ])
-        self.attention_blocks = nn.ModuleList([
-            PartitionAttentionBlock(
+        self.local_attention_blocks = nn.ModuleList([
+            LocalPartitionAttentionBlock(
                 n_channels=n_channels,
                 n_head=n_head,
-                n_scale=len(PartitionPyramid.SCALES),
-                max_local_tokens=max_local_tokens,
-                max_context_tokens=max_context_tokens)
+                max_local_tokens=max_local_tokens)
             for _ in range(n_attention_block)
         ])
+        self.fine_to_coarse_blocks = nn.ModuleList([
+            FineToCoarseAttentionBlock(
+                n_channels=n_channels,
+                n_head=n_head)
+            for _ in range(len(PartitionPyramid.SCALES) - 1)
+        ])
+        self.global_attention = GlobalPartitionAttentionBlock(
+            n_channels=n_channels,
+            n_head=n_head,
+            max_global_tokens=max_global_tokens)
+        self.coarse_to_fine_blocks = nn.ModuleList([
+            CoarseToFineAttentionBlock(
+                n_channels=n_channels,
+                n_head=n_head)
+            for _ in range(len(PartitionPyramid.SCALES) - 1)
+        ])
+        self.detail_refinement = nn.Sequential(
+            nn.GroupNorm(1, n_channels),
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=5,
+                padding=2,
+                groups=n_channels),
+            nn.GELU(),
+            nn.Conv2d(n_channels, n_channels, kernel_size=1))
+        self.detail_refinement_gate = nn.Parameter(torch.tensor(0.1))
         self.depth_head = nn.Sequential(
             nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1),
             nn.GELU(),
@@ -371,13 +575,40 @@ class PartitionAttentionDepthModel(nn.Module):
 
         original_shape = image.shape[-2:]
         partitions = self.extract_partitions(image)
-        fine_feature = partitions[0]
 
-        for attention_block in self.attention_blocks:
-            fine_feature = attention_block(
+        # Retain the original-resolution feature as an identity detail path.
+        fine_feature = partitions[0]
+        for local_attention_block in self.local_attention_blocks:
+            fine_feature = local_attention_block(
                 fine_feature=fine_feature,
-                partitions=partitions,
                 fine_grid=self.fine_grid)
+
+        # Bottom-up communication: every coarser feature is updated from the
+        # already-updated finer representation below it.
+        hierarchy = [fine_feature]
+        for fine_to_coarse_block, coarse_partition in zip(
+                self.fine_to_coarse_blocks, partitions[1:]):
+            hierarchy.append(fine_to_coarse_block(
+                fine_feature=hierarchy[-1],
+                coarse_feature=coarse_partition))
+
+        # The entire 1/8 map communicates globally before information returns
+        # through the top-down path.
+        hierarchy[-1] = self.global_attention(hierarchy[-1])
+
+        # Top-down communication uses overlapping neighborhoods plus bilinear
+        # context, avoiding the previous blockwise repeat_interleave mapping.
+        coarse_feature = hierarchy[-1]
+        for coarse_to_fine_block, level in zip(
+                self.coarse_to_fine_blocks,
+                range(len(hierarchy) - 2, -1, -1)):
+            coarse_feature = coarse_to_fine_block(
+                fine_feature=hierarchy[level],
+                coarse_feature=coarse_feature)
+
+        fine_feature = coarse_feature + \
+            torch.tanh(self.detail_refinement_gate) * \
+            self.detail_refinement(coarse_feature)
 
         raw_depth = self.depth_head(fine_feature)
         normalized_log_depth = torch.sigmoid(raw_depth)

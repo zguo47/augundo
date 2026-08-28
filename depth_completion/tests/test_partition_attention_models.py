@@ -41,7 +41,7 @@ class PartitionAttentionModelTest(unittest.TestCase):
                 n_channels=16,
                 n_head=4,
                 max_local_tokens=8,
-                max_context_tokens=4)
+                max_global_tokens=16)
             partitions = model.extract_partitions(image)
 
             self.assertEqual(
@@ -130,6 +130,25 @@ class PartitionAttentionModelTest(unittest.TestCase):
             torch.isfinite(gradient).all()
             for gradient in gradients
         ]))
+
+        model_depth = model.model.model_depth
+        communication_modules = [
+            model_depth.fine_to_coarse_blocks,
+            [model_depth.global_attention],
+            model_depth.coarse_to_fine_blocks
+        ]
+        for modules in communication_modules:
+            module_gradients = [
+                parameter.grad
+                for module in modules
+                for parameter in module.parameters()
+                if parameter.grad is not None
+            ]
+            self.assertGreater(len(module_gradients), 0)
+            self.assertGreater(sum([
+                torch.sum(torch.abs(gradient)).item()
+                for gradient in module_gradients
+            ]), 0.0)
 
         optimizer = torch.optim.Adam(model.parameters_depth(), lr=1e-4)
         with tempfile.TemporaryDirectory() as directory:
