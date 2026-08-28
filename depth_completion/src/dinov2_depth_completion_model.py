@@ -61,12 +61,13 @@ class DINOv2GuidedModel(object):
             torch.Tensor[float32] : N x 1 x H x W dense depth map
         '''
 
-        output_depth = self.model_depth.forward(
+        output_depth, prior_depth = self.model_depth.forward(
             image=image,
             sparse_depth=sparse_depth,
             validity_map=validity_map)
 
-        return [output_depth] if return_all_outputs else output_depth
+        return [output_depth, prior_depth] \
+            if return_all_outputs else output_depth
 
     def compute_loss_supervised(self, 
                                 target_depth, 
@@ -75,7 +76,8 @@ class DINOv2GuidedModel(object):
         '''
         Computes supervised loss
         '''
-        output_depth = output_depth[0]
+        final_depth = output_depth[0]
+        prior_depth = output_depth[1]
         validity = torch.logical_and(
             torch.isfinite(target_depth),
             target_depth > 0.0).to(target_depth.dtype)
@@ -88,15 +90,22 @@ class DINOv2GuidedModel(object):
             torch.full_like(target_depth, self.min_predict_depth))
 
         loss_log_l1 = loss_utils.log_l1_loss_func(
-            src=output_depth,
+            src=final_depth,
             tgt=target_depth,
             w=validity)
+        loss_prior = loss_utils.log_l1_loss_func(
+            src=prior_depth,
+            tgt=target_depth,
+            w=validity)
+
         w_supervised = w_losses.get('w_supervised', 1.0)
-        loss = w_supervised * loss_log_l1
+        w_prior = w_losses.get('w_prior', 0.5)
+        loss = w_supervised * (loss_log_l1 + w_prior * loss_prior)
 
         return loss, {
             'loss': loss,
-            'loss_log_l1': loss_log_l1
+            'loss_log_l1': loss_log_l1,
+            'loss_prior': loss_prior
         }
 
     def parameters(self):
@@ -116,9 +125,12 @@ class DINOv2GuidedModel(object):
         self.model_depth.to(device)
 
     def data_parallel(self):
-        self.model_depth = nn.DataParallel(self.model_depth)
+        if not isinstance(self.model_depth, nn.DataParallel):
+            self.model_depth = nn.DataParallel(self.model_depth)
 
     def _model_state_dict(self):
+        if isinstance(self.model_depth, nn.DataParallel):
+            return self.model_depth.module.state_dict()
         return self.model_depth.state_dict()
 
     def save_model(self, checkpoint_path, step, optimizer=None):
@@ -127,9 +139,11 @@ class DINOv2GuidedModel(object):
         '''
         checkpoint = {
             'train_step': step,
-            'model_state_dict': self._model_state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
+            'model_state_dict': self._model_state_dict()
         }
+
+        if optimizer is not None:
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
 
         torch.save(checkpoint, checkpoint_path)
 
@@ -139,6 +153,12 @@ class DINOv2GuidedModel(object):
             if isinstance(self.model_depth, nn.DataParallel) \
             else self.model_depth
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as error:
+                warnings.warn(
+                    'Unable to restore optimizer state: {}'.format(error))
 
         return checkpoint.get('train_step', 0), optimizer

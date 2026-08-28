@@ -16,30 +16,6 @@ import net_utils
 EPSILON = 1e-8
 
 
-def shift_tensor(x, offset_y, offset_x):
-    '''
-    Shifts tensor spatially and fills locations outside of the image with zero
-    '''
-
-    n_height, n_width = x.shape[-2:]
-    padding_y = abs(offset_y)
-    padding_x = abs(offset_x)
-
-    x = functional.pad(
-        x,
-        pad=(padding_x, padding_x, padding_y, padding_y),
-        mode='constant',
-        value=0.0)
-
-    start_y = padding_y + offset_y
-    start_x = padding_x + offset_x
-
-    return x[
-        ...,
-        start_y:start_y + n_height,
-        start_x:start_x + n_width]
-
-
 class DINOv2Encoder(nn.Module):
     '''Wrapper around the official DINOv2 Torch Hub backbone.'''
 
@@ -114,189 +90,119 @@ class DINOv2Encoder(nn.Module):
         return self
 
 
-class ImageGuidedDensifier(nn.Module):
+class LeastSquaresScaleAlignment(nn.Module):
     '''
-    Densifies sparse metric depth using RGB decoder guidance.
-    '''
+    Aligns an RGB-only depth prior to valid sparse metric measurements.
 
-    OFFSETS = [
-        (-1, -1), (-1, 0), (-1, 1),
-        (0, -1),           (0, 1),
-        (1, -1),  (1, 0),  (1, 1)
-    ]
+    Scale-inconsistent points are rejected using the median log scale ratio,
+    and the remaining points are used in a least-squares scale fit.
+    '''
 
     def __init__(self,
                  min_predict_depth,
                  max_predict_depth,
-                 propagation_scale=4,
-                 propagation_dilations=[1, 2, 4, 8, 16, 32],
-                 affinity_temperature=0.5):
-        super(ImageGuidedDensifier, self).__init__()
+                 min_scale=0.1,
+                 max_scale=10.0,
+                 max_scale_ratio=1.5,
+                 min_valid_points=3):
+        super(LeastSquaresScaleAlignment, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
-        self.propagation_scale = propagation_scale
-        self.propagation_dilations = propagation_dilations
-        self.affinity_temperature = affinity_temperature
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.max_log_scale_difference = float(torch.log(
+            torch.tensor(max_scale_ratio)))
+        self.min_valid_points = min_valid_points
 
-    def _propagate_once(self,
-                        correction,
-                        confidence,
-                        guidance,
-                        dilation):
-        ones = torch.ones_like(confidence)
+    def _validity_map(self, prior_depth, sparse_depth, validity_map):
+        validity_map = torch.logical_and(validity_map > 0.0, torch.logical_and(
+            torch.isfinite(sparse_depth),
+            torch.isfinite(prior_depth)))
+        validity_map = torch.logical_and(validity_map, torch.logical_and(
+            sparse_depth >= self.min_predict_depth,
+            sparse_depth <= self.max_predict_depth))
+        validity_map = torch.logical_and(validity_map, prior_depth > 0.0)
 
-        numerator = confidence * correction
-        denominator = confidence
-        confidence_numerator = confidence
-        affinity_denominator = ones
+        return validity_map
 
-        for offset_y, offset_x in self.OFFSETS:
-            offset_y = offset_y * dilation
-            offset_x = offset_x * dilation
+    def _robust_weights(self, prior_depth, sparse_depth, validity_map):
+        '''Rejects points whose scale ratios disagree with the valid majority.'''
 
-            neighbor_guidance = shift_tensor(
-                guidance,
-                offset_y,
-                offset_x)
-            neighbor_correction = shift_tensor(
-                correction,
-                offset_y,
-                offset_x)
-            neighbor_confidence = shift_tensor(
-                confidence,
-                offset_y,
-                offset_x)
-            neighbor_in_bounds = shift_tensor(
-                ones,
-                offset_y,
-                offset_x)
+        weights = torch.zeros_like(prior_depth)
+        scale_ratio = sparse_depth / torch.clamp(prior_depth, min=EPSILON)
+        log_scale_ratio = torch.log(torch.clamp(scale_ratio, min=EPSILON))
 
-            similarity = torch.sum(
-                guidance * neighbor_guidance,
-                dim=1,
-                keepdim=True)
-            affinity = torch.exp(
-                (similarity - 1.0) / self.affinity_temperature)
-            affinity = affinity * neighbor_in_bounds
+        # Each sample can contain a different number of valid sparse points.
+        # Point selection does not need gradients; the least-squares fit below
+        # remains differentiable with respect to the selected prior depths.
+        with torch.no_grad():
+            for batch_index in range(prior_depth.shape[0]):
+                valid = validity_map[batch_index]
 
-            weight = affinity * neighbor_confidence
-            numerator = numerator + weight * neighbor_correction
-            denominator = denominator + weight
-            confidence_numerator = \
-                confidence_numerator + affinity * neighbor_confidence
-            affinity_denominator = affinity_denominator + affinity
+                if torch.sum(valid).item() < self.min_valid_points:
+                    continue
 
-        correction = numerator / (denominator + EPSILON)
-        confidence = confidence_numerator / (affinity_denominator + EPSILON)
-        confidence = torch.clamp(confidence, min=0.0, max=1.0)
+                valid_log_scale_ratio = log_scale_ratio[batch_index][valid]
+                median_log_scale_ratio = torch.median(valid_log_scale_ratio)
+                inlier = torch.abs(
+                    log_scale_ratio[batch_index] -
+                    median_log_scale_ratio) <= self.max_log_scale_difference
+                weights[batch_index] = torch.logical_and(
+                    valid,
+                    inlier).to(prior_depth.dtype)
 
-        return correction, confidence
+        return weights
 
-    def forward(self,
-                prior_depth,
-                guidance,
-                sparse_depth,
-                validity_map):
-        validity_map = torch.logical_and(
-            validity_map > 0.0,
-            sparse_depth > 0.0).to(sparse_depth.dtype)
+    def forward(self, prior_depth, sparse_depth, validity_map):
+        validity_map = self._validity_map(
+            prior_depth=prior_depth,
+            sparse_depth=sparse_depth,
+            validity_map=validity_map)
         sparse_depth = torch.where(
-            validity_map > 0.0,
-            torch.clamp(
-                sparse_depth,
-                min=self.min_predict_depth,
-                max=self.max_predict_depth),
+            validity_map,
+            sparse_depth,
             torch.zeros_like(sparse_depth))
 
-        log_prior = torch.log(torch.clamp(prior_depth, min=EPSILON))
-        log_sparse_depth = torch.log(torch.clamp(
-            sparse_depth,
-            min=self.min_predict_depth))
+        weights = self._robust_weights(
+            prior_depth=prior_depth,
+            sparse_depth=sparse_depth,
+            validity_map=validity_map)
 
-        # Align the RGB-only prior to the global metric scale of sparse depth.
-        n_valid = torch.sum(validity_map, dim=[1, 2, 3], keepdim=True)
-        log_scale = torch.sum(
-            validity_map * (log_sparse_depth - log_prior),
+        numerator = torch.sum(
+            weights * prior_depth * sparse_depth,
             dim=[1, 2, 3],
-            keepdim=True) / (n_valid + EPSILON)
-        aligned_log_prior = log_prior + log_scale
+            keepdim=True)
+        denominator = torch.sum(
+            weights * prior_depth * prior_depth,
+            dim=[1, 2, 3],
+            keepdim=True)
+        n_inlier = torch.sum(weights, dim=[1, 2, 3], keepdim=True)
 
-        residual = validity_map * (
-            log_sparse_depth - aligned_log_prior)
+        scale = numerator / (denominator + EPSILON)
+        scale = torch.clamp(
+            scale,
+            min=self.min_scale,
+            max=self.max_scale)
+        scale = torch.where(
+            n_inlier >= self.min_valid_points,
+            scale,
+            torch.ones_like(scale))
 
-        propagation_shape = (
-            max(1, prior_depth.shape[-2] // self.propagation_scale),
-            max(1, prior_depth.shape[-1] // self.propagation_scale))
+        output_depth = torch.clamp(
+            scale * prior_depth,
+            min=self.min_predict_depth,
+            max=self.max_predict_depth)
 
-        pooled_validity = functional.adaptive_avg_pool2d(
-            validity_map,
-            propagation_shape)
-        pooled_residual = functional.adaptive_avg_pool2d(
-            residual,
-            propagation_shape) / (pooled_validity + EPSILON)
-        pooled_validity = (pooled_validity > 0.0).to(prior_depth.dtype)
-        pooled_residual = pooled_residual * pooled_validity
-
-        guidance = functional.interpolate(
-            guidance,
-            size=propagation_shape,
-            mode='bilinear',
-            align_corners=False)
-        guidance = functional.normalize(
-            guidance,
-            p=2,
-            dim=1,
-            eps=EPSILON)
-
-        correction = pooled_residual
-        confidence = pooled_validity
-
-        for dilation in self.propagation_dilations:
-            correction, confidence = self._propagate_once(
-                correction=correction,
-                confidence=confidence,
-                guidance=guidance,
-                dilation=dilation)
-
-            correction = pooled_validity * pooled_residual + \
-                (1.0 - pooled_validity) * correction
-            confidence = torch.maximum(confidence, pooled_validity)
-
-        correction = functional.interpolate(
-            confidence * correction,
-            size=prior_depth.shape[-2:],
-            mode='bilinear',
-            align_corners=False)
-
-        log_min_depth = torch.log(torch.tensor(
-            self.min_predict_depth,
-            dtype=prior_depth.dtype,
-            device=prior_depth.device))
-        log_max_depth = torch.log(torch.tensor(
-            self.max_predict_depth,
-            dtype=prior_depth.dtype,
-            device=prior_depth.device))
-
-        output_depth = torch.exp(torch.clamp(
-            aligned_log_prior + correction,
-            min=log_min_depth,
-            max=log_max_depth))
-
-        # Preserve reliable metric measurements exactly at their locations.
-        output_depth = validity_map * sparse_depth + \
-            (1.0 - validity_map) * output_depth
-
-        return output_depth
+        return output_depth, scale, weights
 
 
 class DINOv2DepthCompletionModel(nn.Module):
     '''
-    RGB-only encoder-decoder followed by image-guided sparse densification.
+    RGB-only encoder-decoder followed by robust metric scale alignment.
 
     DINOv2 and the decoder process RGB features only. Sparse depth is introduced
-    after the decoder as metric measurements for scale alignment and residual
-    propagation.
+    after the decoder and is used only to fit a global multiplicative scale.
     '''
 
     def __init__(self,
@@ -304,13 +210,11 @@ class DINOv2DepthCompletionModel(nn.Module):
                  max_predict_depth=100.0,
                  dinov2_model_name='dinov2_vits14',
                  dinov2_repository='facebookresearch/dinov2:f896929',
-                 freeze_dinov2=True,
-                 n_guidance=8):
+                 freeze_dinov2=True):
         super(DINOv2DepthCompletionModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
-        self.n_guidance = n_guidance
 
         self.encoder = DINOv2Encoder(
             model_name=dinov2_model_name,
@@ -331,7 +235,7 @@ class DINOv2DepthCompletionModel(nn.Module):
         # All latent and skip features below are derived from RGB only.
         self.decoder = networks.MultiScaleDecoder(
             input_channels=256,
-            output_channels=1 + n_guidance,
+            output_channels=1,
             n_resolution=1,
             n_filters=[128, 64, 32, 16],
             n_skips=[64 + 3, 32 + 3, 16 + 3, 3],
@@ -341,7 +245,7 @@ class DINOv2DepthCompletionModel(nn.Module):
             use_batch_norm=False,
             deconv_type='up')
 
-        self.densifier = ImageGuidedDensifier(
+        self.scale_alignment = LeastSquaresScaleAlignment(
             min_predict_depth=min_predict_depth,
             max_predict_depth=max_predict_depth)
 
@@ -402,21 +306,19 @@ class DINOv2DepthCompletionModel(nn.Module):
         ]
 
         output = self.decoder(latent, skips, shape=shape)[-1]
-        raw_depth = output[:, 0:1, ...]
-        guidance = output[:, 1:1 + self.n_guidance, ...]
-
-        raw_depth = torch.sigmoid(raw_depth)
+        raw_depth = torch.sigmoid(output)
         prior_depth = self.min_predict_depth / (
             raw_depth + self.min_predict_depth / self.max_predict_depth)
 
-        return prior_depth, guidance
+        return prior_depth
 
     def forward(self, image, sparse_depth, validity_map):
         # The complete encoder-decoder pass occurs before sparse depth is used.
-        prior_depth, guidance = self.forward_image(image)
+        prior_depth = self.forward_image(image)
 
-        return self.densifier(
+        output_depth, _, _ = self.scale_alignment(
             prior_depth=prior_depth,
-            guidance=guidance,
             sparse_depth=sparse_depth,
             validity_map=validity_map)
+
+        return output_depth, prior_depth

@@ -70,18 +70,16 @@ class DINOv2GuidedModelTest(unittest.TestCase):
         sparse_depth = torch.zeros(1, 1, 55, 83)
         sparse_depth[:, :, 10, 12] = 8.0
         sparse_depth[:, :, 35, 60] = 32.0
+        sparse_depth[:, :, 22, 40] = 18.0
         validity = (sparse_depth > 0.0).float()
         ground_truth = 2.0 + 40.0 * torch.rand(1, 1, 55, 83)
 
-        # The encoder-decoder accepts RGB only and produces the dense image
-        # prior and guidance before sparse depth is introduced.
+        # The encoder-decoder accepts RGB only and produces one dense prior
+        # before sparse depth is introduced for global scale alignment.
         model_depth = model.model.model_depth
-        prior_depth, guidance = model_depth.forward_image(image)
+        prior_depth = model_depth.forward_image(image)
 
         self.assertEqual(prior_depth.shape, sparse_depth.shape)
-        self.assertEqual(guidance.shape[0], image.shape[0])
-        self.assertEqual(guidance.shape[1], model_depth.n_guidance)
-        self.assertEqual(guidance.shape[-2:], image.shape[-2:])
 
         decoder_inputs = {}
 
@@ -104,14 +102,36 @@ class DINOv2GuidedModelTest(unittest.TestCase):
 
         hook.remove()
 
-        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(outputs), 2)
         self.assertEqual(outputs[0].shape, sparse_depth.shape)
+        self.assertEqual(outputs[1].shape, sparse_depth.shape)
         self.assertTrue(torch.isfinite(outputs[0]).all())
+        self.assertTrue(torch.isfinite(outputs[1]).all())
         self.assertEqual(decoder_inputs['latent_channels'], 256)
         self.assertEqual(decoder_inputs['skip_channels'], [3, 19, 35, 67])
+
+        # Robust least squares recovers the common scale and rejects a noisy
+        # but otherwise valid sparse measurement.
+        test_prior = torch.tensor([[[[2.0, 3.0, 4.0, 5.0]]]])
+        test_sparse = torch.tensor([[[[4.0, 6.0, 8.0, 50.0]]]])
+        test_validity = torch.ones_like(test_sparse)
+        aligned_depth, scale, scale_weights = model_depth.scale_alignment(
+            prior_depth=test_prior,
+            sparse_depth=test_sparse,
+            validity_map=test_validity)
+
         self.assertTrue(torch.allclose(
-            outputs[0][validity.bool()],
-            sparse_depth[validity.bool()]))
+            scale,
+            torch.tensor([[[[2.0]]]]),
+            atol=1e-5))
+        self.assertEqual(scale_weights[0, 0, 0, 3].item(), 0.0)
+        self.assertTrue(torch.allclose(
+            aligned_depth,
+            2.0 * test_prior,
+            atol=1e-5))
+        self.assertNotEqual(
+            aligned_depth[0, 0, 0, 3].item(),
+            test_sparse[0, 0, 0, 3].item())
 
         loss, loss_info = model.compute_loss(
             image0=image,
@@ -129,6 +149,7 @@ class DINOv2GuidedModelTest(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
         self.assertIn('loss_log_l1', loss_info)
+        self.assertIn('loss_prior', loss_info)
 
         loss.backward()
         trainable_gradients = [
@@ -141,11 +162,9 @@ class DINOv2GuidedModelTest(unittest.TestCase):
             torch.isfinite(gradient).all()
             for gradient in trainable_gradients
         ]))
-        guidance_gradient = \
-            model_depth.decoder.output0.conv.weight.grad[1:, ...]
-        self.assertGreater(
-            torch.sum(torch.abs(guidance_gradient)).item(),
-            0.0)
+        self.assertEqual(
+            model_depth.decoder.output0.conv.weight.shape[0],
+            1)
 
         optimizer = torch.optim.Adam(model.parameters_depth(), lr=1e-4)
 

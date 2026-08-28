@@ -46,7 +46,17 @@ class DepthCompletionModel(object):
         else:
             dataset_name = 'kitti'
 
-        if 'dinov2_guided' in model_name:
+        if 'partition_attention' in model_name:
+            from partition_attention_depth_completion_model import \
+                PartitionAttentionDepthCompletionModel
+
+            self.model = PartitionAttentionDepthCompletionModel(
+                dataset_name=dataset_name,
+                network_modules=network_modules,
+                min_predict_depth=min_predict_depth,
+                max_predict_depth=max_predict_depth,
+                device=device)
+        elif 'dinov2_guided' in model_name:
             from dinov2_depth_completion_model import DINOv2GuidedModel
 
             self.model = DINOv2GuidedModel(
@@ -278,10 +288,12 @@ class DepthCompletionModel(object):
             torch.optimizer : optimizer for pose or None if no optimizer is passed in
         '''
 
-        if 'dinov2_guided' in self.model_name:
-            return self.model.restore_model(
-                model_depth_restore_path=restore_paths[0],
-                optimizer_depth=optimizer_depth)
+        if 'partition_attention' in self.model_name or \
+                'dinov2_guided' in self.model_name:
+            train_step, optimizer_depth = self.model.restore_model(
+                restore_path=restore_paths[0],
+                optimizer=optimizer_depth)
+            return train_step, optimizer_depth, optimizer_pose
         elif 'kbnet' in self.model_name:
             return self.model.restore_model(
                 model_depth_restore_path=restore_paths[0],
@@ -334,7 +346,14 @@ class DepthCompletionModel(object):
 
         os.makedirs(checkpoint_dirpath, exist_ok=True)
 
-        if 'dinov2_guided' in self.model_name:
+        if 'partition_attention' in self.model_name:
+            self.model.save_model(
+                os.path.join(
+                    checkpoint_dirpath,
+                    'partition-attention-{}.pth'.format(step)),
+                step=step,
+                optimizer=optimizer_depth)
+        elif 'dinov2_guided' in self.model_name:
             self.model.save_model(
                 os.path.join(
                     checkpoint_dirpath,
