@@ -2,8 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# Sparse depth and intrinsics are loaded by the shared AugUndo data interface,
-# but the partition-attention model deliberately forwards RGB only.
+# Every valid sparse measurement is encoded as a coordinate-aware metric token.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/void/supervised/void_train_image_1500.txt \
 --train_sparse_depth_path training/void/supervised/void_train_sparse_depth_1500.txt \
@@ -23,8 +22,8 @@ python depth_completion/src/train_depth_completion.py \
 --normalized_image_range 0 1 \
 --min_predict_depth 0.1 \
 --max_predict_depth 8.0 \
---learning_rates ${LR:-1e-4} ${LR_FINE:-5e-5} \
---learning_schedule 20 40 \
+--learning_rates ${LR:-1e-4} \
+--learning_schedule 40 \
 --augmentation_probabilities 1.0 \
 --augmentation_schedule -1 \
 --augmentation_random_brightness 0.50 1.50 \
@@ -38,13 +37,13 @@ python depth_completion/src/train_depth_completion.py \
 --augmentation_random_crop_type horizontal vertical \
 --augmentation_random_crop_to_shape -1 -1 -1 -1 \
 --augmentation_random_flip_type horizontal vertical \
---augmentation_random_rotate_max 25 \
---augmentation_random_crop_and_pad 0.90 1.00 \
+--augmentation_random_rotate_max -1 \
+--augmentation_random_crop_and_pad -1 -1 \
 --augmentation_random_resize_and_pad -1 -1 \
 --augmentation_random_resize_and_crop -1 -1 \
 --augmentation_random_resize_to_shape -1 -1 \
---augmentation_random_remove_patch_percent_range_image 1e-3 5e-3 \
---augmentation_random_remove_patch_size_image 5 5 \
+--augmentation_random_remove_patch_percent_range_image -1 -1 \
+--augmentation_random_remove_patch_size_image -1 -1 \
 --augmentation_random_remove_patch_percent_range_depth -1 -1 \
 --augmentation_random_remove_patch_size_depth -1 -1 \
 --supervision_type supervised \

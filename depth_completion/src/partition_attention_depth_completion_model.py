@@ -6,7 +6,7 @@ from utils.src import loss_utils
 
 
 class PartitionAttentionDepthCompletionModel(object):
-    '''Repository adapter for the RGB-only partition-attention depth model.'''
+    '''Partition-attention model with coordinate-aware sparse metric tokens.'''
 
     def __init__(self,
                  dataset_name='kitti',
@@ -38,10 +38,12 @@ class PartitionAttentionDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
-        '''Forwards RGB only; the other arguments preserve the common API.'''
-        del sparse_depth, validity_map, intrinsics
+        del intrinsics
 
-        output_depth = self.model_depth(image)
+        output_depth = self.model_depth(
+            image=image,
+            sparse_depth=sparse_depth,
+            validity_map=validity_map)
 
         return [output_depth] if return_all_outputs else output_depth
 
@@ -85,7 +87,7 @@ class PartitionAttentionDepthCompletionModel(object):
     def forward_pose(self, image0, image1):
         del image0, image1
         raise NotImplementedError(
-            'Partition attention is an RGB-only supervised depth baseline')
+            'Partition attention supports supervised depth training only')
 
     def train(self):
         self.model_depth.train()

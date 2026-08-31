@@ -40,8 +40,8 @@ class PartitionAttentionModelTest(unittest.TestCase):
                 partition_mode=mode,
                 n_channels=16,
                 n_head=4,
-                max_local_tokens=8,
-                max_global_tokens=16)
+                max_global_tokens=16,
+                max_metric_queries=16)
             partitions = model.extract_partitions(image)
 
             self.assertEqual(
@@ -52,7 +52,7 @@ class PartitionAttentionModelTest(unittest.TestCase):
                 self.assertEqual(
                     [layer.kernel_size[0]
                      for layer in model.pyramid.convolutions],
-                    [1, 2, 4, 8])
+                    [1, 3, 7, 15])
                 self.assertEqual(
                     [layer.stride[0]
                      for layer in model.pyramid.convolutions],
@@ -61,13 +61,13 @@ class PartitionAttentionModelTest(unittest.TestCase):
                 self.assertEqual(
                     [layer.kernel_size[0]
                      for layer in model.pyramid.convolutions],
-                    [1, 2, 4, 8])
+                    [1, 3, 5, 7])
                 self.assertEqual(
                     [layer.stride[0]
                      for layer in model.pyramid.convolutions],
                     [1, 2, 2, 2])
 
-    def test_rgb_only_forward_loss_backward_and_checkpoint(self):
+    def test_sparse_tokens_constraints_backward_and_checkpoint(self):
         model = DepthCompletionModel(
             model_name='partition_attention_kitti',
             network_modules=['partition_parallel'],
@@ -78,9 +78,11 @@ class PartitionAttentionModelTest(unittest.TestCase):
         # Odd dimensions exercise right/bottom padding and exact output crop.
         image = torch.rand(1, 3, 33, 49)
         sparse_depth0 = torch.zeros(1, 1, 33, 49)
-        sparse_depth1 = 100.0 * torch.rand(1, 1, 33, 49)
+        sparse_depth1 = torch.zeros(1, 1, 33, 49)
+        sparse_depth1[:, :, 5, 7] = 8.0
+        sparse_depth1[:, :, 25, 40] = 32.0
         validity0 = torch.zeros_like(sparse_depth0)
-        validity1 = torch.ones_like(sparse_depth1)
+        validity1 = (sparse_depth1 > 0.0).float()
         ground_truth = 1.5 + 50.0 * torch.rand(1, 1, 33, 49)
 
         outputs0 = model.forward_depth(
@@ -101,13 +103,32 @@ class PartitionAttentionModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(outputs0[0]).all())
         self.assertGreaterEqual(outputs0[0].min().item(), 1.5)
         self.assertLessEqual(outputs0[0].max().item(), 100.0)
-        self.assertTrue(torch.allclose(outputs0[0], output1))
+        self.assertFalse(torch.allclose(outputs0[0], output1))
+        self.assertTrue(torch.allclose(
+            output1[validity1.bool()],
+            sparse_depth1[validity1.bool()]))
+
+        model_depth = model.model.model_depth
+        prepared_depth, prepared_validity = \
+            model_depth._prepare_sparse_depth(
+                image=image,
+                sparse_depth=sparse_depth1,
+                validity_map=validity1)
+        fine_feature = model_depth.extract_partitions(image)[0]
+        tokens, padding_mask, has_valid = \
+            model_depth.sparse_token_encoder(
+                image_feature=fine_feature,
+                sparse_depth=prepared_depth,
+                validity_map=prepared_validity)
+        self.assertEqual(tokens.shape[1], 2)
+        self.assertEqual(torch.sum(~padding_mask).item(), 2)
+        self.assertTrue(has_valid.item())
 
         loss, loss_info = model.compute_loss(
             image0=image,
             image1=image,
             image2=image,
-            output_depth0=outputs0,
+            output_depth0=[output1],
             sparse_depth0=sparse_depth0,
             validity_map0=validity0,
             intrinsics=torch.eye(3).unsqueeze(0),
@@ -131,9 +152,10 @@ class PartitionAttentionModelTest(unittest.TestCase):
             for gradient in gradients
         ]))
 
-        model_depth = model.model.model_depth
         communication_modules = [
             model_depth.fine_to_coarse_blocks,
+            [model_depth.sparse_token_encoder],
+            [model_depth.sparse_metric_attention],
             [model_depth.global_attention],
             model_depth.coarse_to_fine_blocks
         ]
