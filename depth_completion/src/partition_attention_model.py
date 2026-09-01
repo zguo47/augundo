@@ -35,16 +35,10 @@ class PartitionPyramid(nn.Module):
     def __init__(self, n_channels=32, mode='parallel'):
         super(PartitionPyramid, self).__init__()
 
-        if mode not in ('parallel', 'sequential'):
-            raise ValueError(
-                'Unsupported partition pyramid mode: {}'.format(mode))
-
         self.mode = mode
         n_group = normalization_groups(n_channels)
 
         if mode == 'parallel':
-            # Overlap before striding avoids the hard non-overlapping patch
-            # edges produced by kernel_size == stride.
             kernel_sizes = (1, 3, 7, 15)
             convolutions = [
                 nn.Conv2d(
@@ -89,7 +83,7 @@ class PartitionPyramid(nn.Module):
 
 
 class SpatialResidualBlock(nn.Module):
-    '''Grid-free spatial refinement that never changes feature resolution.'''
+    '''Residual block with depthwise convolution and group normalization.'''
 
     def __init__(self, n_channels, kernel_size=5):
         super(SpatialResidualBlock, self).__init__()
@@ -110,11 +104,11 @@ class SpatialResidualBlock(nn.Module):
         return feature + torch.tanh(self.gate) * self.block(feature)
 
 
-class FastFineToCoarseBlock(nn.Module):
-    '''Smooth convolutional bottom-up communication between adjacent scales.'''
+class FineToCoarseBlock(nn.Module):
+    '''Bottom-up communication between adjacent partition levels.'''
 
     def __init__(self, n_channels):
-        super(FastFineToCoarseBlock, self).__init__()
+        super(FineToCoarseBlock, self).__init__()
 
         n_group = normalization_groups(n_channels)
         self.gate = nn.Parameter(torch.tensor(0.1))
@@ -354,11 +348,11 @@ class SparseMetricAttentionBlock(nn.Module):
         return feature + torch.tanh(self.gate) * update
 
 
-class FastCoarseToFineBlock(nn.Module):
+class CoarseToFineBlock(nn.Module):
     '''Grid-free top-down fusion using bilinear interpolation and convolution.'''
 
     def __init__(self, n_channels):
-        super(FastCoarseToFineBlock, self).__init__()
+        super(CoarseToFineBlock, self).__init__()
 
         n_group = normalization_groups(n_channels)
         self.gate = nn.Parameter(torch.tensor(0.1))
@@ -400,14 +394,6 @@ class PartitionAttentionDepthModel(nn.Module):
                  max_metric_queries=128):
         super(PartitionAttentionDepthModel, self).__init__()
 
-        if min_predict_depth <= 0.0:
-            raise ValueError('min_predict_depth must be positive')
-        if max_predict_depth <= min_predict_depth:
-            raise ValueError(
-                'max_predict_depth must be greater than min_predict_depth')
-        if n_channels % n_head != 0:
-            raise ValueError('n_channels must be divisible by n_head')
-
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.partition_mode = partition_mode
@@ -429,7 +415,7 @@ class PartitionAttentionDepthModel(nn.Module):
             n_channels=n_channels,
             kernel_size=7)
         self.fine_to_coarse_blocks = nn.ModuleList([
-            FastFineToCoarseBlock(n_channels=n_channels)
+            FineToCoarseBlock(n_channels=n_channels)
             for _ in range(len(PartitionPyramid.SCALES) - 1)
         ])
         self.sparse_token_encoder = SparseDepthTokenEncoder(
@@ -445,7 +431,7 @@ class PartitionAttentionDepthModel(nn.Module):
             n_head=n_head,
             max_global_tokens=max_global_tokens)
         self.coarse_to_fine_blocks = nn.ModuleList([
-            FastCoarseToFineBlock(n_channels=n_channels)
+            CoarseToFineBlock(n_channels=n_channels)
             for _ in range(len(PartitionPyramid.SCALES) - 1)
         ])
         self.output_refinement = SpatialResidualBlock(
@@ -479,8 +465,6 @@ class PartitionAttentionDepthModel(nn.Module):
         return tensor
 
     def extract_partitions(self, image):
-        if image.ndim != 4 or image.shape[1] != 3:
-            raise ValueError('image must have shape N x 3 x H x W')
 
         image = self._pad(image)
         normalized_image = (image - self.image_mean) / self.image_std
@@ -492,18 +476,8 @@ class PartitionAttentionDepthModel(nn.Module):
         ]
 
     def _prepare_sparse_depth(self, image, sparse_depth, validity_map):
-        if sparse_depth is None:
-            sparse_depth = image.new_zeros((
-                image.shape[0], 1, image.shape[-2], image.shape[-1]))
-        if sparse_depth.ndim != 4 or sparse_depth.shape[1] != 1 or \
-                sparse_depth.shape[0] != image.shape[0] or \
-                sparse_depth.shape[-2:] != image.shape[-2:]:
-            raise ValueError(
-                'sparse_depth must have shape N x 1 x H x W')
         if validity_map is None:
             validity_map = (sparse_depth > 0.0).to(sparse_depth.dtype)
-        if validity_map.shape != sparse_depth.shape:
-            raise ValueError('validity_map must match sparse_depth shape')
 
         sparse_depth = self._pad(sparse_depth, mode='constant')
         validity_map = self._pad(validity_map, mode='constant')
@@ -542,8 +516,6 @@ class PartitionAttentionDepthModel(nn.Module):
             (1.0 - validity_map) * output_depth
 
     def forward(self, image, sparse_depth=None, validity_map=None):
-        if image.ndim != 4 or image.shape[1] != 3:
-            raise ValueError('image must have shape N x 3 x H x W')
 
         original_shape = image.shape[-2:]
         sparse_depth, validity_map = self._prepare_sparse_depth(
