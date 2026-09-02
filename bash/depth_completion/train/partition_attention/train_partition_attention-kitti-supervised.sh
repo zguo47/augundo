@@ -2,8 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# The shared dataset interface still loads sparse depth and intrinsics, but the
-# partition-attention model deliberately ignores both and forwards RGB only.
+# RGB and sparse depth use matching four-level partition-attention branches.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/kitti/supervised/kitti_train_image.txt \
 --train_sparse_depth_path training/kitti/supervised/kitti_train_sparse_depth.txt \
@@ -17,7 +16,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_height 320 \
 --n_width 768 \
 --model_name partition_attention \
---network_modules partition_parallel \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \

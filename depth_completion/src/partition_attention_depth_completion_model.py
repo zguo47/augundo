@@ -6,7 +6,7 @@ from utils.src import loss_utils
 
 
 class PartitionAttentionDepthCompletionModel(object):
-    '''Partition-attention model with coordinate-aware sparse metric tokens.'''
+    '''Repository wrapper for the minimal RGB/sparse partition-attention model.'''
 
     def __init__(self,
                  dataset_name='kitti',
@@ -14,18 +14,11 @@ class PartitionAttentionDepthCompletionModel(object):
                  min_predict_depth=1.5,
                  max_predict_depth=100.0,
                  device=torch.device('cuda')):
-        del dataset_name
-
-        network_modules = [] if network_modules is None else network_modules
-        partition_mode = 'sequential' \
-            if 'partition_sequential' in network_modules \
-            or 'sequential' in network_modules \
-            else 'parallel'
+        del dataset_name, network_modules
 
         self.model_depth = PartitionAttentionDepthModel(
             min_predict_depth=min_predict_depth,
-            max_predict_depth=max_predict_depth,
-            partition_mode=partition_mode)
+            max_predict_depth=max_predict_depth)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
@@ -38,23 +31,22 @@ class PartitionAttentionDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
-        del intrinsics
+        # Intrinsics and the explicit validity map are part of the repository's
+        # shared interface. This baseline feeds the sparse-depth image itself
+        # into its branch, where zero denotes a missing measurement.
+        del intrinsics, validity_map
 
         output_depth = self.model_depth(
             image=image,
-            sparse_depth=sparse_depth,
-            validity_map=validity_map)
+            sparse_depth=sparse_depth)
 
         return [output_depth] if return_all_outputs else output_depth
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
         '''Computes metric log-L1 loss over valid target pixels.'''
-        if isinstance(output_depth, (list, tuple)):
-            output_depth = output_depth[0]
+        output_depth = output_depth[0]
 
-        validity = torch.logical_and(
-            torch.isfinite(target_depth),
-            target_depth > 0.0).to(target_depth.dtype)
+        validity = (target_depth > 0.0).to(target_depth.dtype)
         target_depth = torch.where(
             validity > 0.0,
             torch.clamp(
@@ -86,8 +78,7 @@ class PartitionAttentionDepthCompletionModel(object):
 
     def forward_pose(self, image0, image1):
         del image0, image1
-        raise NotImplementedError(
-            'Partition attention supports supervised depth training only')
+        return None
 
     def train(self):
         self.model_depth.train()
@@ -127,7 +118,7 @@ class PartitionAttentionDepthCompletionModel(object):
             else self.model_depth
         model.load_state_dict(checkpoint['model_state_dict'])
 
-        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        if optimizer is not None:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         return checkpoint.get('train_step', 0), optimizer

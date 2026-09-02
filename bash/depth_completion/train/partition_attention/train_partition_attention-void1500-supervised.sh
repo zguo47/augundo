@@ -2,7 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# Every valid sparse measurement is encoded as a coordinate-aware metric token.
+# RGB and sparse depth use parallel four-level partition-attention branches.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/void/supervised/void_train_image_1500.txt \
 --train_sparse_depth_path training/void/supervised/void_train_sparse_depth_1500.txt \
@@ -16,7 +16,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_height 480 \
 --n_width 640 \
 --model_name partition_attention_void \
---network_modules partition_parallel \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \

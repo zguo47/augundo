@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import torch
+import torch.nn as nn
 
 
 REPOSITORY_ROOT = os.path.abspath(os.path.join(
@@ -20,177 +21,163 @@ if REPOSITORY_ROOT not in sys.path:
 if DEPTH_COMPLETION_SOURCE not in sys.path:
     sys.path.insert(0, DEPTH_COMPLETION_SOURCE)
 
-from depth_completion_model import DepthCompletionModel
-from partition_attention_model import PartitionAttentionDepthModel
+from partition_attention_depth_completion_model import \
+    PartitionAttentionDepthCompletionModel
+from partition_attention_model import (
+    AttentionUpdate,
+    PartitionAttentionDepthModel,
+    feature_to_partitions)
 
 
 class PartitionAttentionModelTest(unittest.TestCase):
 
-    def test_parallel_and_sequential_partition_shapes(self):
-        image = torch.rand(1, 3, 64, 96)
+    def test_level_and_partition_shapes(self):
+        model = PartitionAttentionDepthModel()
+        image = torch.rand(1, 3, 16, 24)
+        sparse_depth = torch.rand(1, 1, 16, 24)
+
+        rgb_features = model.rgb_pyramid(image)
+        sparse_features = model.sparse_pyramid(sparse_depth)
         expected_shapes = [
-            (1, 16, 64, 96),
-            (1, 16, 32, 48),
             (1, 16, 16, 24),
-            (1, 16, 8, 12)
+            (1, 32, 8, 12),
+            (1, 64, 4, 6),
+            (1, 128, 2, 3)
         ]
 
-        for mode in ('parallel', 'sequential'):
-            model = PartitionAttentionDepthModel(
-                partition_mode=mode,
-                n_channels=16,
-                n_head=4,
-                max_global_tokens=16,
-                max_metric_queries=16)
-            partitions = model.extract_partitions(image)
+        self.assertEqual(
+            [tuple(feature.shape) for feature in rgb_features],
+            expected_shapes)
+        self.assertEqual(
+            [tuple(feature.shape) for feature in sparse_features],
+            expected_shapes)
+        self.assertEqual(
+            [layer.kernel_size[0]
+             for layer in model.rgb_pyramid.convolutions],
+            [1, 2, 4, 8])
+        self.assertEqual(
+            [layer.stride[0]
+             for layer in model.rgb_pyramid.convolutions],
+            [1, 2, 4, 8])
 
-            self.assertEqual(
-                [tuple(partition.shape) for partition in partitions],
-                expected_shapes)
+        rgb_partitions = [
+            feature_to_partitions(feature, n_grid)
+            for feature, n_grid in zip(
+                rgb_features, model.level_grids)
+        ]
+        self.assertEqual(
+            [tuple(partitions.shape) for partitions in rgb_partitions],
+            [
+                (1, 8, 8, 6, 16),
+                (1, 4, 4, 6, 32),
+                (1, 2, 2, 6, 64),
+                (1, 1, 1, 6, 128)
+            ])
 
-            if mode == 'parallel':
-                self.assertEqual(
-                    [layer.kernel_size[0]
-                     for layer in model.pyramid.convolutions],
-                    [1, 3, 7, 15])
-                self.assertEqual(
-                    [layer.stride[0]
-                     for layer in model.pyramid.convolutions],
-                    [1, 2, 4, 8])
-            else:
-                self.assertEqual(
-                    [layer.kernel_size[0]
-                     for layer in model.pyramid.convolutions],
-                    [1, 3, 5, 7])
-                self.assertEqual(
-                    [layer.stride[0]
-                     for layer in model.pyramid.convolutions],
-                    [1, 2, 2, 2])
+    def test_attention_between_different_channel_counts(self):
+        attention = AttentionUpdate(
+            query_channels=32,
+            context_channels=64,
+            attention_channels=48,
+            n_head=4)
+        query = torch.rand(2, 6, 32, requires_grad=True)
+        context = torch.rand(2, 24, 64, requires_grad=True)
 
-    def test_sparse_tokens_constraints_backward_and_checkpoint(self):
-        model = DepthCompletionModel(
-            model_name='partition_attention_kitti',
-            network_modules=['partition_parallel'],
-            min_predict_depth=1.5,
-            max_predict_depth=100.0,
+        output = attention(query, context)
+
+        self.assertEqual(tuple(output.shape), (2, 6, 32))
+        output.mean().backward()
+        self.assertTrue(torch.isfinite(query.grad).all())
+        self.assertTrue(torch.isfinite(context.grad).all())
+
+    def test_forward_backward_and_checkpoint(self):
+        torch.manual_seed(7)
+        model = PartitionAttentionDepthCompletionModel(
+            min_predict_depth=0.1,
+            max_predict_depth=8.0,
             device=torch.device('cpu'))
 
-        # Odd dimensions exercise right/bottom padding and exact output crop.
-        image = torch.rand(1, 3, 33, 49)
-        sparse_depth0 = torch.zeros(1, 1, 33, 49)
-        sparse_depth1 = torch.zeros(1, 1, 33, 49)
-        sparse_depth1[:, :, 5, 7] = 8.0
-        sparse_depth1[:, :, 25, 40] = 32.0
-        validity0 = torch.zeros_like(sparse_depth0)
-        validity1 = (sparse_depth1 > 0.0).float()
-        ground_truth = 1.5 + 50.0 * torch.rand(1, 1, 33, 49)
+        image = torch.rand(1, 3, 16, 24)
+        sparse_depth0 = torch.zeros(1, 1, 16, 24)
+        sparse_depth1 = sparse_depth0.clone()
+        sparse_depth1[:, :, 3, 5] = 1.25
+        sparse_depth1[:, :, 12, 19] = 4.50
+        validity = (sparse_depth1 > 0.0).float()
+        ground_truth = 0.1 + 7.9 * torch.rand(1, 1, 16, 24)
 
-        outputs0 = model.forward_depth(
+        output_without_points = model.forward_depth(
             image=image,
             sparse_depth=sparse_depth0,
-            validity_map=validity0,
-            intrinsics=None,
-            return_all_outputs=True)
-        output1 = model.forward_depth(
+            validity_map=torch.zeros_like(sparse_depth0),
+            return_all_outputs=False)
+        output = model.forward_depth(
             image=image,
             sparse_depth=sparse_depth1,
-            validity_map=validity1,
-            intrinsics=torch.eye(3).unsqueeze(0),
+            validity_map=validity,
             return_all_outputs=False)
 
-        self.assertEqual(len(outputs0), 1)
-        self.assertEqual(tuple(outputs0[0].shape), (1, 1, 33, 49))
-        self.assertTrue(torch.isfinite(outputs0[0]).all())
-        self.assertGreaterEqual(outputs0[0].min().item(), 1.5)
-        self.assertLessEqual(outputs0[0].max().item(), 100.0)
-        self.assertFalse(torch.allclose(outputs0[0], output1))
-        self.assertTrue(torch.allclose(
-            output1[validity1.bool()],
-            sparse_depth1[validity1.bool()]))
+        self.assertEqual(tuple(output.shape), (1, 1, 16, 24))
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertGreaterEqual(output.min().item(), 0.1)
+        self.assertLessEqual(output.max().item(), 8.0)
+        self.assertFalse(torch.allclose(output_without_points, output))
 
-        model_depth = model.model.model_depth
-        prepared_depth, prepared_validity = \
-            model_depth._prepare_sparse_depth(
-                image=image,
-                sparse_depth=sparse_depth1,
-                validity_map=validity1)
-        fine_feature = model_depth.extract_partitions(image)[0]
-        tokens, padding_mask, has_valid = \
-            model_depth.sparse_token_encoder(
-                image_feature=fine_feature,
-                sparse_depth=prepared_depth,
-                validity_map=prepared_validity)
-        self.assertEqual(tokens.shape[1], 2)
-        self.assertEqual(torch.sum(~padding_mask).item(), 2)
-        self.assertTrue(has_valid.item())
-
-        loss, loss_info = model.compute_loss(
-            image0=image,
-            image1=image,
-            image2=image,
-            output_depth0=[output1],
-            sparse_depth0=sparse_depth0,
-            validity_map0=validity0,
-            intrinsics=torch.eye(3).unsqueeze(0),
-            pose0to1=None,
-            pose0to2=None,
-            ground_truth0=ground_truth,
-            supervision_type='supervised',
+        loss, loss_info = model.compute_loss_supervised(
+            target_depth=ground_truth,
+            output_depth=[output],
             w_losses={'w_supervised': 1.0})
-
         self.assertTrue(torch.isfinite(loss))
         self.assertIn('loss_log_l1', loss_info)
         loss.backward()
-        gradients = [
-            parameter.grad
-            for parameter in model.parameters_depth()
-            if parameter.grad is not None
-        ]
-        self.assertGreater(len(gradients), 0)
-        self.assertTrue(all([
-            torch.isfinite(gradient).all()
-            for gradient in gradients
-        ]))
 
-        communication_modules = [
-            model_depth.fine_to_coarse_blocks,
-            [model_depth.sparse_token_encoder],
-            [model_depth.sparse_metric_attention],
-            [model_depth.global_attention],
-            model_depth.coarse_to_fine_blocks
+        modules_on_the_output_path = [
+            model.model_depth.rgb_local_attention,
+            model.model_depth.sparse_local_attention,
+            model.model_depth.rgb_fine_to_coarse_attention,
+            model.model_depth.sparse_fine_to_coarse_attention,
+            model.model_depth.rgb_coarse_to_fine_attention,
+            model.model_depth.sparse_coarse_to_fine_attention,
+            model.model_depth.rgb_from_sparse_attention,
+            [model.model_depth.depth_output]
         ]
-        for modules in communication_modules:
-            module_gradients = [
+        for modules in modules_on_the_output_path:
+            gradients = [
                 parameter.grad
                 for module in modules
                 for parameter in module.parameters()
                 if parameter.grad is not None
             ]
-            self.assertGreater(len(module_gradients), 0)
-            self.assertGreater(sum([
-                torch.sum(torch.abs(gradient)).item()
-                for gradient in module_gradients
-            ]), 0.0)
+            self.assertGreater(len(gradients), 0)
+            self.assertTrue(all(
+                torch.isfinite(gradient).all()
+                for gradient in gradients))
+
+        # The only spatial convolutions are the four initial level creators in
+        # each input branch.
+        convolution_names = [
+            name
+            for name, module in model.model_depth.named_modules()
+            if isinstance(module, nn.Conv2d)
+        ]
+        self.assertEqual(len(convolution_names), 8)
+        self.assertTrue(all(
+            name.startswith('rgb_pyramid.convolutions.') or
+            name.startswith('sparse_pyramid.convolutions.')
+            for name in convolution_names))
 
         optimizer = torch.optim.Adam(model.parameters_depth(), lr=1e-4)
         with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = os.path.join(directory, 'model.pth')
             model.save_model(
-                checkpoint_dirpath=directory,
-                step=23,
-                optimizer_depth=optimizer,
-                optimizer_pose=None)
-            checkpoint_path = os.path.join(
-                directory,
-                'partition-attention-23.pth')
-            step, restored_optimizer, restored_pose_optimizer = \
-                model.restore_model(
-                    restore_paths=[checkpoint_path],
-                    optimizer_depth=optimizer,
-                    optimizer_pose=None)
+                checkpoint_path=checkpoint_path,
+                step=11,
+                optimizer=optimizer)
+            step, restored_optimizer = model.restore_model(
+                restore_path=checkpoint_path,
+                optimizer=optimizer)
 
-        self.assertEqual(step, 23)
+        self.assertEqual(step, 11)
         self.assertIs(restored_optimizer, optimizer)
-        self.assertIsNone(restored_pose_optimizer)
 
 
 if __name__ == '__main__':
