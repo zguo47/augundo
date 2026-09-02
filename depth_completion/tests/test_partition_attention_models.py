@@ -33,16 +33,17 @@ class PartitionAttentionModelTest(unittest.TestCase):
 
     def test_level_and_partition_shapes(self):
         model = PartitionAttentionDepthModel()
-        image = torch.rand(1, 3, 16, 24)
-        sparse_depth = torch.rand(1, 1, 16, 24)
+        image = torch.rand(1, 3, 32, 48)
+        sparse_depth = torch.rand(1, 1, 32, 48)
 
         rgb_features = model.rgb_pyramid(image)
         sparse_features = model.sparse_pyramid(sparse_depth)
         expected_shapes = [
-            (1, 16, 16, 24),
+            (1, 32, 32, 48),
+            (1, 32, 16, 24),
             (1, 32, 8, 12),
-            (1, 64, 4, 6),
-            (1, 128, 2, 3)
+            (1, 32, 4, 6),
+            (1, 32, 2, 3)
         ]
 
         self.assertEqual(
@@ -54,11 +55,15 @@ class PartitionAttentionModelTest(unittest.TestCase):
         self.assertEqual(
             [layer.kernel_size[0]
              for layer in model.rgb_pyramid.convolutions],
-            [1, 2, 4, 8])
+            [1, 2, 4, 8, 16])
         self.assertEqual(
             [layer.stride[0]
              for layer in model.rgb_pyramid.convolutions],
-            [1, 2, 4, 8])
+            [1, 2, 4, 8, 16])
+        self.assertEqual(
+            [layer.padding[0]
+             for layer in model.rgb_pyramid.convolutions],
+            [0, 0, 0, 0, 0])
 
         rgb_partitions = [
             feature_to_partitions(feature, n_grid)
@@ -68,20 +73,17 @@ class PartitionAttentionModelTest(unittest.TestCase):
         self.assertEqual(
             [tuple(partitions.shape) for partitions in rgb_partitions],
             [
-                (1, 8, 8, 6, 16),
+                (1, 16, 16, 6, 32),
+                (1, 8, 8, 6, 32),
                 (1, 4, 4, 6, 32),
-                (1, 2, 2, 6, 64),
-                (1, 1, 1, 6, 128)
+                (1, 2, 2, 6, 32),
+                (1, 1, 1, 6, 32)
             ])
 
-    def test_attention_between_different_channel_counts(self):
-        attention = AttentionUpdate(
-            query_channels=32,
-            context_channels=64,
-            attention_channels=48,
-            n_head=4)
+    def test_attention_with_shared_channel_count(self):
+        attention = AttentionUpdate(n_channels=32, n_head=4)
         query = torch.rand(2, 6, 32, requires_grad=True)
-        context = torch.rand(2, 24, 64, requires_grad=True)
+        context = torch.rand(2, 24, 32, requires_grad=True)
 
         output = attention(query, context)
 
@@ -97,13 +99,13 @@ class PartitionAttentionModelTest(unittest.TestCase):
             max_predict_depth=8.0,
             device=torch.device('cpu'))
 
-        image = torch.rand(1, 3, 16, 24)
-        sparse_depth0 = torch.zeros(1, 1, 16, 24)
+        image = torch.rand(1, 3, 32, 48)
+        sparse_depth0 = torch.zeros(1, 1, 32, 48)
         sparse_depth1 = sparse_depth0.clone()
         sparse_depth1[:, :, 3, 5] = 1.25
         sparse_depth1[:, :, 12, 19] = 4.50
         validity = (sparse_depth1 > 0.0).float()
-        ground_truth = 0.1 + 7.9 * torch.rand(1, 1, 16, 24)
+        ground_truth = 0.1 + 7.9 * torch.rand(1, 1, 32, 48)
 
         output_without_points = model.forward_depth(
             image=image,
@@ -116,7 +118,7 @@ class PartitionAttentionModelTest(unittest.TestCase):
             validity_map=validity,
             return_all_outputs=False)
 
-        self.assertEqual(tuple(output.shape), (1, 1, 16, 24))
+        self.assertEqual(tuple(output.shape), (1, 1, 32, 48))
         self.assertTrue(torch.isfinite(output).all())
         self.assertGreaterEqual(output.min().item(), 0.1)
         self.assertLessEqual(output.max().item(), 8.0)
@@ -152,14 +154,14 @@ class PartitionAttentionModelTest(unittest.TestCase):
                 torch.isfinite(gradient).all()
                 for gradient in gradients))
 
-        # The only spatial convolutions are the four initial level creators in
+        # The only spatial convolutions are the five initial level creators in
         # each input branch.
         convolution_names = [
             name
             for name, module in model.model_depth.named_modules()
             if isinstance(module, nn.Conv2d)
         ]
-        self.assertEqual(len(convolution_names), 8)
+        self.assertEqual(len(convolution_names), 10)
         self.assertTrue(all(
             name.startswith('rgb_pyramid.convolutions.') or
             name.startswith('sparse_pyramid.convolutions.')

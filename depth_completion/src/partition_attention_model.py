@@ -7,37 +7,23 @@ import torch.nn.functional as functional
 
 class AttentionUpdate(nn.Module):
     '''
-    Attention between tensors that may have different channel dimensions.
-
-    Only the projected queries and keys need the same channel dimension. The
-    input query and context tensors can therefore come from different levels.
-    The attended result is projected back to the query channel dimension so it
-    can be added to the original query tensor.
+    Attention between query and context sequences with the same channel count.
     '''
 
-    def __init__(self,
-                 query_channels,
-                 context_channels,
-                 attention_channels,
-                 n_head):
+    def __init__(self, n_channels, n_head):
         super(AttentionUpdate, self).__init__()
 
         self.n_head = n_head
-        self.head_channels = attention_channels // n_head
+        self.head_channels = n_channels // n_head
 
-        # W_q maps the query level from C_q channels to the common attention
-        # dimension D. W_k does the same for the context level from C_k to D.
-        self.query_projection = nn.Linear(
-            query_channels, attention_channels)
-        self.key_projection = nn.Linear(
-            context_channels, attention_channels)
-        self.value_projection = nn.Linear(
-            context_channels, attention_channels)
+        # Q, K and V remain in the common C-channel space used by every level.
+        self.query_projection = nn.Linear(n_channels, n_channels)
+        self.key_projection = nn.Linear(n_channels, n_channels)
+        self.value_projection = nn.Linear(n_channels, n_channels)
 
-        # Attention returns D channels. This map returns the result to C_q so
-        # the query can be updated without requiring C_q == C_k.
-        self.output_projection = nn.Linear(
-            attention_channels, query_channels)
+        # The attention result also has C channels, so it can be added directly
+        # to the C-channel query sequence.
+        self.output_projection = nn.Linear(n_channels, n_channels)
 
     def forward(self, query, context):
         n_batch, n_query, _ = query.shape
@@ -79,24 +65,24 @@ class AttentionUpdate(nn.Module):
 
 
 class ConvolutionPyramid(nn.Module):
-    '''Creates the four spatial levels; these are the model's only convolutions.'''
+    '''Creates five parallel spatial levels with no padding or overlap.'''
 
-    SCALES = (1, 2, 4, 8)
+    SCALES = (1, 2, 4, 8, 16)
 
-    def __init__(self, input_channels, level_channels):
+    def __init__(self, input_channels, n_channels):
         super(ConvolutionPyramid, self).__init__()
 
         # Every level is produced directly from the branch input. Kernel size
-        # equals stride, giving exactly H, H/2, H/4 and H/8 for inputs whose
-        # dimensions are divisible by eight.
+        # equals stride and padding is zero. Consequently convolution windows
+        # do not overlap, and the results are H, H/2, H/4, H/8 and H/16 for
+        # input dimensions divisible by sixteen.
         self.convolutions = nn.ModuleList([
             nn.Conv2d(
                 input_channels,
-                output_channels,
+                n_channels,
                 kernel_size=scale,
                 stride=scale)
-            for scale, output_channels in zip(
-                self.SCALES, level_channels)
+            for scale in self.SCALES
         ])
 
     def forward(self, branch_input):
@@ -153,7 +139,7 @@ class PartitionAttentionDepthModel(nn.Module):
     '''
     Minimal two-branch partition-attention baseline.
 
-    Both RGB and sparse depth form the same four-level spatial hierarchy. Each
+    Both RGB and sparse depth form the same five-level spatial hierarchy. Each
     branch first exchanges information locally, the two modalities then
     exchange information at every level, and adjacent levels communicate in a
     fine-to-coarse pass followed by a coarse-to-fine pass.
@@ -162,92 +148,76 @@ class PartitionAttentionDepthModel(nn.Module):
     def __init__(self,
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
-                 level_channels=(16, 32, 64, 128),
+                 n_channels=32,
                  n_head=4):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
-        self.level_channels = level_channels
+        self.n_channels = n_channels
 
         # A partition has the spatial dimensions of the smallest feature map.
-        # The four levels therefore contain 8x8, 4x4, 2x2 and 1x1 partitions.
-        self.level_grids = (8, 4, 2, 1)
+        # The five levels therefore contain 16x16, 8x8, 4x4, 2x2 and 1x1
+        # non-overlapping grid partitions.
+        self.level_grids = (16, 8, 4, 2, 1)
 
-        # RGB and sparse depth use independent convolutions but exactly the same
-        # level dimensions and channel counts.
+        # RGB and sparse depth use independent parallel convolutions. Every
+        # output level in both branches has exactly C channels.
         self.rgb_pyramid = ConvolutionPyramid(
             input_channels=3,
-            level_channels=level_channels)
+            n_channels=n_channels)
         self.sparse_pyramid = ConvolutionPyramid(
             input_channels=1,
-            level_channels=level_channels)
+            n_channels=n_channels)
 
         # Step 1: self-attention is applied independently inside every
         # partition of every level, for both input branches.
         self.rgb_local_attention = nn.ModuleList([
-            AttentionUpdate(channels, channels, channels, n_head)
-            for channels in level_channels
+            AttentionUpdate(n_channels, n_head)
+            for _ in self.level_grids
         ])
         self.sparse_local_attention = nn.ModuleList([
-            AttentionUpdate(channels, channels, channels, n_head)
-            for channels in level_channels
+            AttentionUpdate(n_channels, n_head)
+            for _ in self.level_grids
         ])
 
         # Sparse-to-RGB and RGB-to-sparse attention make the exchange
         # bidirectional. Corresponding partitions at a level have equal token
         # counts and equal channel counts, but use separate learned weights.
         self.rgb_from_sparse_attention = nn.ModuleList([
-            AttentionUpdate(channels, channels, channels, n_head)
-            for channels in level_channels
+            AttentionUpdate(n_channels, n_head)
+            for _ in self.level_grids
         ])
         self.sparse_from_rgb_attention = nn.ModuleList([
-            AttentionUpdate(channels, channels, channels, n_head)
-            for channels in level_channels
+            AttentionUpdate(n_channels, n_head)
+            for _ in self.level_grids
         ])
 
         # Step 2: a coarse partition queries the four fine partitions occupying
-        # the same image region. Projections allow adjacent levels to use
-        # different channel counts.
+        # the same image region. Both query and context have C channels.
         self.rgb_fine_to_coarse_attention = nn.ModuleList([
-            AttentionUpdate(
-                level_channels[level + 1],
-                level_channels[level],
-                level_channels[level + 1],
-                n_head)
-            for level in range(3)
+            AttentionUpdate(n_channels, n_head)
+            for _ in range(4)
         ])
         self.sparse_fine_to_coarse_attention = nn.ModuleList([
-            AttentionUpdate(
-                level_channels[level + 1],
-                level_channels[level],
-                level_channels[level + 1],
-                n_head)
-            for level in range(3)
+            AttentionUpdate(n_channels, n_head)
+            for _ in range(4)
         ])
 
         # Step 3: each fine partition queries its updated parent partition. The
-        # result is projected back to the fine level's channel dimension.
+        # result remains in the shared C-channel space.
         self.rgb_coarse_to_fine_attention = nn.ModuleList([
-            AttentionUpdate(
-                level_channels[level],
-                level_channels[level + 1],
-                level_channels[level],
-                n_head)
-            for level in range(3)
+            AttentionUpdate(n_channels, n_head)
+            for _ in range(4)
         ])
         self.sparse_coarse_to_fine_attention = nn.ModuleList([
-            AttentionUpdate(
-                level_channels[level],
-                level_channels[level + 1],
-                level_channels[level],
-                n_head)
-            for level in range(3)
+            AttentionUpdate(n_channels, n_head)
+            for _ in range(4)
         ])
 
         # One linear map converts each final full-resolution RGB token into one
         # depth value. This is not a spatial convolution and does not mix pixels.
-        self.depth_output = nn.Linear(level_channels[0], 1)
+        self.depth_output = nn.Linear(n_channels, 1)
 
     def _local_attention(self, partitions, attention_blocks):
         outputs = []
@@ -369,12 +339,13 @@ class PartitionAttentionDepthModel(nn.Module):
         return updated_fine.reshape(fine.shape)
 
     def forward(self, image, sparse_depth, validity_map=None):
-        # Initial convolutions create the four RGB and sparse-depth levels.
+        # Initial convolutions create the five RGB and sparse-depth levels.
         rgb_features = self.rgb_pyramid(image)
         sparse_features = self.sparse_pyramid(sparse_depth)
 
-        # A fixed token-space partition size H/8 x W/8 gives level grids of
-        # 8x8, 4x4, 2x2 and 1x1.
+        # A fixed token-space partition size H/16 x W/16 gives level grids of
+        # 16x16, 8x8, 4x4, 2x2 and 1x1. The reshape forms a strict grid: no
+        # partition contains a token belonging to another partition.
         rgb_partitions = [
             feature_to_partitions(feature, n_grid)
             for feature, n_grid in zip(rgb_features, self.level_grids)
@@ -399,15 +370,15 @@ class PartitionAttentionDepthModel(nn.Module):
 
         # The bottom partitions cover the whole image. They exchange RGB and
         # sparse-depth information before their global context travels upward.
-        rgb_partitions[3], sparse_partitions[3] = \
+        rgb_partitions[4], sparse_partitions[4] = \
             self._cross_modal_level(
-                rgb_partitions[3], sparse_partitions[3], level=3)
+                rgb_partitions[4], sparse_partitions[4], level=4)
 
         # Step 3: proceed from bottom to top. At each adjacent pair, every fine
         # partition first attends to the coarse partition covering the same
         # image region. Corresponding RGB and sparse partitions then exchange
         # their updated information through attention.
-        for level in range(2, -1, -1):
+        for level in range(3, -1, -1):
             rgb_partitions[level] = self._coarse_to_fine_level(
                 fine=rgb_partitions[level],
                 coarse=rgb_partitions[level + 1],

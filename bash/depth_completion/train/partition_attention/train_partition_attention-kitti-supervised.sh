@@ -2,7 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# RGB and sparse depth use matching four-level partition-attention branches.
+# RGB and sparse depth use matching five-level partition-attention branches.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/kitti/supervised/kitti_train_image.txt \
 --train_sparse_depth_path training/kitti/supervised/kitti_train_sparse_depth.txt \
