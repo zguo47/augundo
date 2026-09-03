@@ -47,8 +47,7 @@ class DepthCompletionModel(object):
             dataset_name = 'kitti'
 
         if 'partition_attention' in model_name:
-            from partition_attention_depth_completion_model import \
-                PartitionAttentionDepthCompletionModel
+            from partition_attention_depth_completion_model import PartitionAttentionDepthCompletionModel
 
             self.model = PartitionAttentionDepthCompletionModel(
                 dataset_name=dataset_name,

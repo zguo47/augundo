@@ -31,9 +31,6 @@ class PartitionAttentionDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
-        # Intrinsics and the explicit validity map are part of the repository's
-        # shared interface. This baseline feeds the sparse-depth image itself
-        # into its branch, where zero denotes a missing measurement.
         del intrinsics, validity_map
 
         output_depth = self.model_depth(
