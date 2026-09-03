@@ -31,11 +31,12 @@ class PartitionAttentionDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
-        del intrinsics, validity_map
+        del intrinsics
 
         output_depth = self.model_depth(
             image=image,
-            sparse_depth=sparse_depth)
+            sparse_depth=sparse_depth,
+            validity_map=validity_map)
 
         return [output_depth] if return_all_outputs else output_depth
 
