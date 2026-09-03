@@ -2,7 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as functional
+from torch.utils.checkpoint import checkpoint
 
 
 class AttentionUpdate(nn.Module):
@@ -12,6 +12,7 @@ class AttentionUpdate(nn.Module):
 
         self.n_head = n_head
         self.head_channels = n_channels // n_head
+        self.query_chunk_size = 32
 
         # Q, K and V with same number of channels.
         self.query_projection = nn.Linear(n_channels, n_channels)
@@ -20,6 +21,14 @@ class AttentionUpdate(nn.Module):
 
         # Attention result with same number of channels as query
         self.output_projection = nn.Linear(n_channels, n_channels)
+
+    def attention_chunk(self, query, key, value):
+        similarity = torch.matmul(
+            query,
+            key.transpose(-2, -1))
+        similarity.div_(math.sqrt(self.head_channels))
+        attention_weights = torch.softmax(similarity, dim=-1)
+        return torch.matmul(attention_weights, value)
 
     def forward(self, query, context):
         n_batch, n_query, _ = query.shape
@@ -53,10 +62,25 @@ class AttentionUpdate(nn.Module):
         projected_value = projected_value.permute(0, 2, 1, 3)
 
         #   attended = softmax(Q K^T / sqrt(D_head)) V
-        attended = functional.scaled_dot_product_attention(
-            projected_query,
-            projected_key,
-            projected_value)
+        attended_chunks = []
+        for query_chunk in torch.split(
+                projected_query,
+                self.query_chunk_size,
+                dim=2):
+            if self.training:
+                attended_chunk = checkpoint(
+                    self.attention_chunk,
+                    query_chunk,
+                    projected_key,
+                    projected_value)
+            else:
+                attended_chunk = self.attention_chunk(
+                    query_chunk,
+                    projected_key,
+                    projected_value)
+            attended_chunks.append(attended_chunk)
+
+        attended = torch.cat(attended_chunks, dim=2)
         attended = attended.permute(0, 2, 1, 3).reshape(
             n_batch, 
             n_query, 
