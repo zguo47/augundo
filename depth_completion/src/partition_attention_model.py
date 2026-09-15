@@ -20,7 +20,7 @@ class AttentionUpdate(nn.Module):
         # Attention result with same number of channels as query
         self.output_projection = nn.Linear(n_channels, n_channels)
 
-    def forward(self, query, context, context_mask=None):
+    def forward(self, query, context):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
 
@@ -58,12 +58,6 @@ class AttentionUpdate(nn.Module):
 
         similarity = similarity / math.sqrt(self.head_channels)
 
-        # compute similarity only for valid tokens if mask provided.
-        if context_mask is not None:
-            similarity = similarity.masked_fill(
-                ~context_mask[:, None, None, :],
-                -1e9)
-
         attention_weights = torch.softmax(similarity, dim=-1)
 
         attended = torch.matmul(
@@ -79,14 +73,14 @@ class AttentionUpdate(nn.Module):
 
 
 class ConvolutionPyramid(nn.Module):
-    '''Creates five parallel spatial levels'''
+    '''Creates seven parallel spatial levels'''
 
-    SCALES = (1, 2, 4, 8, 16)
+    SCALES = (1, 2, 4, 8, 16, 32, 64)
 
     def __init__(self, input_channels, n_channels):
         super(ConvolutionPyramid, self).__init__()
 
-        # H, H/2, H/4, H/8 and H/16
+        # H, H/2, H/4, H/8, H/16, H/32 and H/64
         self.convolutions = nn.ModuleList([
             nn.Conv2d(
                 input_channels,
@@ -149,29 +143,49 @@ def partitions_to_feature(partitions, n_height, n_width):
         n_width)
 
 
-def validity_pyramid(validity_map):
-    '''Create a validity map for every pyramid level. For sparse depth.'''
-    n_batch, _, n_height, n_width = validity_map.shape
-    outputs = []
+def add_position_encoding(feature):
+    '''Add absolute 2D position information to every spatial feature token.'''
+    _, n_channel, n_height, n_width = feature.shape
+    n_frequency = n_channel // 4
 
-    for scale in ConvolutionPyramid.SCALES:
-        level_validity = validity_map.reshape(
-            n_batch,
-            1,
-            n_height // scale,
-            scale,
-            n_width // scale,
-            scale)
-        level_validity = level_validity.max(dim=3)[0]
-        level_validity = level_validity.max(dim=4)[0]
-        outputs.append(level_validity)
+    # Pixel-center coordinates are normalized so positions from different
+    # pyramid resolutions use the same image coordinate system.
+    y = (torch.arange(
+        n_height,
+        dtype=feature.dtype,
+        device=feature.device) + 0.5) / n_height
+    x = (torch.arange(
+        n_width,
+        dtype=feature.dtype,
+        device=feature.device) + 0.5) / n_width
 
-    return outputs
+    # Multiple Fourier frequencies let attention distinguish both broad image
+    # regions and nearby spatial locations.
+    frequencies = 2.0 ** torch.arange(
+        n_frequency,
+        dtype=feature.dtype,
+        device=feature.device)
+    y_angle = 2.0 * math.pi * y[:, None] * frequencies[None, :]
+    x_angle = 2.0 * math.pi * x[:, None] * frequencies[None, :]
+
+    position = torch.cat([
+        torch.sin(y_angle)[:, None, :].expand(
+            n_height, n_width, n_frequency),
+        torch.cos(y_angle)[:, None, :].expand(
+            n_height, n_width, n_frequency),
+        torch.sin(x_angle)[None, :, :].expand(
+            n_height, n_width, n_frequency),
+        torch.cos(x_angle)[None, :, :].expand(
+            n_height, n_width, n_frequency)
+    ], dim=2)
+    position = position.permute(2, 0, 1)[None, :, :, :]
+
+    return feature + position
 
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
-    Both RGB and sparse depth form the same five-level pyramid. Each
+    Both RGB and sparse depth form the same seven-level pyramid. Each
     branch first exchanges information locally, then exchange information at 
     every level, and adjacent levels communicate in a fine-to-coarse pass 
     followed by a coarse-to-fine pass.
@@ -189,8 +203,8 @@ class PartitionAttentionDepthModel(nn.Module):
         self.n_channels = n_channels
 
         # A partition has the spatial dimensions of the smallest feature map.
-        # Five levels: 16x16, 8x8, 4x4, 2x2 and 1x1.
-        self.level_grids = (16, 8, 4, 2, 1)
+        # Seven levels: 64x64, 32x32, 16x16, 8x8, 4x4, 2x2 and 1x1.
+        self.level_grids = (64, 32, 16, 8, 4, 2, 1)
 
         # RGB and sparse depth use two independent branches with parallel convolutions.
         self.rgb_pyramid = ConvolutionPyramid(
@@ -227,119 +241,27 @@ class PartitionAttentionDepthModel(nn.Module):
         # the same image region (fine to coarse). 
         self.rgb_fine_to_coarse_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(4)
+            for _ in range(6)
         ])
         self.sparse_fine_to_coarse_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(4)
+            for _ in range(6)
         ])
 
         # Step 3: each fine partition queries its updated parent partition (coarse to fine).
         self.rgb_coarse_to_fine_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(4)
+            for _ in range(6)
         ])
         self.sparse_coarse_to_fine_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(4)
+            for _ in range(6)
         ])
 
         # Linear layer
         self.depth_output = nn.Linear(n_channels, 1)
 
-    def summarize_partitions(
-            self,
-            partitions,
-            partition_height,
-            partition_width):
-        '''Summarize each non-overlapping 5x5 region into one context token to save compute.'''
-        n_batch, n_grid, _, _, n_channel = partitions.shape
-        summary_height = partition_height // 5
-        summary_width = partition_width // 5
-
-        summaries = partitions.reshape(
-            n_batch,
-            n_grid,
-            n_grid,
-            summary_height,
-            5,
-            summary_width,
-            5,
-            n_channel)
-        summaries = summaries.permute(0, 1, 2, 3, 5, 4, 6, 7)
-        summaries = summaries.reshape(
-            n_batch,
-            n_grid,
-            n_grid,
-            summary_height * summary_width,
-            25,
-            n_channel)
-        return summaries.mean(dim=4)
-
-    def get_valid_tokens(self, tokens, validity):
-        '''Get valid tokens based on validity mask (for sparse depth).'''
-        n_batch, _, n_channel = tokens.shape
-        n_valid = validity.sum(dim=1)
-        max_valid = int(n_valid.max().item())
-
-        # Get valid tokens into one tensor
-        valid = tokens.new_zeros(n_batch, max_valid, n_channel)
-        valids = torch.arange(
-            max_valid,
-            device=tokens.device)[None, :] < n_valid[:, None]
-        # Get the positions of valid tokens in the original sequence
-        valid_positions = validity.long().cumsum(dim=1) - 1
-        batch_positions = torch.arange(
-            n_batch,
-            device=tokens.device)[:, None].expand_as(validity)
-        valid[batch_positions[validity], valid_positions[validity]] = tokens[validity]
-
-        return valid, valids
-
-    def valid_attention(
-            self,
-            query,
-            query_validity,
-            context,
-            context_validity,
-            attention_block):
-        '''Apply attention using only valid query and context tokens.'''        
-        active = torch.logical_and(
-            query_validity.any(dim=1),
-            context_validity.any(dim=1))
-
-        # Only apply attention to valid query and context tokens.
-        active_query = query[active]
-        active_query_validity = query_validity[active]
-        active_context = context[active]
-        active_context_validity = context_validity[active]
-
-        valid_query, valid_query_validity = self.get_valid_tokens(
-            active_query,
-            active_query_validity)
-        valid_context, valid_context_validity = self.get_valid_tokens(
-            active_context,
-            active_context_validity)
-
-        attended_query = attention_block(
-            valid_query,
-            valid_context,
-            context_mask=valid_context_validity)
-
-        # Only update the valid query tokens. The invalid query tokens remain unchanged.
-        output = query.clone()
-        active_output = output[active]
-        active_output[active_query_validity] = \
-            attended_query[valid_query_validity]
-        output[active] = active_output
-        return output
-
-    def local_attention(
-            self,
-            partitions,
-            attention_blocks,
-            partition_height,
-            partition_width):
+    def local_attention(self, partitions, attention_blocks):
         '''Local attention within each partition.'''
         outputs = []
         for level_partitions, attention_block in zip(partitions, attention_blocks):
@@ -348,18 +270,9 @@ class PartitionAttentionDepthModel(nn.Module):
                 n_batch * n_grid * n_grid,
                 n_token,
                 n_channel)
-            # get summarized tokens to reduce compute.
-            context = self.summarize_partitions(
-                level_partitions,
-                partition_height,
-                partition_width)
-            context = context.reshape(
-                n_batch * n_grid * n_grid,
-                -1,
-                n_channel)
             # apply attention independently to every partition. All partitions in one level
             # are processed in parallel.
-            tokens = attention_block(tokens, context)
+            tokens = attention_block(tokens, tokens)
             outputs.append(tokens.reshape(
                 n_batch,
                 n_grid,
@@ -368,42 +281,7 @@ class PartitionAttentionDepthModel(nn.Module):
                 n_channel))
         return outputs
 
-    def valid_sparse_local_attention(
-            self,
-            partitions,
-            validity_partitions,
-            attention_blocks):
-        '''Local attention using only valid sparse depth tokens.'''
-        outputs = []
-        for level_partitions, level_validity, attention_block in zip(
-                partitions,
-                validity_partitions,
-                attention_blocks):
-            n_batch, n_grid, _, n_token, n_channel = level_partitions.shape
-            tokens = level_partitions.reshape(
-                n_batch * n_grid * n_grid,
-                n_token,
-                n_channel)
-            validity = level_validity.reshape(
-                n_batch * n_grid * n_grid,
-                n_token)
-            tokens = self.valid_attention(
-                tokens,
-                validity,
-                tokens,
-                validity,
-                attention_block)
-            outputs.append(tokens.reshape(level_partitions.shape))
-        return outputs
-
-    def cross_modal_level(
-            self,
-            rgb,
-            sparse,
-            sparse_validity,
-            level,
-            partition_height,
-            partition_width):
+    def cross_modal_level(self, rgb, sparse, level):
         '''RGB and sparse depth exchange information at the same level.'''
         n_batch, n_grid, _, n_token, n_channel = rgb.shape
         rgb_tokens = rgb.reshape(
@@ -414,42 +292,16 @@ class PartitionAttentionDepthModel(nn.Module):
             n_batch * n_grid * n_grid,
             n_token,
             n_channel)
-        sparse_validity = sparse_validity.reshape(
-            n_batch * n_grid * n_grid,
-            n_token)
-        rgb_validity = torch.ones(
-            n_batch * n_grid * n_grid,
-            n_token,
-            dtype=torch.bool,
-            device=rgb.device)
-        rgb_context = self.summarize_partitions(
-            rgb,
-            partition_height,
-            partition_width)
-        rgb_context = rgb_context.reshape(
-            n_batch * n_grid * n_grid,
-            -1,
-            n_channel)
-        rgb_context_validity = torch.ones(
-            rgb_context.shape[:2],
-            dtype=torch.bool,
-            device=rgb.device)
 
         # RGB queries attend to sparse depth tokens in the same partition.
         # Sparse depth queries independently attend to the RGB tokens in that
         # partition, so information exchange is bidirectional.
-        updated_rgb = self.valid_attention(
-            rgb_tokens,
-            rgb_validity,
-            sparse_tokens,
-            sparse_validity,
-            self.rgb_from_sparse_attention[level])
-        updated_sparse = self.valid_attention(
-            sparse_tokens,
-            sparse_validity,
-            rgb_context,
-            rgb_context_validity,
-            self.sparse_from_rgb_attention[level])
+        updated_rgb = self.rgb_from_sparse_attention[level](
+            rgb_tokens, 
+            sparse_tokens)
+        updated_sparse = self.sparse_from_rgb_attention[level](
+            sparse_tokens, 
+            rgb_tokens)
         return updated_rgb.reshape(rgb.shape), updated_sparse.reshape(sparse.shape)
 
     def fine_context_for_coarse(self, fine_partitions):
@@ -471,21 +323,12 @@ class PartitionAttentionDepthModel(nn.Module):
             4 * n_token,
             n_channel)
 
-    def fine_to_coarse(
-            self,
-            partitions,
-            attention_blocks,
-            partition_height,
-            partition_width):
+    def fine_to_coarse(self, partitions, attention_blocks):
         '''Pass info from fine to coarse'''
         outputs = list(partitions)
 
         for level, attention_block in enumerate(attention_blocks):
-            fine_summaries = self.summarize_partitions(
-                outputs[level],
-                partition_height,
-                partition_width)
-            fine_context = self.fine_context_for_coarse(fine_summaries)
+            fine_context = self.fine_context_for_coarse(outputs[level])
             coarse = outputs[level + 1]
             n_batch, n_grid, _, n_token, n_channel = coarse.shape
             coarse_queries = coarse.reshape(
@@ -495,38 +338,6 @@ class PartitionAttentionDepthModel(nn.Module):
             updated_coarse = attention_block(
                 coarse_queries,
                 fine_context)
-            outputs[level + 1] = updated_coarse.reshape(coarse.shape)
-
-        return outputs
-
-    def sparse_fine_to_coarse(
-            self,
-            partitions,
-            validity_partitions,
-            attention_blocks):
-        '''Pass valid sparse depth tokens from fine to coarse.'''
-        outputs = list(partitions)
-
-        for level, attention_block in enumerate(attention_blocks):
-            fine_context = self.fine_context_for_coarse(outputs[level])
-            fine_validity = self.fine_context_for_coarse(
-                validity_partitions[level][..., None])[..., 0]
-            coarse = outputs[level + 1]
-            coarse_validity = validity_partitions[level + 1]
-            n_batch, n_grid, _, n_token, n_channel = coarse.shape
-            coarse_queries = coarse.reshape(
-                n_batch * n_grid * n_grid,
-                n_token,
-                n_channel)
-            coarse_validity = coarse_validity.reshape(
-                n_batch * n_grid * n_grid,
-                n_token)
-            updated_coarse = self.valid_attention(
-                coarse_queries,
-                coarse_validity,
-                fine_context,
-                fine_validity,
-                attention_block)
             outputs[level + 1] = updated_coarse.reshape(coarse.shape)
 
         return outputs
@@ -558,65 +369,33 @@ class PartitionAttentionDepthModel(nn.Module):
             n_token,
             n_channel)
 
-    def coarse_to_fine_level(
-            self,
-            fine,
-            coarse,
-            attention_block,
-            partition_height,
-            partition_width):
+    def coarse_to_fine_level(self, fine, coarse, attention_block):
         '''Pass info from coarse to fine'''
         n_batch, n_grid, _, n_token, n_channel = fine.shape
         fine_queries = fine.reshape(
             n_batch * n_grid * n_grid,
             n_token,
             n_channel)
-        coarse_summaries = self.summarize_partitions(
-            coarse,
-            partition_height,
-            partition_width)
-        parent_context = self.parent_context_for_fine(coarse_summaries)
+        parent_context = self.parent_context_for_fine(coarse)
         updated_fine = attention_block(
             fine_queries,
             parent_context)
         return updated_fine.reshape(fine.shape)
 
-    def sparse_coarse_to_fine_level(
-            self,
-            fine,
-            fine_validity,
-            coarse,
-            coarse_validity,
-            attention_block):
-        '''Pass valid sparse depth tokens from coarse to fine.'''
-        n_batch, n_grid, _, n_token, n_channel = fine.shape
-        fine_queries = fine.reshape(
-            n_batch * n_grid * n_grid,
-            n_token,
-            n_channel)
-        fine_validity = fine_validity.reshape(
-            n_batch * n_grid * n_grid,
-            n_token)
-        parent_context = self.parent_context_for_fine(coarse)
-        parent_validity = self.parent_context_for_fine(
-            coarse_validity[..., None])[..., 0]
-        updated_fine = self.valid_attention(
-            fine_queries,
-            fine_validity,
-            parent_context,
-            parent_validity,
-            attention_block)
-        return updated_fine.reshape(fine.shape)
-
     def forward(self, image, sparse_depth, validity_map=None):
-        # Initial convolutions create the five RGB and sparse-depth levels.
+        # Initial convolutions create the seven RGB and sparse-depth levels.
         rgb_features = self.rgb_pyramid(image)
         sparse_features = self.sparse_pyramid(sparse_depth)
-        validity_features = validity_pyramid(validity_map)
-        partition_height = image.shape[-2] // 16
-        partition_width = image.shape[-1] // 16
+        rgb_features = [
+            add_position_encoding(feature)
+            for feature in rgb_features
+        ]
+        sparse_features = [
+            add_position_encoding(feature)
+            for feature in sparse_features
+        ]
 
-        # Levels: 16x16, 8x8, 4x4, 2x2 and 1x1.
+        # Levels: 64x64, 32x32, 16x16, 8x8, 4x4, 2x2 and 1x1.
         rgb_partitions = [
             feature_to_partitions(feature, n_grid)
             for feature, n_grid in zip(rgb_features, self.level_grids)
@@ -625,64 +404,44 @@ class PartitionAttentionDepthModel(nn.Module):
             feature_to_partitions(feature, n_grid)
             for feature, n_grid in zip(sparse_features, self.level_grids)
         ]
-        validity_partitions = [
-            feature_to_partitions(feature, n_grid)[..., 0] > 0
-            for feature, n_grid in zip(validity_features, self.level_grids)
-        ]
 
         # Step 1: Local attention: only among tokens inside the same partition.
         rgb_partitions = self.local_attention(
             rgb_partitions, 
-            self.rgb_local_attention,
-            partition_height,
-            partition_width)
-        sparse_partitions = self.valid_sparse_local_attention(
-            sparse_partitions,
-            validity_partitions,
+            self.rgb_local_attention)
+        sparse_partitions = self.local_attention(
+            sparse_partitions, 
             self.sparse_local_attention)
 
         # Step 2: fine-to-coarse attention. 
         rgb_partitions = self.fine_to_coarse(
             rgb_partitions, 
-            self.rgb_fine_to_coarse_attention,
-            partition_height,
-            partition_width)
-        sparse_partitions = self.sparse_fine_to_coarse(
-            sparse_partitions,
-            validity_partitions,
+            self.rgb_fine_to_coarse_attention)
+        sparse_partitions = self.fine_to_coarse(
+            sparse_partitions, 
             self.sparse_fine_to_coarse_attention)
 
         # The bottom partitions cover the whole image. They exchange RGB and
         # sparse-depth information before traveling back upwards (global attention).
-        rgb_partitions[4], sparse_partitions[4] = self.cross_modal_level(
-            rgb_partitions[4], 
-            sparse_partitions[4],
-            validity_partitions[4],
-            level=4,
-            partition_height=partition_height,
-            partition_width=partition_width)
+        rgb_partitions[6], sparse_partitions[6] = self.cross_modal_level(
+            rgb_partitions[6], 
+            sparse_partitions[6], 
+            level=6)
 
         # Step 3: proceed from bottom to top.
-        for level in range(3, -1, -1):
+        for level in range(5, -1, -1):
             rgb_partitions[level] = self.coarse_to_fine_level(
                 fine=rgb_partitions[level],
                 coarse=rgb_partitions[level + 1],
-                attention_block=self.rgb_coarse_to_fine_attention[level],
-                partition_height=partition_height,
-                partition_width=partition_width)
-            sparse_partitions[level] = self.sparse_coarse_to_fine_level(
+                attention_block=self.rgb_coarse_to_fine_attention[level])
+            sparse_partitions[level] = self.coarse_to_fine_level(
                 fine=sparse_partitions[level],
-                fine_validity=validity_partitions[level],
                 coarse=sparse_partitions[level + 1],
-                coarse_validity=validity_partitions[level + 1],
                 attention_block=self.sparse_coarse_to_fine_attention[level])
             rgb_partitions[level], sparse_partitions[level] = self.cross_modal_level(
                 rgb_partitions[level],
                 sparse_partitions[level],
-                validity_partitions[level],
-                level=level,
-                partition_height=partition_height,
-                partition_width=partition_width)
+                level=level)
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]

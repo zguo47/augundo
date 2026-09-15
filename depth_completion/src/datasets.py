@@ -377,7 +377,9 @@ class DepthCompletionInferenceDataset(torch.utils.data.Dataset):
                  sparse_depth_paths,
                  intrinsics_paths,
                  ground_truth_paths=None,
-                 load_image_triplets=False):
+                 load_image_triplets=False,
+                 random_crop_shape=None,
+                 random_crop_type=None):
 
         self.n_sample = len(image_paths)
 
@@ -396,6 +398,10 @@ class DepthCompletionInferenceDataset(torch.utils.data.Dataset):
 
         self.data_format = 'CHW'
         self.load_image_triplets = load_image_triplets
+        self.random_crop_shape = random_crop_shape
+        self.random_crop_type = random_crop_type
+        self.do_random_crop = \
+            random_crop_shape is not None and all([x > 0 for x in random_crop_shape])
 
     def __getitem__(self, index):
 
@@ -419,17 +425,28 @@ class DepthCompletionInferenceDataset(torch.utils.data.Dataset):
         # Load camera intrinsics
         intrinsics = np.load(self.intrinsics_paths[index])
 
-        inputs = [
-            image,
-            sparse_depth,
-            intrinsics
-        ]
-
         # Load ground truth if available
         if self.is_available_ground_truth:
             ground_truth = data_utils.load_depth(
                 self.ground_truth_paths[index],
                 data_format=self.data_format)
+
+        if self.do_random_crop:
+            crop_inputs = [image, sparse_depth]
+            if self.is_available_ground_truth:
+                crop_inputs.append(ground_truth)
+            crop_inputs, [intrinsics] = random_crop(
+                inputs=crop_inputs,
+                shape=self.random_crop_shape,
+                intrinsics=[intrinsics],
+                crop_type=self.random_crop_type)
+            image = crop_inputs[0]
+            sparse_depth = crop_inputs[1]
+            if self.is_available_ground_truth:
+                ground_truth = crop_inputs[2]
+
+        inputs = [image, sparse_depth, intrinsics]
+        if self.is_available_ground_truth:
             inputs.append(ground_truth)
 
         # Convert to float32
