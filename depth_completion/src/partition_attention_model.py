@@ -403,24 +403,37 @@ class PartitionAttentionDepthModel(nn.Module):
             for feature, n_grid in zip(sparse_features, self.level_grids)
         ]
 
-        # Step 1: Local attention: only among tokens inside the same partition.
-        rgb_partitions = self.local_attention(
-            rgb_partitions, 
-            self.rgb_local_attention)
-        sparse_partitions = self.local_attention(
-            sparse_partitions, 
-            self.sparse_local_attention)
+        # Step 1 and 2: At each level, perform local attention, exchange RGB
+        # and sparse-depth information, then pass the updated information to
+        # the next coarser level.
+        for level in range(6):
+            rgb_partitions[level] = self.local_attention(
+                [rgb_partitions[level]],
+                [self.rgb_local_attention[level]])[0]
+            sparse_partitions[level] = self.local_attention(
+                [sparse_partitions[level]],
+                [self.sparse_local_attention[level]])[0]
 
-        # Step 2: fine-to-coarse attention. 
-        rgb_partitions = self.fine_to_coarse(
-            rgb_partitions, 
-            self.rgb_fine_to_coarse_attention)
-        sparse_partitions = self.fine_to_coarse(
-            sparse_partitions, 
-            self.sparse_fine_to_coarse_attention)
+            rgb_partitions[level], sparse_partitions[level] = self.cross_modal_level(
+                rgb_partitions[level],
+                sparse_partitions[level],
+                level=level)
 
-        # The bottom partitions cover the whole image. They exchange RGB and
-        # sparse-depth information before traveling back upwards (global attention).
+            rgb_partitions[level + 1] = self.fine_to_coarse(
+                [rgb_partitions[level], rgb_partitions[level + 1]],
+                [self.rgb_fine_to_coarse_attention[level]])[1]
+            sparse_partitions[level + 1] = self.fine_to_coarse(
+                [sparse_partitions[level], sparse_partitions[level + 1]],
+                [self.sparse_fine_to_coarse_attention[level]])[1]
+
+        # The bottom partitions cover the whole image. Process the information
+        # received from the previous level before traveling back upwards.
+        rgb_partitions[6] = self.local_attention(
+            [rgb_partitions[6]],
+            [self.rgb_local_attention[6]])[0]
+        sparse_partitions[6] = self.local_attention(
+            [sparse_partitions[6]],
+            [self.sparse_local_attention[6]])[0]
         rgb_partitions[6], sparse_partitions[6] = self.cross_modal_level(
             rgb_partitions[6], 
             sparse_partitions[6], 
@@ -436,10 +449,6 @@ class PartitionAttentionDepthModel(nn.Module):
                 fine=sparse_partitions[level],
                 coarse=sparse_partitions[level + 1],
                 attention_block=self.sparse_coarse_to_fine_attention[level])
-            rgb_partitions[level], sparse_partitions[level] = self.cross_modal_level(
-                rgb_partitions[level],
-                sparse_partitions[level],
-                level=level)
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]
