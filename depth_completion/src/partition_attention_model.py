@@ -12,12 +12,12 @@ class AttentionUpdate(nn.Module):
         self.head_channels = n_channels // n_head
         self.query_chunk_size = 32
 
-        # Q, K and V with same number of channels.
+        # Q, K and V
         self.query_projection = nn.Linear(n_channels, n_channels)
         self.key_projection = nn.Linear(n_channels, n_channels)
         self.value_projection = nn.Linear(n_channels, n_channels)
 
-        # Attention result with same number of channels as query
+        # Attention result 
         self.output_projection = nn.Linear(n_channels, n_channels)
 
     def forward(self, query, context):
@@ -123,7 +123,7 @@ def feature_to_partitions(feature, n_grid):
 
 
 def partitions_to_feature(partitions, n_height, n_width):
-    '''Reverses feature_to_partitions'''
+    '''Reverses partitions to feature'''
 
     n_batch, n_grid, _, _, n_channel = partitions.shape
     partition_height = n_height // n_grid
@@ -144,12 +144,11 @@ def partitions_to_feature(partitions, n_height, n_width):
 
 
 def add_position_encoding(feature):
-    '''Add absolute 2D position information to every spatial feature token.'''
+    '''Add 2D position information to every feature token.'''
     _, n_channel, n_height, n_width = feature.shape
     n_frequency = n_channel // 4
 
-    # Pixel-center coordinates are normalized so positions from different
-    # pyramid resolutions use the same image coordinate system.
+    # Normalize so positions from different resolutions use the same coordinate system.
     y = (torch.arange(
         n_height,
         dtype=feature.dtype,
@@ -159,8 +158,7 @@ def add_position_encoding(feature):
         dtype=feature.dtype,
         device=feature.device) + 0.5) / n_width
 
-    # Multiple Fourier frequencies let attention distinguish both broad image
-    # regions and nearby spatial locations.
+    # Multiple Fourier frequencies
     frequencies = 2.0 ** torch.arange(
         n_frequency,
         dtype=feature.dtype,
