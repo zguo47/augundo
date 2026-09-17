@@ -20,7 +20,7 @@ class AttentionUpdate(nn.Module):
         # Attention result 
         self.output_projection = nn.Linear(n_channels, n_channels)
 
-    def forward(self, query, context):
+    def forward(self, query, context, context_mask=None):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
 
@@ -57,6 +57,11 @@ class AttentionUpdate(nn.Module):
             projected_key.transpose(-2, -1))
 
         similarity = similarity / math.sqrt(self.head_channels)
+
+        if context_mask is not None:
+            similarity = similarity.masked_fill(
+                ~context_mask[:, None, None, :],
+                -1e9)
 
         attention_weights = torch.softmax(similarity, dim=-1)
 
@@ -302,83 +307,182 @@ class PartitionAttentionDepthModel(nn.Module):
             rgb_tokens)
         return updated_rgb.reshape(rgb.shape), updated_sparse.reshape(sparse.shape)
 
-    def fine_context_for_coarse(self, fine_partitions):
-        '''Process the 2x2 children of every coarse partition into a single context sequence.'''
+    def fine_context_for_coarse(
+            self,
+            fine_partitions,
+            partition_height,
+            partition_width):
+        '''Get the spatially corresponding 2x2 fine tokens for every coarse token.'''
         n_batch, fine_grid, _, n_token, n_channel = fine_partitions.shape
-        coarse_grid = fine_grid // 2
+        fine_height = fine_grid * partition_height
+        fine_width = fine_grid * partition_width
+        coarse_height = fine_height // 2
+        coarse_width = fine_width // 2
 
-        context = fine_partitions.reshape(
+        fine_feature = partitions_to_feature(
+            fine_partitions,
+            fine_height,
+            fine_width)
+        fine_feature = fine_feature.permute(0, 2, 3, 1)
+        context = fine_feature.reshape(
             n_batch,
-            coarse_grid,
+            coarse_height,
             2,
-            coarse_grid,
+            coarse_width,
             2,
-            n_token,
             n_channel)
-        context = context.permute(0, 1, 3, 2, 4, 5, 6)
+        context = context.permute(0, 1, 3, 2, 4, 5)
         return context.reshape(
-            n_batch * coarse_grid * coarse_grid,
-            4 * n_token,
+            n_batch * coarse_height * coarse_width,
+            4,
             n_channel)
 
-    def fine_to_coarse(self, partitions, attention_blocks):
+    def fine_to_coarse(
+            self,
+            partitions,
+            attention_blocks,
+            partition_height,
+            partition_width):
         '''Pass info from fine to coarse'''
         outputs = list(partitions)
 
         for level, attention_block in enumerate(attention_blocks):
-            fine_context = self.fine_context_for_coarse(outputs[level])
+            fine_context = self.fine_context_for_coarse(
+                outputs[level],
+                partition_height,
+                partition_width)
             coarse = outputs[level + 1]
             n_batch, n_grid, _, n_token, n_channel = coarse.shape
-            coarse_queries = coarse.reshape(
-                n_batch * n_grid * n_grid,
-                n_token,
+            coarse_height = n_grid * partition_height
+            coarse_width = n_grid * partition_width
+            coarse_feature = partitions_to_feature(
+                coarse,
+                coarse_height,
+                coarse_width)
+            coarse_queries = coarse_feature.permute(0, 2, 3, 1).reshape(
+                n_batch * coarse_height * coarse_width,
+                1,
                 n_channel)
             updated_coarse = attention_block(
                 coarse_queries,
                 fine_context)
-            outputs[level + 1] = updated_coarse.reshape(coarse.shape)
+            updated_coarse = updated_coarse.reshape(
+                n_batch,
+                coarse_height,
+                coarse_width,
+                n_channel).permute(0, 3, 1, 2)
+            outputs[level + 1] = feature_to_partitions(
+                updated_coarse,
+                n_grid)
 
         return outputs
 
-    def parent_context_for_fine(self, coarse_partitions):
-        '''Process the parent coarse partition into a context sequence for each of its four fine children.'''
+    def parent_context_for_fine(
+            self,
+            coarse_partitions,
+            partition_height,
+            partition_width):
+        '''Get the four coarse tokens surrounding each fine token's projected position.'''
         n_batch, coarse_grid, _, n_token, n_channel = coarse_partitions.shape
+        coarse_height = coarse_grid * partition_height
+        coarse_width = coarse_grid * partition_width
+        fine_height = 2 * coarse_height
+        fine_width = 2 * coarse_width
 
-        # Copy each parent reference to its four child positions. Each child
-        # subsequently uses the same updated parent partition as its context.
-        context = coarse_partitions.reshape(
-            n_batch,
-            coarse_grid,
-            1,
-            coarse_grid,
-            1,
-            n_token,
-            n_channel)
-        context = context.expand(
-            n_batch,
-            coarse_grid,
-            2,
-            coarse_grid,
-            2,
-            n_token,
-            n_channel)
-        return context.reshape(
-            n_batch * (2 * coarse_grid) * (2 * coarse_grid),
-            n_token,
-            n_channel)
+        coarse_feature = partitions_to_feature(
+            coarse_partitions,
+            coarse_height,
+            coarse_width)
+        coarse_feature = coarse_feature.permute(0, 2, 3, 1)
 
-    def coarse_to_fine_level(self, fine, coarse, attention_block):
+        projected_y = (
+            torch.arange(
+                fine_height,
+                dtype=torch.float32,
+                device=coarse_partitions.device) + 0.5) / 2.0 - 0.5
+        projected_x = (
+            torch.arange(
+                fine_width,
+                dtype=torch.float32,
+                device=coarse_partitions.device) + 0.5) / 2.0 - 0.5
+        lower_y = torch.floor(projected_y).long()
+        upper_y = lower_y + 1
+        lower_x = torch.floor(projected_x).long()
+        upper_x = lower_x + 1
+
+        lower_y = lower_y[:, None].expand(fine_height, fine_width)
+        upper_y = upper_y[:, None].expand(fine_height, fine_width)
+        lower_x = lower_x[None, :].expand(fine_height, fine_width)
+        upper_x = upper_x[None, :].expand(fine_height, fine_width)
+        neighbor_y = torch.stack([
+            lower_y,
+            lower_y,
+            upper_y,
+            upper_y
+        ], dim=2)
+        neighbor_x = torch.stack([
+            lower_x,
+            upper_x,
+            lower_x,
+            upper_x
+        ], dim=2)
+        context_mask = \
+            (neighbor_y >= 0) & (neighbor_y < coarse_height) & \
+            (neighbor_x >= 0) & (neighbor_x < coarse_width)
+
+        neighbor_y = neighbor_y.clamp(0, coarse_height - 1)
+        neighbor_x = neighbor_x.clamp(0, coarse_width - 1)
+        context = coarse_feature[:, neighbor_y, neighbor_x, :]
+        context = context.reshape(
+            n_batch * fine_height * fine_width,
+            4,
+            n_channel)
+        context_mask = context_mask[None, ...].expand(
+            n_batch,
+            fine_height,
+            fine_width,
+            4)
+        context_mask = context_mask.reshape(
+            n_batch * fine_height * fine_width,
+            4)
+
+        return context, context_mask
+
+    def coarse_to_fine_level(
+            self,
+            fine,
+            coarse,
+            attention_block,
+            partition_height,
+            partition_width):
         '''Pass info from coarse to fine'''
         n_batch, n_grid, _, n_token, n_channel = fine.shape
-        fine_queries = fine.reshape(
-            n_batch * n_grid * n_grid,
-            n_token,
+        fine_height = n_grid * partition_height
+        fine_width = n_grid * partition_width
+        fine_feature = partitions_to_feature(
+            fine,
+            fine_height,
+            fine_width)
+        fine_queries = fine_feature.permute(0, 2, 3, 1).reshape(
+            n_batch * fine_height * fine_width,
+            1,
             n_channel)
-        parent_context = self.parent_context_for_fine(coarse)
+        parent_context, parent_context_mask = self.parent_context_for_fine(
+            coarse,
+            partition_height,
+            partition_width)
         updated_fine = attention_block(
             fine_queries,
-            parent_context)
-        return updated_fine.reshape(fine.shape)
+            parent_context,
+            context_mask=parent_context_mask)
+        updated_fine = updated_fine.reshape(
+            n_batch,
+            fine_height,
+            fine_width,
+            n_channel).permute(0, 3, 1, 2)
+        return feature_to_partitions(
+            updated_fine,
+            n_grid)
 
     def forward(self, image, sparse_depth, validity_map=None):
         # Initial convolutions create the seven RGB and sparse-depth levels.
@@ -402,6 +506,8 @@ class PartitionAttentionDepthModel(nn.Module):
             feature_to_partitions(feature, n_grid)
             for feature, n_grid in zip(sparse_features, self.level_grids)
         ]
+        partition_height = rgb_features[-1].shape[-2]
+        partition_width = rgb_features[-1].shape[-1]
 
         # Step 1 and 2: At each level, perform local attention, exchange RGB
         # and sparse-depth information, then pass the updated information to
@@ -421,10 +527,14 @@ class PartitionAttentionDepthModel(nn.Module):
 
             rgb_partitions[level + 1] = self.fine_to_coarse(
                 [rgb_partitions[level], rgb_partitions[level + 1]],
-                [self.rgb_fine_to_coarse_attention[level]])[1]
+                [self.rgb_fine_to_coarse_attention[level]],
+                partition_height,
+                partition_width)[1]
             sparse_partitions[level + 1] = self.fine_to_coarse(
                 [sparse_partitions[level], sparse_partitions[level + 1]],
-                [self.sparse_fine_to_coarse_attention[level]])[1]
+                [self.sparse_fine_to_coarse_attention[level]],
+                partition_height,
+                partition_width)[1]
 
         # The bottom partitions cover the whole image. Process the information
         # received from the previous level before traveling back upwards.
@@ -444,11 +554,15 @@ class PartitionAttentionDepthModel(nn.Module):
             rgb_partitions[level] = self.coarse_to_fine_level(
                 fine=rgb_partitions[level],
                 coarse=rgb_partitions[level + 1],
-                attention_block=self.rgb_coarse_to_fine_attention[level])
+                attention_block=self.rgb_coarse_to_fine_attention[level],
+                partition_height=partition_height,
+                partition_width=partition_width)
             sparse_partitions[level] = self.coarse_to_fine_level(
                 fine=sparse_partitions[level],
                 coarse=sparse_partitions[level + 1],
-                attention_block=self.sparse_coarse_to_fine_attention[level])
+                attention_block=self.sparse_coarse_to_fine_attention[level],
+                partition_height=partition_height,
+                partition_width=partition_width)
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]
