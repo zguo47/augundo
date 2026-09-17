@@ -20,7 +20,7 @@ class AttentionUpdate(nn.Module):
         # Attention result 
         self.output_projection = nn.Linear(n_channels, n_channels)
 
-    def forward(self, query, context, context_mask=None):
+    def forward(self, query, context):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
 
@@ -57,11 +57,6 @@ class AttentionUpdate(nn.Module):
             projected_key.transpose(-2, -1))
 
         similarity = similarity / math.sqrt(self.head_channels)
-
-        if context_mask is not None:
-            similarity = similarity.masked_fill(
-                ~context_mask[:, None, None, :],
-                -1e9)
 
         attention_weights = torch.softmax(similarity, dim=-1)
 
@@ -346,53 +341,31 @@ class PartitionAttentionDepthModel(nn.Module):
         return outputs
 
     def parent_context_for_fine(self, coarse_partitions):
-        '''Use the parent and its adjacent coarse partitions as context for each fine partition.'''
+        '''Process the parent coarse partition into a context sequence for each of its four fine children.'''
         n_batch, coarse_grid, _, n_token, n_channel = coarse_partitions.shape
-        fine_grid = 2 * coarse_grid
 
-        fine_y = torch.arange(
-            fine_grid,
-            device=coarse_partitions.device)[:, None].expand(
-                fine_grid, fine_grid)
-        fine_x = torch.arange(
-            fine_grid,
-            device=coarse_partitions.device)[None, :].expand(
-                fine_grid, fine_grid)
-        parent_y = fine_y // 2
-        parent_x = fine_x // 2
-
-        offset_y = torch.tensor(
-            [-1, -1, -1, 0, 0, 0, 1, 1, 1],
-            device=coarse_partitions.device)
-        offset_x = torch.tensor(
-            [-1, 0, 1, -1, 0, 1, -1, 0, 1],
-            device=coarse_partitions.device)
-        neighbor_y = parent_y[..., None] + offset_y
-        neighbor_x = parent_x[..., None] + offset_x
-        valid_neighbor = \
-            (neighbor_y >= 0) & (neighbor_y < coarse_grid) & \
-            (neighbor_x >= 0) & (neighbor_x < coarse_grid)
-
-        # Invalid edge positions are gathered safely and then excluded from
-        # attention by the mask, so no image padding is introduced.
-        neighbor_y = neighbor_y.clamp(0, coarse_grid - 1)
-        neighbor_x = neighbor_x.clamp(0, coarse_grid - 1)
-        context = coarse_partitions[:, neighbor_y, neighbor_x, :, :]
-        context = context.reshape(
-            n_batch * fine_grid * fine_grid,
-            9 * n_token,
-            n_channel)
-        context_mask = valid_neighbor[None, ..., None].expand(
+        # Copy each parent reference to its four child positions. Each child
+        # subsequently uses the same updated parent partition as its context.
+        context = coarse_partitions.reshape(
             n_batch,
-            fine_grid,
-            fine_grid,
-            9,
-            n_token)
-        context_mask = context_mask.reshape(
-            n_batch * fine_grid * fine_grid,
-            9 * n_token)
-
-        return context, context_mask
+            coarse_grid,
+            1,
+            coarse_grid,
+            1,
+            n_token,
+            n_channel)
+        context = context.expand(
+            n_batch,
+            coarse_grid,
+            2,
+            coarse_grid,
+            2,
+            n_token,
+            n_channel)
+        return context.reshape(
+            n_batch * (2 * coarse_grid) * (2 * coarse_grid),
+            n_token,
+            n_channel)
 
     def coarse_to_fine_level(self, fine, coarse, attention_block):
         '''Pass info from coarse to fine'''
@@ -401,12 +374,10 @@ class PartitionAttentionDepthModel(nn.Module):
             n_batch * n_grid * n_grid,
             n_token,
             n_channel)
-        parent_context, parent_context_mask = \
-            self.parent_context_for_fine(coarse)
+        parent_context = self.parent_context_for_fine(coarse)
         updated_fine = attention_block(
             fine_queries,
-            parent_context,
-            context_mask=parent_context_mask)
+            parent_context)
         return updated_fine.reshape(fine.shape)
 
     def forward(self, image, sparse_depth, validity_map=None):
