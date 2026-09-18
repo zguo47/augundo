@@ -89,8 +89,8 @@ class ConvolutionPyramid(nn.Module):
             for layer in range(3)
         ])
 
-        # Every following 3x3 convolution acts on the preceding level. Its
-        # stride of 2 halves the height and width, creating R_1 through R_4.
+        # Every following 3x3 convolution acts on the preceding level. Use 
+        # stride of 2 to divide height and width by 2. 
         self.downsample_convolutions = nn.ModuleList([
             nn.Conv2d(
                 n_channels,
@@ -114,14 +114,12 @@ class ConvolutionPyramid(nn.Module):
         return features
 
 
-def feature_to_partitions(feature, n_grid_height, n_grid_width=None):
+def feature_to_partitions(feature, n_grid_height, n_grid_width):
     '''Divide a feature map into a grid of partitions.'''
 
-    if n_grid_width is None:
-        n_grid_width = n_grid_height
-
-    # The result is B x grid_h x grid_w x T x C. The same grid dimensions
-    # are used at every level, while T decreases with spatial resolution.
+    # The result is B x grid_h x grid_w x T x C, where T is partition height x
+    # partition width. The grid dimensions are the same across all levels,
+    # while T decreases.
     n_batch, n_channel, n_height, n_width = feature.shape
     partition_height = n_height // n_grid_height
     partition_width = n_width // n_grid_width
@@ -226,15 +224,14 @@ class PartitionAttentionDepthModel(nn.Module):
             input_channels=3,
             n_channels=n_channels)
 
-        # Step 1: every partition at every resolution has an independent
-        # local self-attention operation.
+        # Step 1: every partition at every resolution perform self attention independently.
         self.rgb_local_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
             for _ in range(self.n_level)
         ])
 
         # Step 2: all tokens from all bottom-level partitions attend to one
-        # another, providing global communication across the partition grid.
+        # another, providing global communication across the grid.
         self.rgb_bottom_attention = AttentionUpdate(n_channels, n_head)
 
         # Step 3: every upper-level partition queries the corresponding
@@ -251,15 +248,12 @@ class PartitionAttentionDepthModel(nn.Module):
         '''Local attention within each partition.'''
         outputs = []
         for level_partitions, attention_block in zip(partitions, attention_blocks):
-            n_batch, n_grid_height, n_grid_width, n_token, n_channel = \
-                level_partitions.shape
+            n_batch, n_grid_height, n_grid_width, n_token, n_channel = level_partitions.shape
             tokens = level_partitions.reshape(
                 n_batch * n_grid_height * n_grid_width,
                 n_token,
                 n_channel)
 
-            # The grid dimensions are folded into the batch dimension, so all
-            # partitions are processed independently and simultaneously.
             tokens = attention_block(tokens, tokens)
             outputs.append(tokens.reshape(
                 n_batch,
@@ -271,12 +265,9 @@ class PartitionAttentionDepthModel(nn.Module):
 
     def bottom_attention(self, partitions, attention_block):
         '''Full self-attention across every bottom-level partition.'''
-        n_batch, n_grid_height, n_grid_width, n_token, n_channel = \
-            partitions.shape
+        n_batch, n_grid_height, n_grid_width, n_token, n_channel = partitions.shape
 
-        # Unlike local attention, the grid coordinates are folded into the
-        # sequence dimension. Every bottom token can therefore attend to every
-        # token from every other bottom partition.
+        # Every bottom token attend to every token from every other bottom partition.
         tokens = partitions.reshape(
             n_batch,
             n_grid_height * n_grid_width * n_token,
@@ -286,13 +277,9 @@ class PartitionAttentionDepthModel(nn.Module):
 
     def coarse_to_fine_level(self, fine, coarse, attention_block):
         '''Update each fine partition from its corresponding coarse partition.'''
-        n_batch, n_grid_height, n_grid_width, n_fine_token, n_channel = \
-            fine.shape
+        n_batch, n_grid_height, n_grid_width, n_fine_token, n_channel = fine.shape
         n_coarse_token = coarse.shape[3]
 
-        # The grid is identical at both levels. Folding the same grid location
-        # into the batch dimension pairs each fine partition only with its
-        # spatially corresponding coarse partition.
         fine_queries = fine.reshape(
             n_batch * n_grid_height * n_grid_width,
             n_fine_token,
@@ -306,19 +293,15 @@ class PartitionAttentionDepthModel(nn.Module):
             coarse_context)
         return updated_fine.reshape(fine.shape)
 
-    def forward(self, image, sparse_depth=None, validity_map=None):
-        del sparse_depth, validity_map
+    def forward(self, image):
 
-        # The RGB pyramid is sequential: R_l is produced directly from R_l-1.
+        # The RGB pyramid is sequential.
         rgb_features = self.rgb_pyramid(image)
         rgb_features = [
             add_position_encoding(feature)
             for feature in rgb_features
         ]
 
-        # The bottom feature dimensions define one fixed partition grid for
-        # every level. For a 448x640 image this is a 28x40 grid at all levels,
-        # giving partition sizes 16x16, 8x8, 4x4, 2x2 and 1x1.
         n_grid_height = rgb_features[-1].shape[-2]
         n_grid_width = rgb_features[-1].shape[-1]
         rgb_partitions = [
@@ -329,20 +312,17 @@ class PartitionAttentionDepthModel(nn.Module):
             for feature in rgb_features
         ]
 
-        # Step 1: local self-attention is independent within every partition
-        # and is applied at all five resolutions.
+        # Step 1: local self-attention.
         rgb_partitions = self.local_attention(
             rgb_partitions,
             self.rgb_local_attention)
 
-        # Step 2: the bottom level performs full attention across its entire
-        # partition grid before the information travels upward.
+        # Step 2: the bottom level performs full self attention.
         rgb_partitions[-1] = self.bottom_attention(
             rgb_partitions[-1],
             self.rgb_bottom_attention)
 
-        # Step 3: update R_3 from R_4, then R_2 from R_3, continuing until the
-        # full-resolution R_0 has received information from all lower levels.
+        # Step 3: Bottom-up travel.
         for level in range(self.n_level - 2, -1, -1):
             rgb_partitions[level] = self.coarse_to_fine_level(
                 fine=rgb_partitions[level],
