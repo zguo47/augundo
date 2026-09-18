@@ -234,6 +234,10 @@ class PartitionAttentionDepthModel(nn.Module):
         # another, providing global communication across the grid.
         self.rgb_bottom_attention = AttentionUpdate(n_channels, n_head)
 
+        # After the first coarse-to-fine update, all tokens at the level above
+        # the bottom level also perform full self-attention.
+        self.rgb_above_bottom_attention = AttentionUpdate(n_channels, n_head)
+
         # Step 3: every upper-level partition queries the corresponding
         # partition at the adjacent lower-resolution level.
         self.rgb_coarse_to_fine_attention = nn.ModuleList([
@@ -328,6 +332,11 @@ class PartitionAttentionDepthModel(nn.Module):
                 fine=rgb_partitions[level],
                 coarse=rgb_partitions[level + 1],
                 attention_block=self.rgb_coarse_to_fine_attention[level])
+
+            if level == self.n_level - 2:
+                rgb_partitions[level] = self.bottom_attention(
+                    rgb_partitions[level],
+                    self.rgb_above_bottom_attention)
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]
