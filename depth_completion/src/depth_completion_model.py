@@ -46,7 +46,17 @@ class DepthCompletionModel(object):
         else:
             dataset_name = 'kitti'
 
-        if 'partition_attention' in model_name:
+        if 'partition_attention_idea_two' in model_name:
+            from partition_attention_idea_two_depth_completion_model import \
+                PartitionAttentionIdeaTwoDepthCompletionModel
+
+            self.model = PartitionAttentionIdeaTwoDepthCompletionModel(
+                dataset_name=dataset_name,
+                network_modules=network_modules,
+                min_predict_depth=min_predict_depth,
+                max_predict_depth=max_predict_depth,
+                device=device)
+        elif 'partition_attention' in model_name:
             from partition_attention_depth_completion_model import PartitionAttentionDepthCompletionModel
 
             self.model = PartitionAttentionDepthCompletionModel(
