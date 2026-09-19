@@ -604,6 +604,11 @@ def train(train_images_path,
 
             loss.backward()
 
+            if 'partition_attention' in model_name:
+                torch.nn.utils.clip_grad_norm_(
+                    depth_completion_model.parameters_depth(),
+                    max_norm=1.0)
+
             optimizer_depth.step()
 
             if 'unsupervised' in supervision_type:
