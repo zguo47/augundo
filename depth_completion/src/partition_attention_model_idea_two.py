@@ -254,9 +254,9 @@ def add_position_encoding(feature):
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
-    RGB forms a four-level pyramid whose partition size remains 16x16. Every
-    level performs local attention, the bottom level performs full attention,
-    and every lower level updates every higher-resolution level.
+    RGB forms a four-level pyramid. Every level performs local attention, 
+    the bottom level performs full attention, and every lower level updates 
+    every higher-resolution level.
     '''
 
     def __init__(self,
@@ -284,7 +284,7 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level)
         ])
 
-        # All tokens from all four bottom partitions perform full attention.
+        # All tokens from all four bottom partitions perform full self attention.
         self.rgb_bottom_attention = AttentionUpdate(n_channels, n_head)
 
         # A separate attention block is used for each directed lower-to-upper
