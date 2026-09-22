@@ -384,10 +384,10 @@ class PartitionAttentionDepthModel(nn.Module):
                 zip(rgb_features, PARTITION_SIZES)
         ]
 
-        # Step 1: local self-attention for every level except R_0.
-        rgb_partitions[1:] = self.local_attention(
-            rgb_partitions[1:],
-            self.rgb_local_attention)
+        # # Step 1: local self-attention for every level except R_0.
+        # rgb_partitions[1:] = self.local_attention(
+        #     rgb_partitions[1:],
+        #     self.rgb_local_attention)
 
         # Full self attention at the bottom level before traveling upward.
         rgb_partitions[-1] = self.bottom_attention(
