@@ -12,9 +12,9 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path testing/void/void_test_sparse_depth_1500.txt \
 --val_intrinsics_path testing/void/void_test_intrinsics_1500.txt \
 --val_ground_truth_path testing/void/void_test_ground_truth_1500.txt \
---n_batch 2 \
---n_height 448 \
---n_width 640 \
+--n_batch 1 \
+--n_height 512 \
+--n_width 512 \
 --model_name partition_attention_void \
 --input_channels_image 3 \
 --input_channels_depth 2 \

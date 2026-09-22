@@ -28,6 +28,14 @@ class AttentionUpdate(nn.Module):
         # Attention result 
         self.output_projection = nn.Linear(n_channels, n_channels)
 
+        # Layer normalization and feedforward after multi-head attention.
+        self.attention_norm = nn.LayerNorm(n_channels)
+        self.feedforward = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.ReLU(),
+            nn.Linear(4 * n_channels, n_channels))
+        self.feedforward_norm = nn.LayerNorm(n_channels)
+
     def forward(self, query, context):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
@@ -77,7 +85,10 @@ class AttentionUpdate(nn.Module):
             self.n_head * self.head_channels)
         attended = self.output_projection(attended)
 
-        return query + attended
+        attended = self.attention_norm(query + attended)
+        feedforward = self.feedforward(attended)
+
+        return self.feedforward_norm(attended + feedforward)
 
 
 class ConvolutionPyramid(nn.Module):
@@ -88,39 +99,43 @@ class ConvolutionPyramid(nn.Module):
 
         # Three 3x3 convolutions first produce the full-resolution level R_0.
         self.full_resolution_convolutions = nn.ModuleList([
-            nn.Conv2d(
-                input_channels if layer == 0 else n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1)
+            nn.Sequential(
+                nn.Conv2d(
+                    input_channels if layer == 0 else n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.ReLU(inplace=True))
             for layer in range(3)
         ])
 
-        # Every following 3x3 convolution acts on the preceding level. Use 
-        # stride of 2 to divide height and width by 2. 
-        # Do (1, 1, 2), (1, 1, 2), (1, 1, 2) here.
+        # Every following 3x3 convolution acts on the preceding level. The
+        # first block uses stride 16, then the remaining blocks use stride 2.
         self.downsample_convolutions = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=2,
+                    stride=16 if level == 0 else 2,
                     padding=1),
+                nn.ReLU(inplace=True),
                 nn.Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
                     padding=1),
+                nn.ReLU(inplace=True),
                 nn.Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1))
-            for _ in range(4)
+                    padding=1),
+                nn.ReLU(inplace=True))
+            for level in range(4)
         ])
 
     def forward(self, image):
@@ -245,17 +260,19 @@ class PartitionAttentionDepthModel(nn.Module):
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
+        self.n_iteration = 5
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
-        # and each subsequent level has half the preceding spatial resolution.
+        # R_1 is downsampled by 16, and each remaining level is downsampled by 2.
         self.rgb_pyramid = ConvolutionPyramid(
             input_channels=3,
             n_channels=n_channels)
 
-        # Step 1: every partition at every resolution perform self attention independently.
+        # Step 1: every partition below the full-resolution level performs
+        # self attention independently.
         self.rgb_local_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(self.n_level)
+            for _ in range(self.n_level - 1)
         ])
 
         # Step 2: all tokens from all level below first partitions attend to one
@@ -268,6 +285,13 @@ class PartitionAttentionDepthModel(nn.Module):
         # Step 3: every upper-level partition queries the corresponding
         # partition at the adjacent lower-resolution level.
         self.rgb_coarse_to_fine_attention = nn.ModuleList([
+            AttentionUpdate(n_channels, n_head)
+            for _ in range(self.n_level - 1)
+        ])
+
+        # Step 4: every lower-level partition queries the corresponding
+        # partition at the adjacent upper-resolution level.
+        self.rgb_fine_to_coarse_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
             for _ in range(self.n_level - 1)
         ])
@@ -295,7 +319,7 @@ class PartitionAttentionDepthModel(nn.Module):
         return outputs
 
     def bottom_attention(self, partitions, attention_block):
-        '''Full self-attention across every bottom-level partition.'''
+        '''Full self-attention across every partition in one level.'''
         n_batch, n_partition_height, n_partition_width, n_token, n_channel = partitions.shape
 
         # Every bottom token attend to every token from every other bottom partition.
@@ -324,6 +348,24 @@ class PartitionAttentionDepthModel(nn.Module):
             coarse_context)
         return updated_fine.reshape(fine.shape)
 
+    def fine_to_coarse_level(self, coarse, fine, attention_block):
+        '''Update each coarse partition from its corresponding fine partition.'''
+        n_batch, n_partition_height, n_partition_width, n_coarse_token, n_channel = coarse.shape
+        n_fine_token = fine.shape[3]
+
+        coarse_queries = coarse.reshape(
+            n_batch * n_partition_height * n_partition_width,
+            n_coarse_token,
+            n_channel)
+        fine_context = fine.reshape(
+            n_batch * n_partition_height * n_partition_width,
+            n_fine_token,
+            n_channel)
+        updated_coarse = attention_block(
+            coarse_queries,
+            fine_context)
+        return updated_coarse.reshape(coarse.shape)
+
     def forward(self, image):
 
         # The RGB pyramid is sequential.
@@ -342,26 +384,46 @@ class PartitionAttentionDepthModel(nn.Module):
                 zip(rgb_features, PARTITION_SIZES)
         ]
 
-        # Step 1: local self-attention.
-        rgb_partitions = self.local_attention(
-            rgb_partitions,
+        # Step 1: local self-attention for every level except R_0.
+        rgb_partitions[1:] = self.local_attention(
+            rgb_partitions[1:],
             self.rgb_local_attention)
 
-        # Step 3: Bottom-up travel.
-        for level in range(self.n_level - 1, 0, -1):
+        # Full self attention at the bottom level before traveling upward.
+        rgb_partitions[-1] = self.bottom_attention(
+            rgb_partitions[-1],
+            self.rgb_full_attention[-1])
 
-            # Full self attention for every level except the top level.
-            rgb_partitions[level] = self.bottom_attention(
-                rgb_partitions[level],
-                self.rgb_bottom_attention)
-            
-        for level in range(self.n_level - 2, -1, -1):
+        for _ in range(self.n_iteration):
 
-            # Coarse to fine exchange
-            rgb_partitions[level] = self.coarse_to_fine_level(
-                fine=rgb_partitions[level],
-                coarse=rgb_partitions[level + 1],
-                attention_block=self.rgb_coarse_to_fine_attention[level])
+            # Bottom-up travel.
+            for level in range(self.n_level - 2, -1, -1):
+
+                # Coarse to fine exchange
+                rgb_partitions[level] = self.coarse_to_fine_level(
+                    fine=rgb_partitions[level],
+                    coarse=rgb_partitions[level + 1],
+                    attention_block=self.rgb_coarse_to_fine_attention[level])
+
+                # Full self attention for every level except the top level.
+                if level > 0:
+                    rgb_partitions[level] = self.bottom_attention(
+                        rgb_partitions[level],
+                        self.rgb_full_attention[level - 1])
+
+            # Top-down travel.
+            for level in range(1, self.n_level):
+
+                # Fine to coarse exchange
+                rgb_partitions[level] = self.fine_to_coarse_level(
+                    coarse=rgb_partitions[level],
+                    fine=rgb_partitions[level - 1],
+                    attention_block=self.rgb_fine_to_coarse_attention[level - 1])
+
+                # Full self attention after each partition exchange.
+                rgb_partitions[level] = self.bottom_attention(
+                    rgb_partitions[level],
+                    self.rgb_full_attention[level - 1])
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]

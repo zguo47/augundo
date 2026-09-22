@@ -91,6 +91,33 @@ def random_crop(inputs, shape, intrinsics=None, crop_type=['none']):
     n_height, n_width = shape
     _, o_height, o_width = inputs[0].shape
 
+    # Pad inputs when the requested crop is larger than the original image.
+    d_pad_height = max(0, n_height - o_height)
+    d_pad_width = max(0, n_width - o_width)
+    pad_top = d_pad_height // 2
+    pad_bottom = d_pad_height - pad_top
+    pad_left = d_pad_width // 2
+    pad_right = d_pad_width - pad_left
+
+    if d_pad_height > 0 or d_pad_width > 0:
+        inputs = [
+            np.pad(
+                T,
+                ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+                mode='constant')
+            for T in inputs
+        ]
+
+        if intrinsics is not None:
+            offset_principal_point = [[0.0, 0.0, pad_left],
+                                      [0.0, 0.0, pad_top ],
+                                      [0.0, 0.0, 0.0     ]]
+            intrinsics = [
+                in_ + offset_principal_point for in_ in intrinsics
+            ]
+
+        _, o_height, o_width = inputs[0].shape
+
     # Get delta of crop and original height and width
     d_height = o_height - n_height
     d_width = o_width - n_width
