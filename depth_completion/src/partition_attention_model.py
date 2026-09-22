@@ -297,7 +297,11 @@ class PartitionAttentionDepthModel(nn.Module):
         ])
 
         # Each final full-resolution RGB token is decoded to one depth value.
-        self.depth_output = nn.Linear(n_channels, 1)
+        self.depth_output = nn.Sequential(
+            nn.LayerNorm(n_channels),
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.ReLU(),
+            nn.Linear(4 * n_channels, 1))
 
     def local_attention(self, partitions, attention_blocks):
         '''Local attention within each partition.'''
@@ -394,7 +398,7 @@ class PartitionAttentionDepthModel(nn.Module):
             rgb_partitions[-1],
             self.rgb_full_attention[-1])
 
-        for _ in range(self.n_iteration):
+        for iteration in range(self.n_iteration):
 
             # Bottom-up travel.
             for level in range(self.n_level - 2, -1, -1):
@@ -411,19 +415,21 @@ class PartitionAttentionDepthModel(nn.Module):
                         rgb_partitions[level],
                         self.rgb_full_attention[level - 1])
 
-            # Top-down travel.
-            for level in range(1, self.n_level):
+            if iteration < self.n_iteration - 1:
 
-                # Fine to coarse exchange
-                rgb_partitions[level] = self.fine_to_coarse_level(
-                    coarse=rgb_partitions[level],
-                    fine=rgb_partitions[level - 1],
-                    attention_block=self.rgb_fine_to_coarse_attention[level - 1])
+                # Top-down travel.
+                for level in range(1, self.n_level):
 
-                # Full self attention after each partition exchange.
-                rgb_partitions[level] = self.bottom_attention(
-                    rgb_partitions[level],
-                    self.rgb_full_attention[level - 1])
+                    # Fine to coarse exchange
+                    rgb_partitions[level] = self.fine_to_coarse_level(
+                        coarse=rgb_partitions[level],
+                        fine=rgb_partitions[level - 1],
+                        attention_block=self.rgb_fine_to_coarse_attention[level - 1])
+
+                    # Full self attention after each partition exchange.
+                    rgb_partitions[level] = self.bottom_attention(
+                        rgb_partitions[level],
+                        self.rgb_full_attention[level - 1])
 
         # Depth is read from the final full-resolution RGB tokens.
         full_rgb = rgb_partitions[0]
