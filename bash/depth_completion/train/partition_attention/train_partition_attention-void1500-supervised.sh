@@ -23,6 +23,7 @@ python depth_completion/src/train_depth_completion.py \
 --max_predict_depth 8.0 \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
+--n_step_per_gradient_accumulation ${N_GRADIENT_ACCUMULATION:-4} \
 --augmentation_probabilities 1.0 \
 --augmentation_schedule -1 \
 --augmentation_random_brightness 0.50 1.50 \

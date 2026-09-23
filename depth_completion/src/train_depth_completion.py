@@ -67,6 +67,8 @@ parser.add_argument('--learning_rates',
     nargs='+', type=float, default=[1e-4, 5e-5], help='Space delimited list of learning rates')
 parser.add_argument('--learning_schedule',
     nargs='+', type=int, default=[5, 10], help='Space delimited list to change learning rate')
+parser.add_argument('--n_step_per_gradient_accumulation',
+    type=int, default=1, help='Number of batches to accumulate before updating weights')
 
 # Augmentation settings
 parser.add_argument('--augmentation_probabilities',
@@ -173,6 +175,7 @@ if __name__ == '__main__':
 
     # Training settings
     assert len(args.learning_rates) == len(args.learning_schedule)
+    assert args.n_step_per_gradient_accumulation > 0
 
     args.augmentation_random_crop_type = [
         crop_type.lower() for crop_type in args.augmentation_random_crop_type
@@ -218,6 +221,7 @@ if __name__ == '__main__':
           # Training settings
           learning_rates=args.learning_rates,
           learning_schedule=args.learning_schedule,
+          n_step_per_gradient_accumulation=args.n_step_per_gradient_accumulation,
           # Augmentation setting
           augmentation_probabilities=args.augmentation_probabilities,
           augmentation_schedule=args.augmentation_schedule,

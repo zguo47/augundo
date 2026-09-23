@@ -41,6 +41,7 @@ def train(train_images_path,
           # Training settings
           learning_rates,
           learning_schedule,
+          n_step_per_gradient_accumulation,
           augmentation_probabilities,
           augmentation_schedule,
           # Photometric data augmentations
@@ -319,6 +320,7 @@ def train(train_images_path,
         n_train_step=n_train_step,
         learning_rates=learning_rates,
         learning_schedule=learning_schedule,
+        n_step_per_gradient_accumulation=n_step_per_gradient_accumulation,
         # Augmentation settings
         augmentation_probabilities=augmentation_probabilities,
         augmentation_schedule=augmentation_schedule,
@@ -427,6 +429,10 @@ def train(train_images_path,
         n_train_step = n_train_step + train_step
 
     time_start = time.time()
+
+    optimizer_depth.zero_grad()
+    if 'unsupervised' in supervision_type:
+        optimizer_pose.zero_grad()
 
     # Define padding for input image, sparse depth, validity map
     padding_modes = [augmentation_padding_mode, 'constant', 'constant']
@@ -597,12 +603,6 @@ def train(train_images_path,
                 w_losses=w_losses)
 
             # Compute gradient and backpropagate
-            optimizer_depth.zero_grad()
-
-            if 'unsupervised' in supervision_type:
-                optimizer_pose.zero_grad()
-
-
             # if 'partition_attention' in model_name:
             #     torch.nn.utils.clip_grad_norm_(
             #         depth_completion_model.parameters_depth(),
@@ -614,12 +614,25 @@ def train(train_images_path,
             if train_step % 100 == 0:
                 weight_before = parameter.detach().clone()
 
-            loss.backward()
+            accumulated_loss = loss / n_step_per_gradient_accumulation
+            accumulated_loss.backward()
 
             if train_step % 100 == 0:
                 print('gradient norm:', parameter.grad.norm().item())
 
-            optimizer_depth.step()
+            is_optimizer_step = \
+                train_step % n_step_per_gradient_accumulation == 0
+
+            if is_optimizer_step:
+                optimizer_depth.step()
+
+                if 'unsupervised' in supervision_type:
+                    optimizer_pose.step()
+
+                optimizer_depth.zero_grad()
+
+                if 'unsupervised' in supervision_type:
+                    optimizer_pose.zero_grad()
 
             if train_step % 100 == 0:
                 update_norm = (
@@ -641,9 +654,6 @@ def train(train_images_path,
                     output_depth0[0].max().item(),
                     output_depth0[0].std().item())
                     
-            if 'unsupervised' in supervision_type:
-                optimizer_pose.step()
-
             if (train_step % n_step_per_summary) == 0:
 
                 if 'unsupervised' in supervision_type:
@@ -717,6 +727,17 @@ def train(train_images_path,
                     train_step,
                     optimizer_depth,
                     optimizer_pose)
+
+    if train_step % n_step_per_gradient_accumulation != 0:
+        optimizer_depth.step()
+
+        if 'unsupervised' in supervision_type:
+            optimizer_pose.step()
+
+        optimizer_depth.zero_grad()
+
+        if 'unsupervised' in supervision_type:
+            optimizer_pose.zero_grad()
 
     # Perform validation for final step
     depth_completion_model.eval()
@@ -1299,6 +1320,7 @@ def log_training_settings(log_path,
                           n_train_step,
                           learning_rates,
                           learning_schedule,
+                          n_step_per_gradient_accumulation,
                           # Augmentation settings
                           augmentation_probabilities,
                           augmentation_schedule,
@@ -1337,6 +1359,8 @@ def log_training_settings(log_path,
             ls * (n_train_sample // n_batch), le * (n_train_sample // n_batch), v)
             for ls, le, v in zip([0] + learning_schedule[:-1], learning_schedule, learning_rates)),
         log_path)
+    log('n_step_per_gradient_accumulation={}'.format(
+        n_step_per_gradient_accumulation), log_path)
     log('', log_path)
 
     log('Augmentation settings:', log_path)
