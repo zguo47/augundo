@@ -602,15 +602,45 @@ def train(train_images_path,
             if 'unsupervised' in supervision_type:
                 optimizer_pose.zero_grad()
 
+
+            # if 'partition_attention' in model_name:
+            #     torch.nn.utils.clip_grad_norm_(
+            #         depth_completion_model.parameters_depth(),
+            #         max_norm=1.0)
+            parameter = next(
+                p for p in depth_completion_model.parameters_depth()
+                if p.requires_grad)
+
+            if train_step % 100 == 0:
+                weight_before = parameter.detach().clone()
+
             loss.backward()
 
-            if 'partition_attention' in model_name:
-                torch.nn.utils.clip_grad_norm_(
-                    depth_completion_model.parameters_depth(),
-                    max_norm=1.0)
+            if train_step % 100 == 0:
+                print('gradient norm:', parameter.grad.norm().item())
 
             optimizer_depth.step()
 
+            if train_step % 100 == 0:
+                update_norm = (
+                    parameter.detach() - weight_before
+                ).norm().item()
+
+                relative_update = update_norm / (
+                    weight_before.norm().item() + 1e-12
+                )
+
+                print('Step:', train_step)
+                print('weight update:', update_norm)
+                print('relative update:', relative_update)
+
+            if train_step % 100 == 0:
+                print(
+                    'output min/max/std:',
+                    output_depth0[0].min().item(),
+                    output_depth0[0].max().item(),
+                    output_depth0[0].std().item())
+                    
             if 'unsupervised' in supervision_type:
                 optimizer_pose.step()
 
