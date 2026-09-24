@@ -20,6 +20,14 @@ class AttentionUpdate(nn.Module):
         # Attention result
         self.output_projection = nn.Linear(n_channels, n_channels)
 
+        # Layer normalization and feedforward after multi-head attention.
+        self.attention_norm = nn.LayerNorm(n_channels)
+        self.feedforward = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.LeakyReLU(),
+            nn.Linear(4 * n_channels, n_channels))
+        self.feedforward_norm = nn.LayerNorm(n_channels)
+
     def forward(self, query, context):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
@@ -66,154 +74,70 @@ class AttentionUpdate(nn.Module):
             self.n_head * self.head_channels)
         attended = self.output_projection(attended)
 
-        return query + attended
+        attended = self.attention_norm(query + attended)
+        feedforward = self.feedforward(attended)
+
+        return self.feedforward_norm(attended + feedforward)
 
 
 class ConvolutionPyramid(nn.Module):
-    '''Creates four sequential RGB levels for idea two.'''
+    '''Creates five sequential spatial levels from RGB.'''
 
     def __init__(self, input_channels, n_channels):
         super(ConvolutionPyramid, self).__init__()
 
-        # Three 1x1 convolutions preserve the input resolution and create R_0.
+        # Three 3x3 convolutions first produce the full-resolution level R_0.
         self.full_resolution_convolutions = nn.ModuleList([
-            nn.Conv2d(
-                input_channels if layer == 0 else n_channels,
-                n_channels,
-                kernel_size=1,
-                stride=1)
+            nn.Sequential(
+                nn.Conv2d(
+                    input_channels if layer == 0 else n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True))
             for layer in range(3)
         ])
 
-        # R_1 and R_2 each use two 3x3 convolutions and one 7x7 convolution.
-        # The first 3x3 convolution halves the preceding spatial resolution.
-        self.level_1_convolutions = nn.ModuleList([
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=7,
-                stride=1,
-                padding=3)
+        # Every following 3x3 convolution acts on the preceding level. The
+        # first block uses stride 16, then the remaining blocks use stride 2.
+        self.downsample_convolutions = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=16 if level == 0 else 2,
+                    padding=1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True))
+            for level in range(4)
         ])
-        self.level_2_convolutions = nn.ModuleList([
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=7,
-                stride=1,
-                padding=3)
-        ])
-
-        # The bottom block operates on R_2 sequentially. For a 448x640 input,
-        # its final 19x5 convolution with stride 3x5 maps 112x160 to 32x32.
-        # With 16x16 partitions, the bottom level therefore has a 2x2 grid.
-        self.bottom_convolutions = nn.ModuleList([
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1),
-            nn.Conv2d(
-                n_channels,
-                n_channels,
-                kernel_size=(19, 5),
-                stride=(3, 5))
-        ])
-
-    def apply_convolutions(self, feature, convolutions):
-        for convolution in convolutions:
-            feature = convolution(feature)
-        return feature
 
     def forward(self, image):
-        level_0 = self.apply_convolutions(
-            image,
-            self.full_resolution_convolutions)
-        level_1 = self.apply_convolutions(
-            level_0,
-            self.level_1_convolutions)
-        level_2 = self.apply_convolutions(
-            level_1,
-            self.level_2_convolutions)
-        level_3 = self.apply_convolutions(
-            level_2,
-            self.bottom_convolutions)
+        feature = image
+        for convolution in self.full_resolution_convolutions:
+            feature = convolution(feature)
 
-        return [level_0, level_1, level_2, level_3]
+        features = [feature]
+        for convolution in self.downsample_convolutions:
+            feature = convolution(feature)
+            features.append(feature)
 
-
-def feature_to_partitions(feature, partition_size):
-    '''Divide a feature map into non-overlapping k x k partitions.'''
-    n_batch, n_channel, n_height, n_width = feature.shape
-    n_grid_height = n_height // partition_size
-    n_grid_width = n_width // partition_size
-
-    partitions = feature.reshape(
-        n_batch,
-        n_channel,
-        n_grid_height,
-        partition_size,
-        n_grid_width,
-        partition_size)
-    partitions = partitions.permute(0, 2, 4, 3, 5, 1)
-    return partitions.reshape(
-        n_batch,
-        n_grid_height,
-        n_grid_width,
-        partition_size * partition_size,
-        n_channel)
-
-
-def partitions_to_feature(partitions, n_height, n_width):
-    '''Reverse partitions to a feature map.'''
-    n_batch, n_grid_height, n_grid_width, n_token, n_channel = \
-        partitions.shape
-    partition_size = int(math.sqrt(n_token))
-
-    feature = partitions.reshape(
-        n_batch,
-        n_grid_height,
-        n_grid_width,
-        partition_size,
-        partition_size,
-        n_channel)
-    feature = feature.permute(0, 5, 1, 3, 2, 4)
-    return feature.reshape(
-        n_batch,
-        n_channel,
-        n_height,
-        n_width)
+        return features
 
 
 def add_position_encoding(feature):
@@ -221,6 +145,7 @@ def add_position_encoding(feature):
     _, n_channel, n_height, n_width = feature.shape
     n_frequency = n_channel // 4
 
+    # Normalize so positions from different resolutions use the same coordinate system.
     y = (torch.arange(
         n_height,
         dtype=feature.dtype,
@@ -230,6 +155,7 @@ def add_position_encoding(feature):
         dtype=feature.dtype,
         device=feature.device) + 0.5) / n_width
 
+    # Multiple Fourier frequencies
     frequencies = 2.0 ** torch.arange(
         n_frequency,
         dtype=feature.dtype,
@@ -254,167 +180,128 @@ def add_position_encoding(feature):
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
-    RGB forms a four-level pyramid. Every level performs local attention, 
-    the bottom level performs full attention, and every lower level updates 
-    every higher-resolution level.
+    RGB forms the same sequential five-level pyramid as idea one. Every level
+    except the full-resolution level performs full self-attention independently.
+    A U-Net-style decoder upsamples from the bottom, concatenates the feature at
+    the corresponding upper level, and returns to full resolution.
     '''
 
     def __init__(self,
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
                  n_channels=32,
-                 n_head=4,
-                 partition_size=16):
+                 n_head=4):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
-        self.n_level = 4
-        self.partition_size = partition_size
+        self.n_level = 5
 
+        # The convolution pyramid is identical to idea one. R_0 is full
+        # resolution, R_1 is downsampled by 16, and every later level by 2.
         self.rgb_pyramid = ConvolutionPyramid(
             input_channels=3,
             n_channels=n_channels)
 
-        # Every partition at every resolution performs self-attention
-        # independently from the other partitions at that level.
-        self.rgb_local_attention = nn.ModuleList([
+        # R_1, R_2, R_3 and R_4 each perform independent full self-attention
+        # over every spatial token in that resolution level.
+        self.rgb_full_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(self.n_level)
+            for _ in range(self.n_level - 1)
         ])
 
-        # All tokens from all four bottom partitions perform full self attention.
-        self.rgb_bottom_attention = AttentionUpdate(n_channels, n_head)
+        # The first three decoder stages double the resolution. The final
+        # stage maps R_1 back to the full-resolution shape of R_0.
+        self.up_convolutions = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=16 if level == 0 else 2,
+                    stride=16 if level == 0 else 2),
+                nn.LeakyReLU(inplace=True))
+            for level in range(self.n_level - 2, -1, -1)
+        ])
 
-        # A separate attention block is used for each directed lower-to-upper
-        # connection: 3->2, 3->1, 3->0, 2->1, 2->0 and 1->0.
-        self.rgb_lower_to_upper_attention = nn.ModuleDict({
-            '{}_to_{}'.format(source_level, target_level):
-                AttentionUpdate(n_channels, n_head)
-            for source_level in range(1, self.n_level)
-            for target_level in range(source_level)
-        })
+        # Concatenation produces 2C channels. One convolution combines the
+        # upsampled decoder feature with the corresponding encoder feature and
+        # restores the shared C-channel representation for the next stage.
+        self.fusion_convolutions = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(
+                    2 * n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True))
+            for _ in range(self.n_level - 1)
+        ])
 
-        self.depth_output = nn.Linear(n_channels, 1)
+        # Every final full-resolution token passes through the same
+        # feedforward network to produce one raw depth value.
+        self.depth_output = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(4 * n_channels, 1))
 
-    def local_attention(self, partitions, attention_blocks):
-        '''Local self-attention within every partition at every level.'''
-        outputs = []
-        for level_partitions, attention_block in zip(
-                partitions,
-                attention_blocks):
-            n_batch, n_grid_height, n_grid_width, n_token, n_channel = \
-                level_partitions.shape
-            tokens = level_partitions.reshape(
-                n_batch * n_grid_height * n_grid_width,
-                n_token,
-                n_channel)
-            tokens = attention_block(tokens, tokens)
-            outputs.append(tokens.reshape(level_partitions.shape))
-
-        return outputs
-
-    def full_attention(self, partitions, attention_block):
-        '''Full self-attention across all partitions in one level.'''
-        n_batch, n_grid_height, n_grid_width, n_token, n_channel = \
-            partitions.shape
-        tokens = partitions.reshape(
+    def full_attention(self, feature, attention_block):
+        '''Full self-attention across every spatial token in one level.'''
+        n_batch, n_channel, n_height, n_width = feature.shape
+        tokens = feature.permute(0, 2, 3, 1).reshape(
             n_batch,
-            n_grid_height * n_grid_width * n_token,
+            n_height * n_width,
             n_channel)
         tokens = attention_block(tokens, tokens)
-        return tokens.reshape(partitions.shape)
-
-    def corresponding_context(self, source, target_grid_height, target_grid_width):
-        '''Route each target partition to the source partition covering its center.'''
-        n_batch, source_grid_height, source_grid_width, n_token, n_channel = \
-            source.shape
-
-        target_y = torch.arange(
-            target_grid_height,
-            device=source.device)
-        target_x = torch.arange(
-            target_grid_width,
-            device=source.device)
-        source_y = torch.floor(
-            (target_y + 0.5) * source_grid_height / target_grid_height).long()
-        source_x = torch.floor(
-            (target_x + 0.5) * source_grid_width / target_grid_width).long()
-
-        context = source[:, source_y[:, None], source_x[None, :], :, :]
-        return context.reshape(
-            n_batch * target_grid_height * target_grid_width,
-            n_token,
-            n_channel)
-
-    def lower_to_upper_level(self, upper, lower, attention_block):
-        '''Update an upper level from spatially corresponding lower partitions.'''
-        n_batch, upper_grid_height, upper_grid_width, n_token, n_channel = \
-            upper.shape
-        upper_queries = upper.reshape(
-            n_batch * upper_grid_height * upper_grid_width,
-            n_token,
-            n_channel)
-        lower_context = self.corresponding_context(
-            lower,
-            upper_grid_height,
-            upper_grid_width)
-        updated_upper = attention_block(
-            upper_queries,
-            lower_context)
-        return updated_upper.reshape(upper.shape)
+        return tokens.reshape(
+            n_batch,
+            n_height,
+            n_width,
+            n_channel).permute(0, 3, 1, 2)
 
     def forward(self, image):
-        # Create R_0, R_1, R_2 and R_3 sequentially from RGB.
+        # Create R_0, R_1, R_2, R_3 and R_4 sequentially from RGB using the
+        # same convolution pyramid as idea one.
         rgb_features = self.rgb_pyramid(image)
         rgb_features = [
             add_position_encoding(feature)
             for feature in rgb_features
         ]
 
-        # Every level is divided into non-overlapping 16x16 partitions.
-        rgb_partitions = [
-            feature_to_partitions(feature, self.partition_size)
-            for feature in rgb_features
-        ]
+        # Full self-attention is independent at each resolution and is omitted
+        # only for the full-resolution R_0 level.
+        for level, attention_block in enumerate(
+                self.rgb_full_attention,
+                start=1):
+            rgb_features[level] = self.full_attention(
+                rgb_features[level],
+                attention_block)
 
-        # First perform local self-attention independently at every level.
-        rgb_partitions = self.local_attention(
-            rgb_partitions,
-            self.rgb_local_attention)
+        # Start at R_4. Each stage upsamples the current decoder feature,
+        # concatenates it with the corresponding encoder feature, and fuses
+        # the 2C concatenated channels back into C channels.
+        feature = rgb_features[-1]
+        for level, up_convolution, fusion_convolution in zip(
+                range(self.n_level - 2, -1, -1),
+                self.up_convolutions,
+                self.fusion_convolutions):
+            feature = up_convolution(feature)
+            feature = torch.cat([
+                feature,
+                rgb_features[level]
+            ], dim=1)
+            feature = fusion_convolution(feature)
 
-        # The 2x2 bottom grid then performs full attention across all four
-        # partitions and all tokens contained in those partitions.
-        rgb_partitions[-1] = self.full_attention(
-            rgb_partitions[-1],
-            self.rgb_bottom_attention)
-
-        # Each lower level updates every level above it. Because sources are
-        # processed from bottom to top, an updated intermediate level passes
-        # both its own information and information received from lower levels.
-        for source_level in range(self.n_level - 1, 0, -1):
-            for target_level in range(source_level - 1, -1, -1):
-                attention_name = '{}_to_{}'.format(
-                    source_level,
-                    target_level)
-                rgb_partitions[target_level] = self.lower_to_upper_level(
-                    upper=rgb_partitions[target_level],
-                    lower=rgb_partitions[source_level],
-                    attention_block=self.rgb_lower_to_upper_attention[
-                        attention_name])
-
-        # Decode every updated full-resolution token directly to metric depth.
-        full_rgb = rgb_partitions[0]
+        # Convert the full-resolution feature map to a token sequence so the
+        # final feedforward network operates independently on every pixel.
+        full_rgb = feature.permute(0, 2, 3, 1)
         raw_depth = self.depth_output(full_rgb)
+        raw_depth = raw_depth.permute(0, 3, 1, 2)
+
         normalized_depth = torch.sigmoid(raw_depth)
         log_min_depth = math.log(self.min_predict_depth)
         log_max_depth = math.log(self.max_predict_depth)
-        depth_partitions = torch.exp(
+        return torch.exp(
             log_min_depth +
             normalized_depth * (log_max_depth - log_min_depth))
-
-        return partitions_to_feature(
-            depth_partitions,
-            n_height=image.shape[-2],
-            n_width=image.shape[-1])

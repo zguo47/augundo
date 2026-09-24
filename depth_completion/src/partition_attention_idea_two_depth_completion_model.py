@@ -6,7 +6,7 @@ from utils.src import loss_utils
 
 
 class PartitionAttentionIdeaTwoDepthCompletionModel(object):
-    '''Repository wrapper for the RGB-only idea-two partition-attention model.'''
+    '''Repository wrapper for the RGB-only idea-two U-Net ablation model.'''
 
     def __init__(self,
                  dataset_name='kitti',
