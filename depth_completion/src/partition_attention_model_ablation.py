@@ -5,26 +5,28 @@ import torch.nn as nn
 
 
 class AttentionUpdate(nn.Module):
-    '''Update with attention.'''
+    '''Update with attention '''
     def __init__(self, n_channels, n_head):
         super(AttentionUpdate, self).__init__()
 
         self.n_head = n_head
         self.head_channels = n_channels // n_head
+        self.query_chunk_size = 32
 
         # Q, K and V
         self.query_projection = nn.Linear(n_channels, n_channels)
         self.key_projection = nn.Linear(n_channels, n_channels)
         self.value_projection = nn.Linear(n_channels, n_channels)
 
-        # Attention result
+        # Attention result 
         self.output_projection = nn.Linear(n_channels, n_channels)
 
         # Layer normalization and feedforward after multi-head attention.
         self.attention_norm = nn.LayerNorm(n_channels)
+        self.context_norm = nn.LayerNorm(n_channels)
         self.feedforward = nn.Sequential(
             nn.Linear(n_channels, 4 * n_channels),
-            nn.LeakyReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_channels, n_channels))
         self.feedforward_norm = nn.LayerNorm(n_channels)
 
@@ -32,29 +34,34 @@ class AttentionUpdate(nn.Module):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
 
-        # Q: N x L_q x C -> N x heads x L_q x D_head
+        # normalize query and context
+        query = self.attention_norm(query)
+        context = self.context_norm(context)
+
+        # Prepare Q, K, and V for multi-head attention
+        # Q: N x L_q x C_q -> N x heads x L_q x D_head
         projected_query = self.query_projection(query)
         projected_query = projected_query.reshape(
-            n_batch,
-            n_query,
-            self.n_head,
+            n_batch, 
+            n_query, 
+            self.n_head, 
             self.head_channels)
         projected_query = projected_query.permute(0, 2, 1, 3)
 
-        # K and V: N x L_k x C -> N x heads x L_k x D_head
+        # K and V: N x L_k x C_k -> N x heads x L_k x D_head
         projected_key = self.key_projection(context)
         projected_key = projected_key.reshape(
-            n_batch,
-            n_context,
-            self.n_head,
+            n_batch, 
+            n_context, 
+            self.n_head, 
             self.head_channels)
         projected_key = projected_key.permute(0, 2, 1, 3)
 
         projected_value = self.value_projection(context)
         projected_value = projected_value.reshape(
-            n_batch,
-            n_context,
-            self.n_head,
+            n_batch, 
+            n_context, 
+            self.n_head, 
             self.head_channels)
         projected_value = projected_value.permute(0, 2, 1, 3)
 
@@ -62,22 +69,31 @@ class AttentionUpdate(nn.Module):
         similarity = torch.matmul(
             projected_query,
             projected_key.transpose(-2, -1))
+
         similarity = similarity / math.sqrt(self.head_channels)
+
         attention_weights = torch.softmax(similarity, dim=-1)
+
         attended = torch.matmul(
             attention_weights,
             projected_value)
-
         attended = attended.permute(0, 2, 1, 3).reshape(
-            n_batch,
-            n_query,
+            n_batch, 
+            n_query, 
             self.n_head * self.head_channels)
+
         attended = self.output_projection(attended)
 
-        attended = self.attention_norm(query + attended)
-        feedforward = self.feedforward(attended)
+        # Residual connection after attention
+        x = query + attended
 
-        return self.feedforward_norm(attended + feedforward)
+        # Layer norm before ffn
+        feedforward = self.feedforward(self.feedforward_norm(x))
+
+        # Residual connection after feedforward
+        x = x + feedforward
+
+        return x
 
 
 class ConvolutionPyramid(nn.Module):
@@ -107,23 +123,24 @@ class ConvolutionPyramid(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
                     stride=16 if level == 0 else 2,
                     padding=1),
-                nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
-                    n_channels,
-                    n_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1),
-                nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
-                    n_channels,
-                    n_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1),
-                nn.LeakyReLU(inplace=True))
+                nn.LeakyReLU(inplace=True)
+                )
             for level in range(4)
         ])
 
@@ -180,7 +197,7 @@ def add_position_encoding(feature):
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
-    RGB forms the same sequential five-level pyramid as idea one. Every level
+    RGB forms the same sequential five-level pyramid as original idea. Every level
     except the full-resolution level performs full self-attention independently.
     A U-Net-style decoder upsamples from the bottom, concatenates the feature at
     the corresponding upper level, and returns to full resolution.
@@ -198,14 +215,13 @@ class PartitionAttentionDepthModel(nn.Module):
         self.n_channels = n_channels
         self.n_level = 5
 
-        # The convolution pyramid is identical to idea one. R_0 is full
+        # The convolution pyramid is identical. R_0 is full
         # resolution, R_1 is downsampled by 16, and every later level by 2.
         self.rgb_pyramid = ConvolutionPyramid(
             input_channels=3,
             n_channels=n_channels)
 
         # R_1, R_2, R_3 and R_4 each perform independent full self-attention
-        # over every spatial token in that resolution level.
         self.rgb_full_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
             for _ in range(self.n_level - 1)
@@ -224,9 +240,7 @@ class PartitionAttentionDepthModel(nn.Module):
             for level in range(self.n_level - 2, -1, -1)
         ])
 
-        # Concatenation produces 2C channels. One convolution combines the
-        # upsampled decoder feature with the corresponding encoder feature and
-        # restores the shared C-channel representation for the next stage.
+        # Fuse to restore to C channels
         self.fusion_convolutions = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(

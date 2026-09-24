@@ -15,7 +15,7 @@ python depth_completion/src/train_depth_completion.py \
 --n_batch 1 \
 --n_height 512 \
 --n_width 512 \
---model_name partition_attention_idea_two_void \
+--model_name partition_attention_ablation_void \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \
@@ -23,6 +23,7 @@ python depth_completion/src/train_depth_completion.py \
 --max_predict_depth 8.0 \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
+--n_step_per_gradient_accumulation 8 \
 --augmentation_probabilities 1.0 \
 --augmentation_schedule -1 \
 --augmentation_random_brightness 0.50 1.50 \
@@ -56,6 +57,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/partition_attention_idea_two/void1500/unet_ablation \
+    trained_models/depth_completion/partition_attention_ablation/void1500/unet_ablation \
 --device gpu \
 --n_thread 8

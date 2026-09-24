@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 
-from partition_attention_model_idea_two import PartitionAttentionDepthModel
+from partition_attention_model_ablation import PartitionAttentionDepthModel
 from utils.src import loss_utils
 
 
-class PartitionAttentionIdeaTwoDepthCompletionModel(object):
-    '''Repository wrapper for the RGB-only idea-two U-Net ablation model.'''
+class PartitionAttentionAblationDepthCompletionModel(object):
+    '''Repository wrapper for the RGB-only U-Net ablation model.'''
 
     def __init__(self,
                  dataset_name='kitti',
