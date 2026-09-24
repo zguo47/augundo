@@ -30,15 +30,20 @@ class AttentionUpdate(nn.Module):
 
         # Layer normalization and feedforward after multi-head attention.
         self.attention_norm = nn.LayerNorm(n_channels)
+        self.context_norm = nn.LayerNorm(n_channels)
         self.feedforward = nn.Sequential(
             nn.Linear(n_channels, 4 * n_channels),
-            nn.LeakyReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(4 * n_channels, n_channels))
         self.feedforward_norm = nn.LayerNorm(n_channels)
 
     def forward(self, query, context):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
+
+        # normalize query and context
+        query = self.attention_norm(query)
+        context = self.context_norm(context)
 
         # Prepare Q, K, and V for multi-head attention
         # Q: N x L_q x C_q -> N x heads x L_q x D_head
@@ -83,12 +88,19 @@ class AttentionUpdate(nn.Module):
             n_batch, 
             n_query, 
             self.n_head * self.head_channels)
+
         attended = self.output_projection(attended)
 
-        attended = self.attention_norm(query + attended)
-        feedforward = self.feedforward(attended)
+        # Residual connection after attention
+        x = query + attended
 
-        return self.attention_norm(attended + feedforward)
+        # Layer norm before ffn
+        feedforward = self.feedforward(self.feedforward_norm(x))
+
+        # Residual connection after feedforward
+        x = x + feedforward
+
+        return x
 
 
 class ConvolutionPyramid(nn.Module):
@@ -118,9 +130,9 @@ class ConvolutionPyramid(nn.Module):
                 nn.Conv2d(
                     n_channels,
                     n_channels,
-                    kernel_size=7,
-                    stride=16 if level == 0 else 2,
-                    padding=3),
+                    kernel_size=3,
+                    stride=1,
+                    padding=1),
                 nn.LeakyReLU(inplace=True),
                 nn.Conv2d(
                     n_channels,
@@ -133,7 +145,7 @@ class ConvolutionPyramid(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
+                    stride=16 if level == 0 else 2,
                     padding=1),
                 nn.LeakyReLU(inplace=True)
                 )
@@ -298,12 +310,21 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
+        # Before propagating to the full-res level, pass the features through a feedforward network.
+        self.feedforwardtofullres = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_channels, 4 * n_channels),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(4 * n_channels, n_channels))
+            for _ in range(self.n_iteration)
+        ])
+
         # Each final full-resolution RGB token is decoded to one depth value.
-        # self.depth_output = nn.Sequential(
-        #     nn.Linear(n_channels, 4 * n_channels),
-        #     nn.LeakyReLU(),
-        #     nn.Linear(4 * n_channels, 1))
-        self.depth_output = nn.Linear(n_channels, 1)
+        self.depth_output = nn.Sequential(
+            nn.Linear(n_channels, 4 * n_channels),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(4 * n_channels, 1))
+        # self.depth_output = nn.Linear(n_channels, 1)
 
     def local_attention(self, partitions, attention_blocks):
         '''Local attention within each partition.'''
@@ -410,6 +431,9 @@ class PartitionAttentionDepthModel(nn.Module):
                     fine=rgb_partitions[level],
                     coarse=rgb_partitions[level + 1],
                     attention_block=self.rgb_coarse_to_fine_attention[level])
+                
+                if level == 0:
+                    rgb_partitions[level] = self.feedforwardtofullres[iteration](rgb_partitions[level])
 
                 # Full self attention for every level except the top level.
                 if level > 0:
