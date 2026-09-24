@@ -35,6 +35,7 @@ class AttentionUpdate(nn.Module):
         n_context = context.shape[1]
 
         # normalize query and context
+        residual = query
         query = self.attention_norm(query)
         context = self.context_norm(context)
 
@@ -85,7 +86,7 @@ class AttentionUpdate(nn.Module):
         attended = self.output_projection(attended)
 
         # Residual connection after attention
-        x = query + attended
+        x = residual + attended
 
         # Layer norm before ffn
         feedforward = self.feedforward(self.feedforward_norm(x))
