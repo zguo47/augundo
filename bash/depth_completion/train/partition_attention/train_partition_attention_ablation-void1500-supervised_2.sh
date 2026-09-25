@@ -15,6 +15,7 @@ python depth_completion/src/train_depth_completion.py \
 --n_batch 1 \
 --n_height 512 \
 --n_width 512 \
+--n_train_sample_limit 1 \
 --model_name partition_attention_ablation_void \
 --input_channels_image 3 \
 --input_channels_depth 2 \
@@ -22,9 +23,9 @@ python depth_completion/src/train_depth_completion.py \
 --min_predict_depth 0.1 \
 --max_predict_depth 8.0 \
 --learning_rates ${LR:-1e-4} \
---learning_schedule 40 \
---n_step_per_gradient_accumulation 8 \
---augmentation_probabilities 1.0 \
+--learning_schedule 10000 \
+--n_step_per_gradient_accumulation 1 \
+--augmentation_probabilities 0.0 \
 --augmentation_schedule -1 \
 --augmentation_random_brightness 0.50 1.50 \
 --augmentation_random_contrast 0.50 1.50 \
@@ -34,7 +35,7 @@ python depth_completion/src/train_depth_completion.py \
 --augmentation_random_noise_type none \
 --augmentation_random_noise_spread -1 \
 --augmentation_padding_mode edge \
---augmentation_random_crop_type horizontal vertical \
+--augmentation_random_crop_type none \
 --augmentation_random_crop_to_shape -1 -1 -1 -1 \
 --augmentation_random_flip_type horizontal vertical \
 --augmentation_random_rotate_max -1 \
@@ -52,11 +53,11 @@ python depth_completion/src/train_depth_completion.py \
 --w_weight_decay_pose 0.00 \
 --min_evaluate_depth 0.2 \
 --max_evaluate_depth 5.0 \
---n_step_per_summary 500 \
---n_image_per_summary 4 \
+--n_step_per_summary 100 \
+--n_image_per_summary 1 \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/partition_attention_ablation/void1500/unet_ablation_2 \
+    trained_models/depth_completion/partition_attention_ablation/void1500/single_sample_overfit \
 --device gpu \
 --n_thread 8

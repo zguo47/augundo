@@ -43,6 +43,8 @@ parser.add_argument('--n_height',
     type=int, default=480, help='Height of of sample')
 parser.add_argument('--n_width',
     type=int, default=640, help='Width of each sample')
+parser.add_argument('--n_train_sample_limit',
+    type=int, default=-1, help='Maximum number of training samples to use; disabled if -1')
 
 # Input settings
 parser.add_argument('--input_channels_image',
@@ -204,6 +206,7 @@ if __name__ == '__main__':
           n_batch=args.n_batch,
           n_height=args.n_height,
           n_width=args.n_width,
+          n_train_sample_limit=args.n_train_sample_limit,
           # Input settings
           input_channels_image=args.input_channels_image,
           input_channels_depth=args.input_channels_depth,

@@ -24,6 +24,7 @@ def train(train_images_path,
           n_batch,
           n_height,
           n_width,
+          n_train_sample_limit,
           # Input settings
           input_channels_image,
           input_channels_depth,
@@ -136,6 +137,13 @@ def train(train_images_path,
 
     for paths in input_paths:
         assert len(paths) == n_train_sample
+
+    if n_train_sample_limit > 0:
+        train_images_paths = train_images_paths[:n_train_sample_limit]
+        train_sparse_depth_paths = train_sparse_depth_paths[:n_train_sample_limit]
+        train_intrinsics_paths = train_intrinsics_paths[:n_train_sample_limit]
+        train_ground_truth_paths = train_ground_truth_paths[:n_train_sample_limit]
+        n_train_sample = len(train_images_paths)
 
     # Set up training dataloader
     n_train_step = \
