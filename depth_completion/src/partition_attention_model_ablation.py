@@ -98,7 +98,7 @@ class AttentionUpdate(nn.Module):
 
 
 class ConvolutionPyramid(nn.Module):
-    '''Creates eight sequential spatial levels from RGB.'''
+    '''Creates five sequential spatial levels from RGB.'''
 
     def __init__(self, input_channels, n_channels):
         super(ConvolutionPyramid, self).__init__()
@@ -116,8 +116,8 @@ class ConvolutionPyramid(nn.Module):
             for layer in range(3)
         ])
 
-        # Every following block acts on the preceding level and reduces its
-        # height and width by 2.
+        # Every following 3x3 convolution acts on the preceding level. The
+        # first block uses stride 16, then the remaining blocks use stride 2.
         self.downsample_convolutions = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(
@@ -138,11 +138,11 @@ class ConvolutionPyramid(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=2,
+                    stride=16 if level == 0 else 2,
                     padding=1),
                 nn.LeakyReLU(inplace=True)
                 )
-            for _ in range(7)
+            for level in range(4)
         ])
 
     def forward(self, image):
@@ -198,10 +198,10 @@ def add_position_encoding(feature):
 
 class PartitionAttentionDepthModel(nn.Module):
     '''
-    RGB forms an eight-level pyramid with progressive 2x downsampling. The four
-    coarse levels perform full self-attention independently. A U-Net-style
-    decoder upsamples from the bottom, concatenates the feature at every upper
-    level, and returns to full resolution.
+    RGB forms the same sequential five-level pyramid as original idea. Every level
+    except the full-resolution level performs full self-attention independently.
+    A U-Net-style decoder upsamples from the bottom, concatenates the feature at
+    the corresponding upper level, and returns to full resolution.
     '''
 
     def __init__(self,
@@ -214,34 +214,31 @@ class PartitionAttentionDepthModel(nn.Module):
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
-        self.n_level = 8
-        self.first_attention_level = 4
+        self.n_level = 5
 
-        # R_0 is full resolution and every later level is downsampled by 2.
-        # For a 512x512 input, the levels are 512, 256, 128, 64, 32, 16, 8 and 4.
+        # The convolution pyramid is identical. R_0 is full
+        # resolution, R_1 is downsampled by 16, and every later level by 2.
         self.rgb_pyramid = ConvolutionPyramid(
             input_channels=3,
             n_channels=n_channels)
 
-        # The 32x32, 16x16, 8x8 and 4x4 levels each perform independent full
-        # self-attention. Full attention is not applied to the added high-
-        # resolution levels because its memory grows quadratically in the
-        # number of spatial tokens.
+        # R_1, R_2, R_3 and R_4 each perform independent full self-attention
         self.rgb_full_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(self.first_attention_level, self.n_level)
+            for _ in range(self.n_level - 1)
         ])
 
-        # Every decoder stage doubles the resolution until returning to R_0.
+        # The first three decoder stages double the resolution. The final
+        # stage maps R_1 back to the full-resolution shape of R_0.
         self.up_convolutions = nn.ModuleList([
             nn.Sequential(
                 nn.ConvTranspose2d(
                     n_channels,
                     n_channels,
-                    kernel_size=2,
-                    stride=2),
+                    kernel_size=16 if level == 0 else 2,
+                    stride=16 if level == 0 else 2),
                 nn.LeakyReLU(inplace=True))
-            for _ in range(self.n_level - 2, -1, -1)
+            for level in range(self.n_level - 2, -1, -1)
         ])
 
         # Fuse to restore to C channels
@@ -279,23 +276,24 @@ class PartitionAttentionDepthModel(nn.Module):
             n_channel).permute(0, 3, 1, 2)
 
     def forward(self, image):
-        # Create R_0 through R_7 sequentially from RGB using progressive 2x
-        # downsampling.
+        # Create R_0, R_1, R_2, R_3 and R_4 sequentially from RGB using the
+        # same convolution pyramid as idea one.
         rgb_features = self.rgb_pyramid(image)
         rgb_features = [
             add_position_encoding(feature)
             for feature in rgb_features
         ]
 
-        # Full self-attention is independent at each feasible coarse resolution.
-        for level, attention_block in zip(
-                range(self.first_attention_level, self.n_level),
-                self.rgb_full_attention):
+        # Full self-attention is independent at each resolution and is omitted
+        # only for the full-resolution R_0 level.
+        for level, attention_block in enumerate(
+                self.rgb_full_attention,
+                start=1):
             rgb_features[level] = self.full_attention(
                 rgb_features[level],
                 attention_block)
 
-        # Start at R_7. Each stage upsamples the current decoder feature,
+        # Start at R_4. Each stage upsamples the current decoder feature,
         # concatenates it with the corresponding encoder feature, and fuses
         # the 2C concatenated channels back into C channels.
         feature = rgb_features[-1]
