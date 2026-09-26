@@ -254,12 +254,29 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Every final full-resolution token passes through the same
-        # feedforward network to produce one raw depth value.
+        # Three 3x3 convolutions decode the full-resolution feature map into
+        # one raw depth value while preserving spatial neighborhood context.
         self.depth_output = nn.Sequential(
-            nn.Linear(n_channels, 4 * n_channels),
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1),
             nn.LeakyReLU(inplace=True),
-            nn.Linear(4 * n_channels, 1))
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(
+                n_channels,
+                1,
+                kernel_size=3,
+                stride=1,
+                padding=1))
 
     def full_attention(self, feature, attention_block):
         '''Full self-attention across every spatial token in one level.'''
@@ -269,11 +286,15 @@ class PartitionAttentionDepthModel(nn.Module):
             n_height * n_width,
             n_channel)
         tokens = attention_block(tokens, tokens)
-        return tokens.reshape(
+
+        # Restore the attended tokens to a spatial feature map before the
+        # upsampling and fusion convolutions use this level.
+        feature = tokens.reshape(
             n_batch,
             n_height,
             n_width,
             n_channel).permute(0, 3, 1, 2)
+        return feature
 
     def forward(self, image):
         # Create R_0, R_1, R_2, R_3 and R_4 sequentially from RGB using the
@@ -308,11 +329,8 @@ class PartitionAttentionDepthModel(nn.Module):
             ], dim=1)
             feature = fusion_convolution(feature)
 
-        # Convert the full-resolution feature map to a token sequence so the
-        # final feedforward network operates independently on every pixel.
-        full_rgb = feature.permute(0, 2, 3, 1)
-        raw_depth = self.depth_output(full_rgb)
-        raw_depth = raw_depth.permute(0, 3, 1, 2)
+        # Decode directly from the full-resolution spatial feature map.
+        raw_depth = self.depth_output(feature)
 
         normalized_depth = torch.sigmoid(raw_depth)
         log_min_depth = math.log(self.min_predict_depth)
