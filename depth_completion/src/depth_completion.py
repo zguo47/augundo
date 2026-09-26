@@ -419,6 +419,7 @@ def train(train_images_path,
 
     # Start training
     train_step = 0
+    n = 0
 
     if len(restore_paths) > 0:
         try:
@@ -475,7 +476,7 @@ def train(train_images_path,
 
         for inputs in train_dataloader:
 
-            train_step = train_step + 1
+            n = n + 1
 
             # Fetch data
             inputs = [
@@ -611,10 +612,7 @@ def train(train_images_path,
                 w_losses=w_losses)
 
             # Compute gradient and backpropagate
-            # if 'partition_attention' in model_name:
-            #     torch.nn.utils.clip_grad_norm_(
-            #         depth_completion_model.parameters_depth(),
-            #         max_norm=1.0)
+
             parameter = next(
                 p for p in depth_completion_model.parameters_depth()
                 if p.requires_grad)
@@ -628,10 +626,12 @@ def train(train_images_path,
             if train_step % 100 == 0:
                 print('gradient norm:', parameter.grad.norm().item())
 
-            is_optimizer_step = \
-                train_step % n_step_per_gradient_accumulation == 0
+            is_optimizer_step = n % n_step_per_gradient_accumulation == 0
 
             if is_optimizer_step:
+
+                train_step = train_step + 1
+
                 optimizer_depth.step()
 
                 if 'unsupervised' in supervision_type:
