@@ -46,7 +46,17 @@ class DepthCompletionModel(object):
         else:
             dataset_name = 'kitti'
 
-        if 'partition_attention_ablation' in model_name:
+        if 'partition_attention_multiscale_ablation' in model_name:
+            from partition_attention_multiscale_ablation_depth_completion_model import \
+                PartitionAttentionMultiscaleAblationDepthCompletionModel
+
+            self.model = PartitionAttentionMultiscaleAblationDepthCompletionModel(
+                dataset_name=dataset_name,
+                network_modules=network_modules,
+                min_predict_depth=min_predict_depth,
+                max_predict_depth=max_predict_depth,
+                device=device)
+        elif 'partition_attention_ablation' in model_name:
             from partition_attention_ablation_depth_completion_model import \
                 PartitionAttentionAblationDepthCompletionModel
 
