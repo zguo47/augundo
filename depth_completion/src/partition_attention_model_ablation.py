@@ -228,14 +228,13 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # The first three decoder stages double the resolution. The final
-        # stage maps R_1 back to R_0 with bilinear interpolation followed by
-        # a 3x3 convolution instead of a non-overlapping stride-16 transpose
-        # convolution.
+        # Every decoder stage uses bilinear interpolation followed by a 3x3
+        # convolution. The first three stages double the resolution, while
+        # the final stage maps R_1 back to the full-resolution R_0 shape.
         self.up_convolutions = nn.ModuleList([
             nn.Sequential(
                 nn.Upsample(
-                    scale_factor=16,
+                    scale_factor=16 if level == 0 else 2,
                     mode='bilinear',
                     align_corners=True),
                 nn.Conv2d(
@@ -244,14 +243,6 @@ class PartitionAttentionDepthModel(nn.Module):
                     kernel_size=3,
                     stride=1,
                     padding=1),
-                nn.LeakyReLU(inplace=True))
-            if level == 0 else
-            nn.Sequential(
-                nn.ConvTranspose2d(
-                    n_channels,
-                    n_channels,
-                    kernel_size=2,
-                    stride=2),
                 nn.LeakyReLU(inplace=True))
             for level in range(self.n_level - 2, -1, -1)
         ])
