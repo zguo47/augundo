@@ -1,7 +1,13 @@
 import math
+import os
+import sys
 
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, os.path.join(
+    'external_src', 'depth_completion', 'kbnet', 'src'))
+from net_utils import UpConv2d
 
 
 class AttentionUpdate(nn.Module):
@@ -228,23 +234,14 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Every decoder stage uses bilinear interpolation followed by a 3x3
-        # convolution. The first three stages double the resolution, while
-        # the final stage maps R_1 back to the full-resolution R_0 shape.
+        # Every decoder stage uses KBNet's upsample-and-convolution block.
         self.up_convolutions = nn.ModuleList([
-            nn.Sequential(
-                nn.Upsample(
-                    scale_factor=16 if level == 0 else 2,
-                    mode='bilinear',
-                    align_corners=True),
-                nn.Conv2d(
-                    n_channels,
-                    n_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1),
-                nn.LeakyReLU(inplace=True))
-            for level in range(self.n_level - 2, -1, -1)
+            UpConv2d(
+                in_channels=n_channels,
+                out_channels=n_channels,
+                kernel_size=3,
+                activation_func=nn.LeakyReLU(inplace=True))
+            for _ in range(self.n_level - 1)
         ])
 
         # Fuse to restore to C channels
@@ -328,7 +325,9 @@ class PartitionAttentionDepthModel(nn.Module):
                 range(self.n_level - 2, -1, -1),
                 self.up_convolutions,
                 self.fusion_convolutions):
-            feature = up_convolution(feature)
+            feature = up_convolution(
+                feature,
+                shape=rgb_features[level].shape[-2:])
             feature = torch.cat([
                 feature,
                 rgb_features[level]
