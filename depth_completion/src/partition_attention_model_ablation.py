@@ -7,7 +7,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(
     'external_src', 'depth_completion', 'kbnet', 'src'))
-from net_utils import UpConv2d
+from net_utils import Conv2d, UpConv2d
 
 
 class AttentionUpdate(nn.Module):
@@ -112,12 +112,12 @@ class ConvolutionPyramid(nn.Module):
         # Three 3x3 convolutions first produce the full-resolution level R_0.
         self.full_resolution_convolutions = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(
+                Conv2d(
                     input_channels if layer == 0 else n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True))
             for layer in range(3)
         ])
@@ -126,26 +126,26 @@ class ConvolutionPyramid(nn.Module):
         # first block uses stride 16, then the remaining blocks use stride 2.
         self.downsample_convolutions = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=16 if level == 0 else 2,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True)
                 )
             for level in range(4)
@@ -247,12 +247,12 @@ class PartitionAttentionDepthModel(nn.Module):
         # Fuse to restore to C channels
         self.fusion_convolutions = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(
+                Conv2d(
                     2 * n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True))
             for _ in range(self.n_level - 1)
         ])
@@ -260,26 +260,26 @@ class PartitionAttentionDepthModel(nn.Module):
         # Three 3x3 convolutions decode the full-resolution feature map into
         # one raw depth value while preserving spatial neighborhood context.
         self.depth_output = nn.Sequential(
-            nn.Conv2d(
+            Conv2d(
                 n_channels,
                 n_channels,
                 kernel_size=3,
                 stride=1,
-                padding=1),
+                activation_func=None),
             nn.LeakyReLU(inplace=True),
-            nn.Conv2d(
+            Conv2d(
                 n_channels,
                 n_channels,
                 kernel_size=3,
                 stride=1,
-                padding=1),
+                activation_func=None),
             nn.LeakyReLU(inplace=True),
-            nn.Conv2d(
+            Conv2d(
                 n_channels,
                 1,
                 kernel_size=3,
                 stride=1,
-                padding=1))
+                activation_func=None))
 
     def full_attention(self, feature, attention_block):
         '''Full self-attention across every spatial token in one level.'''
