@@ -116,9 +116,7 @@ class ConvolutionPyramid(nn.Module):
                     input_channels if layer == 0 else n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True))
+                    stride=1))
             for layer in range(3)
         ])
 
@@ -130,23 +128,17 @@ class ConvolutionPyramid(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True),
+                    stride=1),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True),
+                    stride=1),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=16 if level == 0 else 2,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True)
+                    stride=16 if level == 0 else 2)
                 )
             for level in range(4)
         ])
@@ -239,8 +231,7 @@ class PartitionAttentionDepthModel(nn.Module):
             UpConv2d(
                 in_channels=n_channels,
                 out_channels=n_channels,
-                kernel_size=3,
-                activation_func=nn.LeakyReLU(inplace=True))
+                kernel_size=3)
             for _ in range(self.n_level - 1)
         ])
 
@@ -251,9 +242,7 @@ class PartitionAttentionDepthModel(nn.Module):
                     2 * n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True))
+                    stride=1))
             for _ in range(self.n_level - 1)
         ])
 
@@ -264,16 +253,12 @@ class PartitionAttentionDepthModel(nn.Module):
                 n_channels,
                 n_channels,
                 kernel_size=3,
-                stride=1,
-                activation_func=None),
-            nn.LeakyReLU(inplace=True),
+                stride=1),
             Conv2d(
                 n_channels,
                 n_channels,
                 kernel_size=3,
-                stride=1,
-                activation_func=None),
-            nn.LeakyReLU(inplace=True),
+                stride=1),
             Conv2d(
                 n_channels,
                 1,
