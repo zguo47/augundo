@@ -1,7 +1,13 @@
 import math
+import os
+import sys
 
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, os.path.join(
+    'external_src', 'depth_completion', 'kbnet', 'src'))
+from net_utils import Conv2d
 
 PARTITION_SIZES = [
     (128, 128),
@@ -113,12 +119,12 @@ class ConvolutionPyramid(nn.Module):
         # Three 3x3 convolutions first produce the full-resolution level R_0.
         self.full_resolution_convolutions = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(
+                Conv2d(
                     input_channels if layer == 0 else n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True)
                 )
             for layer in range(3)
@@ -128,26 +134,26 @@ class ConvolutionPyramid(nn.Module):
         # first block uses stride 16, then the remaining blocks use stride 2.
         self.downsample_convolutions = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=1,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True),
-                nn.Conv2d(
+                Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
                     stride=16 if level == 0 else 2,
-                    padding=1),
+                    activation_func=None),
                 nn.LeakyReLU(inplace=True)
                 )
             for level in range(4)
@@ -268,7 +274,8 @@ class PartitionAttentionDepthModel(nn.Module):
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
                  n_channels=32,
-                 n_head=4):
+                 n_head=4,
+                 n_self_attention=3):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -276,6 +283,7 @@ class PartitionAttentionDepthModel(nn.Module):
         self.n_channels = n_channels
         self.n_level = 5
         self.n_iteration = 5
+        self.n_self_attention = n_self_attention
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
         # R_1 is downsampled by 16, and each remaining level is downsampled by 2.
@@ -293,7 +301,10 @@ class PartitionAttentionDepthModel(nn.Module):
         # Step 2: all tokens from all level below first partitions attend to one
         # another, providing global communication across the grid.
         self.rgb_full_attention = nn.ModuleList([
-            AttentionUpdate(n_channels, n_head)
+            nn.ModuleList([
+                AttentionUpdate(n_channels, n_head)
+                for _ in range(n_self_attention)
+            ])
             for _ in range(self.n_level - 1)
         ])
 
@@ -311,21 +322,48 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Before propagating to the full-res level, pass the features through a feedforward network.
-        self.feedforwardtofullres = nn.ModuleList([
+        # After propagating back to the full-resolution level, restore the
+        # partitions to one spatial feature map and pass it through three
+        # convolutions with activation.
+        self.convolutiontofullres = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(n_channels, 4 * n_channels),
-                nn.LeakyReLU(inplace=True),
-                nn.Linear(4 * n_channels, n_channels))
+                Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1),
+                Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1),
+                Conv2d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=3,
+                    stride=1))
             for _ in range(self.n_iteration)
         ])
 
-        # Each final full-resolution RGB token is decoded to one depth value.
+        # Three spatial convolutions decode the final full-resolution feature.
+        # The first two use Conv2d's activation and the last produces raw depth.
         self.depth_output = nn.Sequential(
-            nn.Linear(n_channels, 4 * n_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(4 * n_channels, 1))
-        # self.depth_output = nn.Linear(n_channels, 1)
+            Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                stride=1),
+            Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                stride=1),
+            Conv2d(
+                n_channels,
+                1,
+                kernel_size=3,
+                stride=1,
+                activation_func=None))
 
     def local_attention(self, partitions, attention_blocks):
         '''Local attention within each partition.'''
@@ -357,6 +395,14 @@ class PartitionAttentionDepthModel(nn.Module):
             n_channel)
         tokens = attention_block(tokens, tokens)
         return tokens.reshape(partitions.shape)
+
+    def repeated_bottom_attention(self, partitions, attention_blocks):
+        '''Apply multiple consecutive full self-attention smoothing blocks.'''
+        for attention_block in attention_blocks:
+            partitions = self.bottom_attention(
+                partitions,
+                attention_block)
+        return partitions
 
     def coarse_to_fine_level(self, fine, coarse, attention_block):
         '''Update each fine partition from its corresponding coarse partition.'''
@@ -418,7 +464,7 @@ class PartitionAttentionDepthModel(nn.Module):
         #     self.rgb_local_attention)
 
         # Full self attention at the bottom level before traveling upward.
-        rgb_partitions[-1] = self.bottom_attention(
+        rgb_partitions[-1] = self.repeated_bottom_attention(
             rgb_partitions[-1],
             self.rgb_full_attention[-1])
 
@@ -434,11 +480,20 @@ class PartitionAttentionDepthModel(nn.Module):
                     attention_block=self.rgb_coarse_to_fine_attention[level])
                 
                 if level == 0:
-                    rgb_partitions[level] = self.feedforwardtofullres[iteration](rgb_partitions[level])
+                    full_resolution_feature = partitions_to_feature(
+                        rgb_partitions[level],
+                        n_height=image.shape[-2],
+                        n_width=image.shape[-1])
+                    full_resolution_feature = self.convolutiontofullres[iteration](
+                        full_resolution_feature)
+                    rgb_partitions[level] = feature_to_partitions(
+                        full_resolution_feature,
+                        partition_height=PARTITION_SIZES[level][0],
+                        partition_width=PARTITION_SIZES[level][1])
 
                 # Full self attention for every level except the top level.
                 if level > 0:
-                    rgb_partitions[level] = self.bottom_attention(
+                    rgb_partitions[level] = self.repeated_bottom_attention(
                         rgb_partitions[level],
                         self.rgb_full_attention[level - 1])
 
@@ -454,19 +509,19 @@ class PartitionAttentionDepthModel(nn.Module):
                         attention_block=self.rgb_fine_to_coarse_attention[level - 1])
 
                     # Full self attention after each partition exchange.
-                    rgb_partitions[level] = self.bottom_attention(
+                    rgb_partitions[level] = self.repeated_bottom_attention(
                         rgb_partitions[level],
                         self.rgb_full_attention[level - 1])
 
-        # Depth is read from the final full-resolution RGB tokens.
-        full_rgb = rgb_partitions[0]
+        # Restore the final full-resolution partitions and decode spatially.
+        full_rgb = partitions_to_feature(
+            rgb_partitions[0],
+            n_height=image.shape[-2],
+            n_width=image.shape[-1])
         raw_depth = self.depth_output(full_rgb)
         normalized_depth = torch.sigmoid(raw_depth)
         log_min_depth = math.log(self.min_predict_depth)
         log_max_depth = math.log(self.max_predict_depth)
-        depth_partitions = torch.exp(log_min_depth + normalized_depth * (log_max_depth - log_min_depth))
-
-        return partitions_to_feature(
-            depth_partitions,
-            n_height=image.shape[-2],
-            n_width=image.shape[-1])
+        return torch.exp(
+            log_min_depth +
+            normalized_depth * (log_max_depth - log_min_depth))
