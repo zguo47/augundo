@@ -418,6 +418,28 @@ class PartitionAttentionDepthModel(nn.Module):
             coarse_context)
         return updated_fine.reshape(fine.shape)
 
+    def global_coarse_to_fine_level(self, fine, coarse, attention_block):
+        '''Update every fine partition from the complete coarse level.'''
+        n_batch, n_partition_height, n_partition_width, _, n_channel = fine.shape
+
+        # Every full-resolution partition receives the same complete R_1
+        # context instead of a separate set of coarse tokens.
+        coarse_context = coarse.reshape(
+            n_batch,
+            -1,
+            n_channel)
+
+        updated_fine = []
+        for partition_height in range(n_partition_height):
+            updated_row = []
+            for partition_width in range(n_partition_width):
+                updated_row.append(attention_block(
+                    fine[:, partition_height, partition_width, :, :],
+                    coarse_context))
+            updated_fine.append(torch.stack(updated_row, dim=1))
+
+        return torch.stack(updated_fine, dim=1)
+
     def fine_to_coarse_level(self, coarse, fine, attention_block):
         '''Update each coarse partition from its corresponding fine partition.'''
         n_batch, n_partition_height, n_partition_width, n_coarse_token, n_channel = coarse.shape
@@ -470,10 +492,16 @@ class PartitionAttentionDepthModel(nn.Module):
             for level in range(self.n_level - 2, -1, -1):
 
                 # Coarse to fine exchange
-                rgb_partitions[level] = self.coarse_to_fine_level(
-                    fine=rgb_partitions[level],
-                    coarse=rgb_partitions[level + 1],
-                    attention_block=self.rgb_coarse_to_fine_attention[level])
+                if level == 0:
+                    rgb_partitions[level] = self.global_coarse_to_fine_level(
+                        fine=rgb_partitions[level],
+                        coarse=rgb_partitions[level + 1],
+                        attention_block=self.rgb_coarse_to_fine_attention[level])
+                else:
+                    rgb_partitions[level] = self.coarse_to_fine_level(
+                        fine=rgb_partitions[level],
+                        coarse=rgb_partitions[level + 1],
+                        attention_block=self.rgb_coarse_to_fine_attention[level])
                 
                 if level == 0:
                     full_resolution_feature = partitions_to_feature(
