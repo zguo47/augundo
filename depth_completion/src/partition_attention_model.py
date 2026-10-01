@@ -266,14 +266,14 @@ class PartitionAttentionDepthModel(nn.Module):
                  max_predict_depth=8.0,
                  n_channels=32,
                  n_head=4,
-                 n_self_attention=2):
+                 n_self_attention=3):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
-        self.n_iteration = 5
+        self.n_iteration = 2
         self.n_self_attention = n_self_attention
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
@@ -400,7 +400,7 @@ class PartitionAttentionDepthModel(nn.Module):
         return tokens.reshape(partitions.shape)
 
     def repeated_bottom_attention(self, partitions, attention_blocks):
-        '''Apply multiple consecutive full self-attention smoothing blocks.'''
+        '''Apply multiple consecutive full self-attention blocks.'''
         for attention_block in attention_blocks:
             partitions = self.bottom_attention(
                 partitions,
@@ -453,8 +453,7 @@ class PartitionAttentionDepthModel(nn.Module):
             n_height=n_coarse_height,
             n_width=n_coarse_width)
 
-        # Shift both levels by half of their own partition size. The shifted
-        # windows therefore cross the boundaries of the original windows.
+        # Shift both levels by half of their own partition size. 
         fine_shift = (
             PARTITION_SIZES[0][0] // 2,
             PARTITION_SIZES[0][1] // 2)

@@ -617,14 +617,8 @@ def train(train_images_path,
                 p for p in depth_completion_model.parameters_depth()
                 if p.requires_grad)
 
-            if train_step % 100 == 0:
-                weight_before = parameter.detach().clone()
-
             accumulated_loss = loss / n_step_per_gradient_accumulation
             accumulated_loss.backward()
-
-            if train_step % 100 == 0:
-                print('gradient norm:', parameter.grad.norm().item())
 
             is_optimizer_step = n % n_step_per_gradient_accumulation == 0
 
@@ -641,26 +635,6 @@ def train(train_images_path,
 
                 if 'unsupervised' in supervision_type:
                     optimizer_pose.zero_grad()
-
-            if train_step % 100 == 0:
-                update_norm = (
-                    parameter.detach() - weight_before
-                ).norm().item()
-
-                relative_update = update_norm / (
-                    weight_before.norm().item() + 1e-12
-                )
-
-                print('Step:', train_step)
-                print('weight update:', update_norm)
-                print('relative update:', relative_update)
-
-            if train_step % 100 == 0:
-                print(
-                    'output min/max/std:',
-                    output_depth0[0].min().item(),
-                    output_depth0[0].max().item(),
-                    output_depth0[0].std().item())
                     
             if (train_step % n_step_per_summary) == 0:
 
