@@ -306,6 +306,13 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
+        # Shifted-window attention is used only for the final R_1 to R_0
+        # propagation so adjacent full-resolution partitions can exchange
+        # coarse context without global attention.
+        self.rgb_shifted_coarse_to_fine_attention = AttentionUpdate(
+            n_channels,
+            n_head)
+
         # Step 4: every lower-level partition queries the corresponding
         # partition at the adjacent upper-resolution level.
         self.rgb_fine_to_coarse_attention = nn.ModuleList([
@@ -418,27 +425,77 @@ class PartitionAttentionDepthModel(nn.Module):
             coarse_context)
         return updated_fine.reshape(fine.shape)
 
-    def global_coarse_to_fine_level(self, fine, coarse, attention_block):
-        '''Update every fine partition from the complete coarse level.'''
-        n_batch, n_partition_height, n_partition_width, _, n_channel = fine.shape
+    def swin_coarse_to_fine_level(
+            self,
+            fine,
+            coarse,
+            attention_block,
+            shifted_attention_block):
+        '''Propagate from R_1 to R_0 with regular and shifted windows.'''
 
-        # Every full-resolution partition receives the same complete R_1
-        # context instead of a separate set of coarse tokens.
-        coarse_context = coarse.reshape(
-            n_batch,
-            -1,
-            n_channel)
+        # First use the original corresponding 4 x 4 windows.
+        fine = self.coarse_to_fine_level(
+            fine,
+            coarse,
+            attention_block)
 
-        updated_fine = []
-        for partition_height in range(n_partition_height):
-            updated_row = []
-            for partition_width in range(n_partition_width):
-                updated_row.append(attention_block(
-                    fine[:, partition_height, partition_width, :, :],
-                    coarse_context))
-            updated_fine.append(torch.stack(updated_row, dim=1))
+        n_fine_height = fine.shape[1] * PARTITION_SIZES[0][0]
+        n_fine_width = fine.shape[2] * PARTITION_SIZES[0][1]
+        n_coarse_height = coarse.shape[1] * PARTITION_SIZES[1][0]
+        n_coarse_width = coarse.shape[2] * PARTITION_SIZES[1][1]
 
-        return torch.stack(updated_fine, dim=1)
+        fine_feature = partitions_to_feature(
+            fine,
+            n_height=n_fine_height,
+            n_width=n_fine_width)
+        coarse_feature = partitions_to_feature(
+            coarse,
+            n_height=n_coarse_height,
+            n_width=n_coarse_width)
+
+        # Shift both levels by half of their own partition size. The shifted
+        # windows therefore cross the boundaries of the original windows.
+        fine_shift = (
+            PARTITION_SIZES[0][0] // 2,
+            PARTITION_SIZES[0][1] // 2)
+        coarse_shift = (
+            PARTITION_SIZES[1][0] // 2,
+            PARTITION_SIZES[1][1] // 2)
+        fine_feature = torch.roll(
+            fine_feature,
+            shifts=(-fine_shift[0], -fine_shift[1]),
+            dims=(-2, -1))
+        coarse_feature = torch.roll(
+            coarse_feature,
+            shifts=(-coarse_shift[0], -coarse_shift[1]),
+            dims=(-2, -1))
+
+        shifted_fine = feature_to_partitions(
+            fine_feature,
+            partition_height=PARTITION_SIZES[0][0],
+            partition_width=PARTITION_SIZES[0][1])
+        shifted_coarse = feature_to_partitions(
+            coarse_feature,
+            partition_height=PARTITION_SIZES[1][0],
+            partition_width=PARTITION_SIZES[1][1])
+        shifted_fine = self.coarse_to_fine_level(
+            shifted_fine,
+            shifted_coarse,
+            shifted_attention_block)
+
+        # Restore every updated token to its original full-resolution position.
+        fine_feature = partitions_to_feature(
+            shifted_fine,
+            n_height=n_fine_height,
+            n_width=n_fine_width)
+        fine_feature = torch.roll(
+            fine_feature,
+            shifts=fine_shift,
+            dims=(-2, -1))
+        return feature_to_partitions(
+            fine_feature,
+            partition_height=PARTITION_SIZES[0][0],
+            partition_width=PARTITION_SIZES[0][1])
 
     def fine_to_coarse_level(self, coarse, fine, attention_block):
         '''Update each coarse partition from its corresponding fine partition.'''
@@ -493,10 +550,11 @@ class PartitionAttentionDepthModel(nn.Module):
 
                 # Coarse to fine exchange
                 if level == 0:
-                    rgb_partitions[level] = self.global_coarse_to_fine_level(
+                    rgb_partitions[level] = self.swin_coarse_to_fine_level(
                         fine=rgb_partitions[level],
                         coarse=rgb_partitions[level + 1],
-                        attention_block=self.rgb_coarse_to_fine_attention[level])
+                        attention_block=self.rgb_coarse_to_fine_attention[level],
+                        shifted_attention_block=self.rgb_shifted_coarse_to_fine_attention)
                 else:
                     rgb_partitions[level] = self.coarse_to_fine_level(
                         fine=rgb_partitions[level],
