@@ -264,7 +264,7 @@ class PartitionAttentionDepthModel(nn.Module):
     def __init__(self,
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
-                 n_channels=64,
+                 n_channels=32,
                  n_head=4,
                  n_self_attention=2):
         super(PartitionAttentionDepthModel, self).__init__()
@@ -273,7 +273,7 @@ class PartitionAttentionDepthModel(nn.Module):
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
-        self.n_iteration = 1
+        self.n_iteration = 5
         self.n_self_attention = n_self_attention
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
@@ -322,17 +322,20 @@ class PartitionAttentionDepthModel(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1),
+                    stride=1,
+                    activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1),
+                    stride=1,
+                    activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1))
+                    stride=1,
+                    activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
             for _ in range(self.n_iteration)
         ])
 
@@ -343,12 +346,14 @@ class PartitionAttentionDepthModel(nn.Module):
                 n_channels,
                 n_channels,
                 kernel_size=3,
-                stride=1),
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 n_channels,
                 n_channels,
                 kernel_size=3,
-                stride=1),
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 n_channels,
                 1,
