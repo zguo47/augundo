@@ -205,7 +205,7 @@ class PartitionAttentionDepthModel(nn.Module):
     def __init__(self,
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
-                 n_channels=32,
+                 n_channels=64,
                  n_head=4):
         super(PartitionAttentionDepthModel, self).__init__()
 

@@ -123,9 +123,7 @@ class ConvolutionPyramid(nn.Module):
                     input_channels if layer == 0 else n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True)
+                    stride=1)
                 )
             for layer in range(3)
         ])
@@ -138,23 +136,17 @@ class ConvolutionPyramid(nn.Module):
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True),
+                    stride=1),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=1,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True),
+                    stride=1,),
                 Conv2d(
                     n_channels,
                     n_channels,
                     kernel_size=3,
-                    stride=16 if level == 0 else 2,
-                    activation_func=None),
-                nn.LeakyReLU(inplace=True)
+                    stride=16 if level == 0 else 2)
                 )
             for level in range(4)
         ])
@@ -175,8 +167,7 @@ class ConvolutionPyramid(nn.Module):
 def feature_to_partitions(feature, partition_height, partition_width):
     '''Divide a feature map into a grid of partitions.'''
 
-    # TODO: Adjust for different input image sizes so that partition height and width is always FIXED.
-
+    # Partition height and width is always FIXED.
 
     # The result is B x grid_h x grid_w x T x C, where T is partition height x
     # partition width. The grid dimensions are the same across all levels,
@@ -266,23 +257,23 @@ def add_position_encoding(feature):
 class PartitionAttentionDepthModel(nn.Module):
     '''
     RGB forms a sequential five-level pyramid. Every level uses the same
-    partition grid. Information is exchanged locally, globally at the bottom
+    partition grid. Information is exchanged globally at the bottom
     level, and then from the bottom level back to the full-resolution level.
     '''
 
     def __init__(self,
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
-                 n_channels=32,
+                 n_channels=64,
                  n_head=4,
-                 n_self_attention=3):
+                 n_self_attention=2):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
-        self.n_iteration = 5
+        self.n_iteration = 1
         self.n_self_attention = n_self_attention
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
@@ -293,10 +284,10 @@ class PartitionAttentionDepthModel(nn.Module):
 
         # Step 1: every partition below the full-resolution level performs
         # self attention independently.
-        self.rgb_local_attention = nn.ModuleList([
-            AttentionUpdate(n_channels, n_head)
-            for _ in range(self.n_level - 1)
-        ])
+        # self.rgb_local_attention = nn.ModuleList([
+        #     AttentionUpdate(n_channels, n_head)
+        #     for _ in range(self.n_level - 1)
+        # ])
 
         # Step 2: all tokens from all level below first partitions attend to one
         # another, providing global communication across the grid.

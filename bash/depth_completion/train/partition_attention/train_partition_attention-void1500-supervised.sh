@@ -12,7 +12,7 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path testing/void/void_test_sparse_depth_1500.txt \
 --val_intrinsics_path testing/void/void_test_intrinsics_1500.txt \
 --val_ground_truth_path testing/void/void_test_ground_truth_1500.txt \
---n_batch 1 \
+--n_batch 2 \
 --n_height 512 \
 --n_width 512 \
 --model_name partition_attention_void \
@@ -34,7 +34,7 @@ python depth_completion/src/train_depth_completion.py \
 --augmentation_random_noise_type none \
 --augmentation_random_noise_spread -1 \
 --augmentation_padding_mode edge \
---augmentation_random_crop_type horizontal vertical \
+--augmentation_random_crop_type none \
 --augmentation_random_crop_to_shape -1 -1 -1 -1 \
 --augmentation_random_flip_type horizontal vertical \
 --augmentation_random_rotate_max -1 \
@@ -57,6 +57,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/partition_attention/void1500/supervised_parallel \
+    trained_models/depth_completion/partition_attention_ablation/void1500/supervised_attention \
 --device gpu \
 --n_thread 8
