@@ -147,7 +147,10 @@ def train(train_images_path,
 
     # Set up training dataloader
     n_train_step = \
-        learning_schedule[-1] * np.floor(n_train_sample / n_batch).astype(np.int32)
+        np.ceil(
+            learning_schedule[-1] *
+            np.floor(n_train_sample / n_batch).astype(np.int32) /
+            n_step_per_gradient_accumulation).astype(np.int32)
 
     if supervision_type == 'unsupervised':
         train_dataloader = torch.utils.data.DataLoader(
@@ -419,7 +422,8 @@ def train(train_images_path,
 
     # Start training
     train_step = 0
-    n = 0
+    micro_step = 0
+    last_validation_step = -1
 
     if len(restore_paths) > 0:
         try:
@@ -476,7 +480,13 @@ def train(train_images_path,
 
         for inputs in train_dataloader:
 
-            n = n + 1
+            micro_step = micro_step + 1
+            is_optimizer_step = \
+                micro_step % n_step_per_gradient_accumulation == 0
+            next_train_step = train_step + 1
+            is_summary_step = \
+                is_optimizer_step and \
+                next_train_step % n_step_per_summary == 0
 
             # Fetch data
             inputs = [
@@ -536,11 +546,13 @@ def train(train_images_path,
                 input_sparse_depth0_arr = []
                 input_validity_map0_arr = []
 
-                for n in range(n_batch):
-                    z = torch.unsqueeze(input_sparse_depth0[n, ...], dim=0)
-                    v = torch.unsqueeze(input_validity_map0[n, ...], dim=0)
+                for batch_index in range(n_batch):
+                    z = torch.unsqueeze(
+                        input_sparse_depth0[batch_index, ...], dim=0)
+                    v = torch.unsqueeze(
+                        input_validity_map0[batch_index, ...], dim=0)
 
-                    if do_resize[n]:
+                    if do_resize[batch_index]:
                         v = erosion2d(v)
                         z = z * v
 
@@ -579,7 +591,7 @@ def train(train_images_path,
                 intrinsics=input_intrinsics,
                 return_all_outputs=True)
 
-            if (train_step % n_step_per_summary) == 0:
+            if is_summary_step:
                 output_depth0_initial = output_depth0[0].detach().clone()
 
             if 'unsupervised' in supervision_type:
@@ -620,12 +632,7 @@ def train(train_images_path,
             accumulated_loss = loss / n_step_per_gradient_accumulation
             accumulated_loss.backward()
 
-            is_optimizer_step = n % n_step_per_gradient_accumulation == 0
-
             if is_optimizer_step:
-
-                train_step = train_step + 1
-
                 optimizer_depth.step()
 
                 if 'unsupervised' in supervision_type:
@@ -635,8 +642,10 @@ def train(train_images_path,
 
                 if 'unsupervised' in supervision_type:
                     optimizer_pose.zero_grad()
-                    
-            if (train_step % n_step_per_summary) == 0:
+
+                train_step = next_train_step
+
+            if is_summary_step:
 
                 if 'unsupervised' in supervision_type:
                     image1to0 = loss_info.pop('image1to0')
@@ -673,7 +682,8 @@ def train(train_images_path,
                     n_image_per_summary=min(n_batch, n_image_per_summary))
 
             # Log results and save checkpoints
-            if (train_step % n_step_per_checkpoint) == 0:
+            if is_optimizer_step and \
+                    (train_step % n_step_per_checkpoint) == 0:
                 time_elapse = (time.time() - time_start) / 3600
                 time_remain = (n_train_step - train_step) * time_elapse / train_step
 
@@ -699,6 +709,7 @@ def train(train_images_path,
                             summary_writer=val_summary_writer,
                             n_image_per_summary=n_image_per_summary,
                             log_path=log_path)
+                        last_validation_step = train_step
 
                     # Switch back to training
                     depth_completion_model.train()
@@ -710,7 +721,23 @@ def train(train_images_path,
                     optimizer_depth,
                     optimizer_pose)
 
-    if train_step % n_step_per_gradient_accumulation != 0:
+    n_remaining_accumulation = \
+        micro_step % n_step_per_gradient_accumulation
+
+    if n_remaining_accumulation != 0:
+        # The losses in the final incomplete group were divided by the full
+        # accumulation count. Restore their average over the actual count.
+        gradient_scale = \
+            n_step_per_gradient_accumulation / n_remaining_accumulation
+        for parameter in depth_completion_model.parameters_depth():
+            if parameter.grad is not None:
+                parameter.grad.mul_(gradient_scale)
+
+        if 'unsupervised' in supervision_type:
+            for parameter in depth_completion_model.parameters_pose():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(gradient_scale)
+
         optimizer_depth.step()
 
         if 'unsupervised' in supervision_type:
@@ -721,22 +748,25 @@ def train(train_images_path,
         if 'unsupervised' in supervision_type:
             optimizer_pose.zero_grad()
 
-    # Perform validation for final step
-    depth_completion_model.eval()
+        train_step = train_step + 1
 
-    with torch.no_grad():
-        best_results = validate(
-            depth_model=depth_completion_model,
-            dataloader=val_dataloader,
-            transforms=val_transforms,
-            step=train_step,
-            best_results=best_results,
-            min_evaluate_depth=min_evaluate_depth,
-            max_evaluate_depth=max_evaluate_depth,
-            device=device,
-            summary_writer=val_summary_writer,
-            n_image_per_summary=n_image_per_summary,
-            log_path=log_path)
+    # Perform validation for final step
+    if is_available_validation and last_validation_step != train_step:
+        depth_completion_model.eval()
+
+        with torch.no_grad():
+            best_results = validate(
+                depth_model=depth_completion_model,
+                dataloader=val_dataloader,
+                transforms=val_transforms,
+                step=train_step,
+                best_results=best_results,
+                min_evaluate_depth=min_evaluate_depth,
+                max_evaluate_depth=max_evaluate_depth,
+                device=device,
+                summary_writer=val_summary_writer,
+                n_image_per_summary=n_image_per_summary,
+                log_path=log_path)
 
     # Save checkpoints
     depth_completion_model.save_model(
