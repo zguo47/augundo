@@ -43,7 +43,7 @@ class AttentionUpdate(nn.Module):
             nn.Linear(4 * n_channels, n_channels))
         self.feedforward_norm = nn.LayerNorm(n_channels)
 
-    def forward(self, query, context):
+    def forward(self, query, context, attention_mask=None):
         n_batch, n_query, _ = query.shape
         n_context = context.shape[1]
 
@@ -85,6 +85,13 @@ class AttentionUpdate(nn.Module):
             projected_key.transpose(-2, -1))
 
         similarity = similarity / math.sqrt(self.head_channels)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.repeat(
+                n_batch // attention_mask.shape[0],
+                1,
+                1)
+            similarity = similarity + attention_mask[:, None, :, :]
 
         attention_weights = torch.softmax(similarity, dim=-1)
 
@@ -306,10 +313,9 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Shifted-window attention is used only for the final R_1 to R_0
-        # propagation so adjacent full-resolution partitions can exchange
-        # coarse context without global attention.
-        self.rgb_shifted_coarse_to_fine_attention = AttentionUpdate(
+        # Small-window self-attention is used after the final R_1 to R_0
+        # propagation so neighboring full-resolution tokens communicate.
+        self.rgb_full_resolution_window_attention = AttentionUpdate(
             n_channels,
             n_head)
 
@@ -430,10 +436,12 @@ class PartitionAttentionDepthModel(nn.Module):
             fine,
             coarse,
             attention_block,
-            shifted_attention_block):
-        '''Propagate from R_1 to R_0 with regular and shifted windows.'''
+            window_attention_block,
+            iteration):
+        '''Propagate from R_1 to R_0 and exchange full-resolution information.'''
 
-        # First use the original corresponding 4 x 4 windows.
+        # First inject coarse information through the original corresponding
+        # R_1 and R_0 partitions.
         fine = self.coarse_to_fine_level(
             fine,
             coarse,
@@ -441,56 +449,95 @@ class PartitionAttentionDepthModel(nn.Module):
 
         n_fine_height = fine.shape[1] * PARTITION_SIZES[0][0]
         n_fine_width = fine.shape[2] * PARTITION_SIZES[0][1]
-        n_coarse_height = coarse.shape[1] * PARTITION_SIZES[1][0]
-        n_coarse_width = coarse.shape[2] * PARTITION_SIZES[1][1]
 
         fine_feature = partitions_to_feature(
             fine,
             n_height=n_fine_height,
             n_width=n_fine_width)
-        coarse_feature = partitions_to_feature(
-            coarse,
-            n_height=n_coarse_height,
-            n_width=n_coarse_width)
 
-        # Shift both levels by half of their own partition size. 
-        fine_shift = (
-            PARTITION_SIZES[0][0] // 2,
-            PARTITION_SIZES[0][1] // 2)
-        coarse_shift = (
-            PARTITION_SIZES[1][0] // 2,
-            PARTITION_SIZES[1][1] // 2)
-        fine_feature = torch.roll(
+        window_size = 8
+        shift_size = 0 if iteration % 2 == 0 else window_size // 2
+
+        if shift_size > 0:
+            fine_feature = torch.roll(
+                fine_feature,
+                shifts=(-shift_size, -shift_size),
+                dims=(-2, -1))
+
+        # Each 8 x 8 full-resolution window becomes a sequence of 64 tokens.
+        fine_windows = feature_to_partitions(
             fine_feature,
-            shifts=(-fine_shift[0], -fine_shift[1]),
-            dims=(-2, -1))
-        coarse_feature = torch.roll(
-            coarse_feature,
-            shifts=(-coarse_shift[0], -coarse_shift[1]),
-            dims=(-2, -1))
+            partition_height=window_size,
+            partition_width=window_size)
+        n_batch, n_window_height, n_window_width, n_token, n_channel = \
+            fine_windows.shape
+        fine_tokens = fine_windows.reshape(
+            n_batch * n_window_height * n_window_width,
+            n_token,
+            n_channel)
 
-        shifted_fine = feature_to_partitions(
-            fine_feature,
-            partition_height=PARTITION_SIZES[0][0],
-            partition_width=PARTITION_SIZES[0][1])
-        shifted_coarse = feature_to_partitions(
-            coarse_feature,
-            partition_height=PARTITION_SIZES[1][0],
-            partition_width=PARTITION_SIZES[1][1])
-        shifted_fine = self.coarse_to_fine_level(
-            shifted_fine,
-            shifted_coarse,
-            shifted_attention_block)
+        attention_mask = None
+        if shift_size > 0:
+            # Label the spatial regions that become adjacent only because of
+            # the cyclic roll. Tokens with different labels cannot attend.
+            region = torch.zeros(
+                1,
+                1,
+                n_fine_height,
+                n_fine_width,
+                dtype=fine_feature.dtype,
+                device=fine_feature.device)
+            height_slices = (
+                slice(0, -window_size),
+                slice(-window_size, -shift_size),
+                slice(-shift_size, None))
+            width_slices = (
+                slice(0, -window_size),
+                slice(-window_size, -shift_size),
+                slice(-shift_size, None))
+            region_index = 0
+            for height_slice in height_slices:
+                for width_slice in width_slices:
+                    region[:, :, height_slice, width_slice] = region_index
+                    region_index = region_index + 1
 
-        # Restore every updated token to its original full-resolution position.
+            region_windows = feature_to_partitions(
+                region,
+                partition_height=window_size,
+                partition_width=window_size)
+            region_tokens = region_windows.reshape(
+                n_window_height * n_window_width,
+                n_token)
+            attention_mask = \
+                region_tokens[:, :, None] - region_tokens[:, None, :]
+            attention_mask = attention_mask.masked_fill(
+                attention_mask != 0,
+                -100.0)
+            attention_mask = attention_mask.masked_fill(
+                attention_mask == 0,
+                0.0)
+
+        fine_tokens = window_attention_block(
+            fine_tokens,
+            fine_tokens,
+            attention_mask=attention_mask)
+        fine_windows = fine_tokens.reshape(
+            n_batch,
+            n_window_height,
+            n_window_width,
+            n_token,
+            n_channel)
         fine_feature = partitions_to_feature(
-            shifted_fine,
+            fine_windows,
             n_height=n_fine_height,
             n_width=n_fine_width)
-        fine_feature = torch.roll(
-            fine_feature,
-            shifts=fine_shift,
-            dims=(-2, -1))
+
+        if shift_size > 0:
+            fine_feature = torch.roll(
+                fine_feature,
+                shifts=(shift_size, shift_size),
+                dims=(-2, -1))
+
         return feature_to_partitions(
             fine_feature,
             partition_height=PARTITION_SIZES[0][0],
@@ -553,7 +600,8 @@ class PartitionAttentionDepthModel(nn.Module):
                         fine=rgb_partitions[level],
                         coarse=rgb_partitions[level + 1],
                         attention_block=self.rgb_coarse_to_fine_attention[level],
-                        shifted_attention_block=self.rgb_shifted_coarse_to_fine_attention)
+                        window_attention_block=self.rgb_full_resolution_window_attention,
+                        iteration=iteration)
                 else:
                     rgb_partitions[level] = self.coarse_to_fine_level(
                         fine=rgb_partitions[level],
