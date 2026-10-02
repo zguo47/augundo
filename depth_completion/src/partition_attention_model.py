@@ -273,7 +273,7 @@ class PartitionAttentionDepthModel(nn.Module):
                  max_predict_depth=8.0,
                  n_channels=32,
                  n_head=4,
-                 n_self_attention=3):
+                 n_self_attention=2):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -440,8 +440,7 @@ class PartitionAttentionDepthModel(nn.Module):
             iteration):
         '''Propagate from R_1 to R_0 and exchange full-resolution information.'''
 
-        # First inject coarse information through the original corresponding
-        # R_1 and R_0 partitions.
+        # Original coarse to fine within partitions
         fine = self.coarse_to_fine_level(
             fine,
             coarse,
@@ -455,10 +454,13 @@ class PartitionAttentionDepthModel(nn.Module):
             n_height=n_fine_height,
             n_width=n_fine_width)
 
+        # Determine regular or shifted window. Use window size 8 to avoid performing
+        # attention within 128 x 128 partition.
         window_size = 8
         shift_size = 0 if iteration % 2 == 0 else window_size // 2
 
         if shift_size > 0:
+            # Move every feature shift_size positions upward and leftward.
             fine_feature = torch.roll(
                 fine_feature,
                 shifts=(-shift_size, -shift_size),
@@ -471,15 +473,19 @@ class PartitionAttentionDepthModel(nn.Module):
             partition_width=window_size)
         n_batch, n_window_height, n_window_width, n_token, n_channel = \
             fine_windows.shape
+        # Reshape to B * 64 * 64, 64, C
         fine_tokens = fine_windows.reshape(
             n_batch * n_window_height * n_window_width,
             n_token,
             n_channel)
 
+        # Prepare the mask used by Swin Transformer to avoid attention between 
+        # tokens that are not actually adjacent due to the cyclic shift.
         attention_mask = None
         if shift_size > 0:
             # Label the spatial regions that become adjacent only because of
             # the cyclic roll. Tokens with different labels cannot attend.
+            # 1 x 1 x 512 x 512 one label for every pixel
             region = torch.zeros(
                 1,
                 1,
@@ -487,27 +493,36 @@ class PartitionAttentionDepthModel(nn.Module):
                 n_fine_width,
                 dtype=fine_feature.dtype,
                 device=fine_feature.device)
+            # Divide height into 3 slices (0:504, 504:508, 508:512)
+            # The last two slices are the original last four pixels before shift and
+            # the four pixels involved in the cyclic shift.
             height_slices = (
                 slice(0, -window_size),
                 slice(-window_size, -shift_size),
                 slice(-shift_size, None))
+            # Same for width. Thus creating 3 x 3 = 9 regions.
             width_slices = (
                 slice(0, -window_size),
                 slice(-window_size, -shift_size),
                 slice(-shift_size, None))
+            # Every region receives one label
             region_index = 0
             for height_slice in height_slices:
                 for width_slice in width_slices:
                     region[:, :, height_slice, width_slice] = region_index
                     region_index = region_index + 1
 
+            # Divide label map into windows. (1, 64, 64, 64, 1)
             region_windows = feature_to_partitions(
                 region,
                 partition_height=window_size,
                 partition_width=window_size)
+            # (4096, 64). region_tokens[w, i] is the label of the i-th token in the w-th window.
             region_tokens = region_windows.reshape(
                 n_window_height * n_window_width,
                 n_token)
+            # if labels are equal, result is zero; if differs, result is non-zero.
+            # mask shape (4096, 64, 64)
             attention_mask = \
                 region_tokens[:, :, None] - region_tokens[:, None, :]
             attention_mask = attention_mask.masked_fill(
@@ -517,6 +532,7 @@ class PartitionAttentionDepthModel(nn.Module):
                 attention_mask == 0,
                 0.0)
 
+        # Apply mask so that invalid wrapped token pairs receive effectively zero attention.
         fine_tokens = window_attention_block(
             fine_tokens,
             fine_tokens,
@@ -532,6 +548,7 @@ class PartitionAttentionDepthModel(nn.Module):
             n_height=n_fine_height,
             n_width=n_fine_width)
 
+        # Undos the shift
         if shift_size > 0:
             fine_feature = torch.roll(
                 fine_feature,
