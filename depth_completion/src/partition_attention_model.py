@@ -4,6 +4,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 sys.path.insert(0, os.path.join(
     'external_src', 'depth_completion', 'kbnet', 'src'))
@@ -590,6 +591,18 @@ class PartitionAttentionDepthModel(nn.Module):
 
     def forward(self, image):
 
+        # Pad to a multiple of 112 so every pyramid level has the same number
+        # of partitions and the full-resolution map divides into 16 x 16
+        # self-attention windows. The padding is removed from the final depth.
+        n_input_height, n_input_width = image.shape[-2:]
+        n_alignment = PARTITION_SIZES[0][0]
+        pad_height = (n_alignment - n_input_height % n_alignment) % n_alignment
+        pad_width = (n_alignment - n_input_width % n_alignment) % n_alignment
+        image = functional.pad(
+            image,
+            (0, pad_width, 0, pad_height),
+            mode='replicate')
+
         # The RGB pyramid is sequential.
         rgb_features = self.rgb_pyramid(image)
         rgb_features = [
@@ -677,6 +690,7 @@ class PartitionAttentionDepthModel(nn.Module):
         normalized_depth = torch.sigmoid(raw_depth)
         log_min_depth = math.log(self.min_predict_depth)
         log_max_depth = math.log(self.max_predict_depth)
-        return torch.exp(
+        output_depth = torch.exp(
             log_min_depth +
             normalized_depth * (log_max_depth - log_min_depth))
+        return output_depth[..., :n_input_height, :n_input_width]
