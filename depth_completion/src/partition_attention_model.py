@@ -313,9 +313,9 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Small-window self-attention is used after the final R_1 to R_0
-        # propagation so neighboring full-resolution tokens communicate.
-        self.rgb_full_resolution_window_attention = AttentionUpdate(
+        # A second R_1 to R_0 attention block uses a half-partition-shifted
+        # grid. Its output is blended with the regular-grid output.
+        self.rgb_shifted_coarse_to_fine_attention = AttentionUpdate(
             n_channels,
             n_head)
 
@@ -413,7 +413,12 @@ class PartitionAttentionDepthModel(nn.Module):
                 attention_block)
         return partitions
 
-    def coarse_to_fine_level(self, fine, coarse, attention_block):
+    def coarse_to_fine_level(
+            self,
+            fine,
+            coarse,
+            attention_block,
+            attention_mask=None):
         '''Update each fine partition from its corresponding coarse partition.'''
         n_batch, n_partition_height, n_partition_width, n_fine_token, n_channel = fine.shape
         n_coarse_token = coarse.shape[3]
@@ -428,7 +433,8 @@ class PartitionAttentionDepthModel(nn.Module):
             n_channel)
         updated_fine = attention_block(
             fine_queries,
-            coarse_context)
+            coarse_context,
+            attention_mask=attention_mask)
         return updated_fine.reshape(fine.shape)
 
     def swin_coarse_to_fine_level(
@@ -436,125 +442,176 @@ class PartitionAttentionDepthModel(nn.Module):
             fine,
             coarse,
             attention_block,
-            window_attention_block,
-            iteration):
-        '''Propagate from R_1 to R_0 and exchange full-resolution information.'''
+            shifted_attention_block):
+        '''Blend regular and shifted partition attention from R_1 to R_0.'''
 
-        # Original coarse to fine within partitions
-        fine = self.coarse_to_fine_level(
+        # Both branches start from the same R_0 and R_1 features. The regular
+        # branch uses the original corresponding 4 x 4 partition grid.
+        regular_fine = self.coarse_to_fine_level(
             fine,
             coarse,
             attention_block)
 
         n_fine_height = fine.shape[1] * PARTITION_SIZES[0][0]
         n_fine_width = fine.shape[2] * PARTITION_SIZES[0][1]
+        n_coarse_height = coarse.shape[1] * PARTITION_SIZES[1][0]
+        n_coarse_width = coarse.shape[2] * PARTITION_SIZES[1][1]
 
         fine_feature = partitions_to_feature(
             fine,
             n_height=n_fine_height,
             n_width=n_fine_width)
+        coarse_feature = partitions_to_feature(
+            coarse,
+            n_height=n_coarse_height,
+            n_width=n_coarse_width)
 
-        # Determine regular or shifted window. Use window size 8 to avoid performing
-        # attention within 128 x 128 partition.
-        window_size = 8
-        shift_size = 0 if iteration % 2 == 0 else window_size // 2
-
-        if shift_size > 0:
-            # Move every feature shift_size positions upward and leftward.
-            fine_feature = torch.roll(
-                fine_feature,
-                shifts=(-shift_size, -shift_size),
-                dims=(-2, -1))
-
-        # Each 8 x 8 full-resolution window becomes a sequence of 64 tokens.
-        fine_windows = feature_to_partitions(
+        # The second branch shifts both levels by half of their own partition
+        # size, so its windows cross the boundaries of the regular grid.
+        fine_shift = (
+            PARTITION_SIZES[0][0] // 2,
+            PARTITION_SIZES[0][1] // 2)
+        coarse_shift = (
+            PARTITION_SIZES[1][0] // 2,
+            PARTITION_SIZES[1][1] // 2)
+        shifted_fine_feature = torch.roll(
             fine_feature,
-            partition_height=window_size,
-            partition_width=window_size)
-        n_batch, n_window_height, n_window_width, n_token, n_channel = \
-            fine_windows.shape
-        # Reshape to B * 64 * 64, 64, C
-        fine_tokens = fine_windows.reshape(
-            n_batch * n_window_height * n_window_width,
-            n_token,
-            n_channel)
+            shifts=(-fine_shift[0], -fine_shift[1]),
+            dims=(-2, -1))
+        shifted_coarse_feature = torch.roll(
+            coarse_feature,
+            shifts=(-coarse_shift[0], -coarse_shift[1]),
+            dims=(-2, -1))
+        shifted_fine = feature_to_partitions(
+            shifted_fine_feature,
+            partition_height=PARTITION_SIZES[0][0],
+            partition_width=PARTITION_SIZES[0][1])
+        shifted_coarse = feature_to_partitions(
+            shifted_coarse_feature,
+            partition_height=PARTITION_SIZES[1][0],
+            partition_width=PARTITION_SIZES[1][1])
 
-        # Prepare the mask used by Swin Transformer to avoid attention between 
-        # tokens that are not actually adjacent due to the cyclic shift.
-        attention_mask = None
-        if shift_size > 0:
-            # Label the spatial regions that become adjacent only because of
-            # the cyclic roll. Tokens with different labels cannot attend.
-            # 1 x 1 x 512 x 512 one label for every pixel
-            region = torch.zeros(
-                1,
-                1,
-                n_fine_height,
-                n_fine_width,
-                dtype=fine_feature.dtype,
-                device=fine_feature.device)
-            # Divide height into 3 slices (0:504, 504:508, 508:512)
-            # The last two slices are the original last four pixels before shift and
-            # the four pixels involved in the cyclic shift.
-            height_slices = (
-                slice(0, -window_size),
-                slice(-window_size, -shift_size),
-                slice(-shift_size, None))
-            # Same for width. Thus creating 3 x 3 = 9 regions.
-            width_slices = (
-                slice(0, -window_size),
-                slice(-window_size, -shift_size),
-                slice(-shift_size, None))
-            # Every region receives one label
-            region_index = 0
-            for height_slice in height_slices:
-                for width_slice in width_slices:
-                    region[:, :, height_slice, width_slice] = region_index
-                    region_index = region_index + 1
+        # Build a cross-resolution Swin mask. A fine query and coarse key with
+        # different labels are adjacent only because torch.roll wrapped them
+        # across an outer image boundary.
+        fine_region = torch.zeros(
+            1,
+            1,
+            n_fine_height,
+            n_fine_width,
+            dtype=fine_feature.dtype,
+            device=fine_feature.device)
+        coarse_region = torch.zeros(
+            1,
+            1,
+            n_coarse_height,
+            n_coarse_width,
+            dtype=coarse_feature.dtype,
+            device=coarse_feature.device)
+        fine_height_slices = (
+            slice(0, -PARTITION_SIZES[0][0]),
+            slice(-PARTITION_SIZES[0][0], -fine_shift[0]),
+            slice(-fine_shift[0], None))
+        fine_width_slices = (
+            slice(0, -PARTITION_SIZES[0][1]),
+            slice(-PARTITION_SIZES[0][1], -fine_shift[1]),
+            slice(-fine_shift[1], None))
+        coarse_height_slices = (
+            slice(0, -PARTITION_SIZES[1][0]),
+            slice(-PARTITION_SIZES[1][0], -coarse_shift[0]),
+            slice(-coarse_shift[0], None))
+        coarse_width_slices = (
+            slice(0, -PARTITION_SIZES[1][1]),
+            slice(-PARTITION_SIZES[1][1], -coarse_shift[1]),
+            slice(-coarse_shift[1], None))
+        region_index = 0
+        for fine_height_slice, coarse_height_slice in zip(
+                fine_height_slices,
+                coarse_height_slices):
+            for fine_width_slice, coarse_width_slice in zip(
+                    fine_width_slices,
+                    coarse_width_slices):
+                fine_region[
+                    :, :, fine_height_slice, fine_width_slice] = region_index
+                coarse_region[
+                    :, :, coarse_height_slice, coarse_width_slice] = region_index
+                region_index = region_index + 1
 
-            # Divide label map into windows. (1, 64, 64, 64, 1)
-            region_windows = feature_to_partitions(
-                region,
-                partition_height=window_size,
-                partition_width=window_size)
-            # (4096, 64). region_tokens[w, i] is the label of the i-th token in the w-th window.
-            region_tokens = region_windows.reshape(
-                n_window_height * n_window_width,
-                n_token)
-            # if labels are equal, result is zero; if differs, result is non-zero.
-            # mask shape (4096, 64, 64)
-            attention_mask = \
-                region_tokens[:, :, None] - region_tokens[:, None, :]
-            attention_mask = attention_mask.masked_fill(
-                attention_mask != 0,
-                -100.0)
-            attention_mask = attention_mask.masked_fill(
-                attention_mask == 0,
-                0.0)
+        fine_region_tokens = feature_to_partitions(
+            fine_region,
+            partition_height=PARTITION_SIZES[0][0],
+            partition_width=PARTITION_SIZES[0][1]).reshape(
+                fine.shape[1] * fine.shape[2],
+                fine.shape[3])
+        coarse_region_tokens = feature_to_partitions(
+            coarse_region,
+            partition_height=PARTITION_SIZES[1][0],
+            partition_width=PARTITION_SIZES[1][1]).reshape(
+                coarse.shape[1] * coarse.shape[2],
+                coarse.shape[3])
+        attention_mask = \
+            fine_region_tokens[:, :, None] - \
+            coarse_region_tokens[:, None, :]
+        attention_mask = attention_mask.masked_fill(
+            attention_mask != 0,
+            -100.0)
+        attention_mask = attention_mask.masked_fill(
+            attention_mask == 0,
+            0.0)
 
-        # Apply mask so that invalid wrapped token pairs receive effectively zero attention.
-        fine_tokens = window_attention_block(
-            fine_tokens,
-            fine_tokens,
+        shifted_fine = self.coarse_to_fine_level(
+            shifted_fine,
+            shifted_coarse,
+            shifted_attention_block,
             attention_mask=attention_mask)
-        fine_windows = fine_tokens.reshape(
-            n_batch,
-            n_window_height,
-            n_window_width,
-            n_token,
-            n_channel)
-        fine_feature = partitions_to_feature(
-            fine_windows,
+
+        regular_fine_feature = partitions_to_feature(
+            regular_fine,
             n_height=n_fine_height,
             n_width=n_fine_width)
+        shifted_fine_feature = partitions_to_feature(
+            shifted_fine,
+            n_height=n_fine_height,
+            n_width=n_fine_width)
+        shifted_fine_feature = torch.roll(
+            shifted_fine_feature,
+            shifts=fine_shift,
+            dims=(-2, -1))
 
-        # Undos the shift
-        if shift_size > 0:
-            fine_feature = torch.roll(
-                fine_feature,
-                shifts=(shift_size, shift_size),
-                dims=(-2, -1))
+        # A cosine confidence is largest at a window center and smallest at
+        # its boundary. The shifted confidence has the complementary layout.
+        y = (torch.arange(
+            n_fine_height,
+            dtype=fine_feature.dtype,
+            device=fine_feature.device) + 0.5) % PARTITION_SIZES[0][0]
+        x = (torch.arange(
+            n_fine_width,
+            dtype=fine_feature.dtype,
+            device=fine_feature.device) + 0.5) % PARTITION_SIZES[0][1]
+        y_confidence = torch.sin(
+            math.pi * y / PARTITION_SIZES[0][0]) ** 2
+        x_confidence = torch.sin(
+            math.pi * x / PARTITION_SIZES[0][1]) ** 2
+        regular_confidence = \
+            (y_confidence[:, None] * x_confidence[None, :])[None, None, :, :]
+        shifted_confidence = torch.roll(
+            regular_confidence,
+            shifts=fine_shift,
+            dims=(-2, -1))
+        confidence_sum = regular_confidence + shifted_confidence
+        zero_confidence = confidence_sum == 0
+        confidence_sum = confidence_sum.masked_fill(
+            zero_confidence,
+            1.0)
+        regular_weight = regular_confidence / confidence_sum
+        regular_weight = regular_weight.masked_fill(
+            zero_confidence,
+            0.5)
+        shifted_weight = 1.0 - regular_weight
 
+        fine_feature = \
+            regular_weight * regular_fine_feature + \
+            shifted_weight * shifted_fine_feature
         return feature_to_partitions(
             fine_feature,
             partition_height=PARTITION_SIZES[0][0],
@@ -617,8 +674,7 @@ class PartitionAttentionDepthModel(nn.Module):
                         fine=rgb_partitions[level],
                         coarse=rgb_partitions[level + 1],
                         attention_block=self.rgb_coarse_to_fine_attention[level],
-                        window_attention_block=self.rgb_full_resolution_window_attention,
-                        iteration=iteration)
+                        shifted_attention_block=self.rgb_shifted_coarse_to_fine_attention)
                 else:
                     rgb_partitions[level] = self.coarse_to_fine_level(
                         fine=rgb_partitions[level],
