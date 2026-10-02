@@ -13,8 +13,8 @@ python depth_completion/src/train_depth_completion.py \
 --val_intrinsics_path validation/kitti/kitti_val_intrinsics.txt \
 --val_ground_truth_path validation/kitti/kitti_val_ground_truth.txt \
 --n_batch 2 \
---n_height 320 \
---n_width 768 \
+--n_height 448 \
+--n_width 448 \
 --model_name partition_attention \
 --input_channels_image 3 \
 --input_channels_depth 2 \

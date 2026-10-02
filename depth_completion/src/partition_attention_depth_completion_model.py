@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 from partition_attention_model import PartitionAttentionDepthModel
 from utils.src import loss_utils
@@ -22,6 +23,8 @@ class PartitionAttentionDepthCompletionModel(object):
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
+        self.input_height = 448
+        self.input_width = 448
         self.device = device
         self.to(device)
 
@@ -33,10 +36,72 @@ class PartitionAttentionDepthCompletionModel(object):
                       return_all_outputs=False):
         del intrinsics
 
-        output_depth = self.model_depth(
-            image=image)
+        if image.shape[-2:] == (self.input_height, self.input_width):
+            output_depth = self.model_depth(
+                image=image)
+        else:
+            output_depth = self.forward_tiled(
+                image=image)
 
         return [output_depth] if return_all_outputs else output_depth
+
+    def forward_tiled(self, image):
+        '''Predict every original image position using padded 448 x 448 tiles.'''
+        n_height, n_width = image.shape[-2:]
+        padded_height = max(n_height, self.input_height)
+        padded_width = max(n_width, self.input_width)
+        image = functional.pad(
+            image,
+            (0, padded_width - n_width, 0, padded_height - n_height),
+            mode='replicate')
+
+        height_starts = list(range(
+            0,
+            padded_height - self.input_height + 1,
+            self.input_height))
+        width_starts = list(range(
+            0,
+            padded_width - self.input_width + 1,
+            self.input_width))
+        if height_starts[-1] != padded_height - self.input_height:
+            height_starts.append(padded_height - self.input_height)
+        if width_starts[-1] != padded_width - self.input_width:
+            width_starts.append(padded_width - self.input_width)
+
+        height_weight = torch.hann_window(
+            self.input_height,
+            periodic=False,
+            dtype=image.dtype,
+            device=image.device).clamp(min=1e-3)
+        width_weight = torch.hann_window(
+            self.input_width,
+            periodic=False,
+            dtype=image.dtype,
+            device=image.device).clamp(min=1e-3)
+        tile_weight = \
+            (height_weight[:, None] * width_weight[None, :])[None, None, :, :]
+
+        output_depth = torch.zeros(
+            image.shape[0],
+            1,
+            padded_height,
+            padded_width,
+            dtype=image.dtype,
+            device=image.device)
+        output_weight = torch.zeros_like(output_depth)
+
+        for start_y in height_starts:
+            for start_x in width_starts:
+                end_y = start_y + self.input_height
+                end_x = start_x + self.input_width
+                tile_depth = self.model_depth(
+                    image=image[..., start_y:end_y, start_x:end_x])
+                output_depth[..., start_y:end_y, start_x:end_x] += \
+                    tile_weight * tile_depth
+                output_weight[..., start_y:end_y, start_x:end_x] += tile_weight
+
+        output_depth = output_depth / output_weight
+        return output_depth[..., :n_height, :n_width]
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
         '''Computes metric log-L1 loss over valid target pixels.'''

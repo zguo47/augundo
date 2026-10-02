@@ -239,7 +239,8 @@ def train(train_images_path,
                 ground_truth_paths=val_ground_truth_paths,
                 load_image_triplets=False,
                 random_crop_shape=(n_height, n_width)
-                if 'partition_attention' in model_name else None,
+                if 'partition_attention' in model_name and
+                'ablation' in model_name else None,
                 random_crop_type=['none']),
             batch_size=1,
             shuffle=False,
