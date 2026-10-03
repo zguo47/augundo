@@ -274,15 +274,20 @@ class PartitionAttentionDepthModel(nn.Module):
                  max_predict_depth=8.0,
                  n_channels=32,
                  n_head=4,
-                 n_self_attention=2):
+                 n_iteration=1,
+                 window_size=16,
+                 n_self_attention=2,
+                 n_shift=4):
         super(PartitionAttentionDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
-        self.n_iteration = 1
+        self.n_iteration = n_iteration
+        self.window_size = window_size
         self.n_self_attention = n_self_attention
+        self.n_shift = n_shift
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
         # R_1 is downsampled by 16, and each remaining level is downsampled by 2.
@@ -314,11 +319,11 @@ class PartitionAttentionDepthModel(nn.Module):
             for _ in range(self.n_level - 1)
         ])
 
-        # Four regular and shifted full-resolution window self-attention pairs
+        # Regular and shifted full-resolution window self-attention pairs
         # follow the final R_1 to R_0 propagation in every iteration.
         self.rgb_full_resolution_window_attention = nn.ModuleList([
             AttentionUpdate(n_channels, n_head)
-            for _ in range(8)
+            for _ in range(2 * n_shift)
         ])
 
         # Step 4: every lower-level partition queries the corresponding
@@ -454,7 +459,7 @@ class PartitionAttentionDepthModel(nn.Module):
             n_height=n_fine_height,
             n_width=n_fine_width)
 
-        window_size = 16
+        window_size = self.window_size
         shift_size = window_size // 2
 
         n_batch, n_channel, _, _ = fine_feature.shape
@@ -506,8 +511,8 @@ class PartitionAttentionDepthModel(nn.Module):
             attention_mask == 0,
             0.0)
 
-        # Alternate four regular and shifted window-attention pairs. Each pair
-        # uses separate learned attention parameters.
+        # Alternate regular and shifted window-attention pairs. Each pair uses
+        # separate learned attention parameters.
         for pair in range(len(window_attention_blocks) // 2):
 
             fine_windows = feature_to_partitions(
@@ -593,7 +598,9 @@ class PartitionAttentionDepthModel(nn.Module):
         # of partitions and the full-resolution map divides into 16 x 16
         # self-attention windows. The padding is removed from the final depth.
         n_input_height, n_input_width = image.shape[-2:]
-        n_alignment = PARTITION_SIZES[0][0]
+        n_alignment = \
+            PARTITION_SIZES[0][0] * self.window_size // \
+            math.gcd(PARTITION_SIZES[0][0], self.window_size)
         pad_height = (n_alignment - n_input_height % n_alignment) % n_alignment
         pad_width = (n_alignment - n_input_width % n_alignment) % n_alignment
         image = functional.pad(

@@ -34,6 +34,10 @@ def train(train_images_path,
           network_modules,
           min_predict_depth,
           max_predict_depth,
+          n_iteration,
+          window_size,
+          n_self_attention,
+          n_shift,
           # Loss function settings
           supervision_type,
           w_losses,
@@ -259,6 +263,10 @@ def train(train_images_path,
         network_modules=network_modules,
         min_predict_depth=min_predict_depth,
         max_predict_depth=max_predict_depth,
+        n_iteration=n_iteration,
+        window_size=window_size,
+        n_self_attention=n_self_attention,
+        n_shift=n_shift,
         device=device)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
@@ -933,6 +941,10 @@ def run(image_path,
         network_modules,
         min_predict_depth,
         max_predict_depth,
+        n_iteration,
+        window_size,
+        n_self_attention,
+        n_shift,
         # Evaluation settings
         min_evaluate_depth,
         max_evaluate_depth,
@@ -1034,6 +1046,10 @@ def run(image_path,
         network_modules=network_modules,
         min_predict_depth=min_predict_depth,
         max_predict_depth=max_predict_depth,
+        n_iteration=n_iteration,
+        window_size=window_size,
+        n_self_attention=n_self_attention,
+        n_shift=n_shift,
         device=device)
 
     # Restore model and set to evaluation mode

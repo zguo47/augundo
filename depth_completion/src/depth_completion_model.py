@@ -24,6 +24,10 @@ class DepthCompletionModel(object):
                  network_modules,
                  min_predict_depth,
                  max_predict_depth,
+                 n_iteration=1,
+                 window_size=16,
+                 n_self_attention=2,
+                 n_shift=4,
                  device=torch.device('cuda')):
 
         self.model_name = model_name
@@ -84,6 +88,10 @@ class DepthCompletionModel(object):
                 network_modules=network_modules,
                 min_predict_depth=min_predict_depth,
                 max_predict_depth=max_predict_depth,
+                n_iteration=n_iteration,
+                window_size=window_size,
+                n_self_attention=n_self_attention,
+                n_shift=n_shift,
                 device=device)
         elif 'dinov2_guided' in model_name:
             from dinov2_depth_completion_model import DINOv2GuidedModel

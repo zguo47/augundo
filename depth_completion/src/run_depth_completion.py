@@ -36,6 +36,14 @@ parser.add_argument('--min_predict_depth',
     type=float, default=0.10, help='Minimum value of predicted depth')
 parser.add_argument('--max_predict_depth',
     type=float, default=10.00, help='Maximum value of predicted depth')
+parser.add_argument('--n_iteration',
+    type=int, default=1, help='Number of fine-to-coarse/coarse-to-fine iterations')
+parser.add_argument('--window_size',
+    type=int, default=16, help='Full-resolution attention window size')
+parser.add_argument('--n_self_attention',
+    type=int, default=2, help='Number of consecutive self-attention blocks')
+parser.add_argument('--n_shift',
+    type=int, default=4, help='Number of regular/shifted attention pairs')
 
 # Evaluation settings
 parser.add_argument('--min_evaluate_depth',
@@ -85,6 +93,10 @@ if __name__ == '__main__':
         network_modules=args.network_modules,
         min_predict_depth=args.min_predict_depth,
         max_predict_depth=args.max_predict_depth,
+        n_iteration=args.n_iteration,
+        window_size=args.window_size,
+        n_self_attention=args.n_self_attention,
+        n_shift=args.n_shift,
         # Evaluation settings
         min_evaluate_depth=args.min_evaluate_depth,
         max_evaluate_depth=args.max_evaluate_depth,

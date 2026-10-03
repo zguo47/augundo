@@ -2,6 +2,11 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
+N_ITERATION=${N_ITERATION:-1}
+WINDOW_SIZE=${WINDOW_SIZE:-16}
+N_SELF_ATTENTION=${N_SELF_ATTENTION:-2}
+N_SHIFT=${N_SHIFT:-4}
+
 # RGB and sparse depth use parallel seven-level partition-attention branches.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/void/supervised/void_train_image_1500.txt \
@@ -21,6 +26,10 @@ python depth_completion/src/train_depth_completion.py \
 --normalized_image_range 0 1 \
 --min_predict_depth 0.1 \
 --max_predict_depth 8.0 \
+--n_iteration ${N_ITERATION} \
+--window_size ${WINDOW_SIZE} \
+--n_self_attention ${N_SELF_ATTENTION} \
+--n_shift ${N_SHIFT} \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 8 \

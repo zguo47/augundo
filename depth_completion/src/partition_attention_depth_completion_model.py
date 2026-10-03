@@ -15,12 +15,20 @@ class PartitionAttentionDepthCompletionModel(object):
                  network_modules=None,
                  min_predict_depth=1.5,
                  max_predict_depth=100.0,
+                 n_iteration=1,
+                 window_size=16,
+                 n_self_attention=2,
+                 n_shift=4,
                  device=torch.device('cuda')):
         del dataset_name, network_modules
 
         self.model_depth = PartitionAttentionDepthModel(
             min_predict_depth=min_predict_depth,
-            max_predict_depth=max_predict_depth)
+            max_predict_depth=max_predict_depth,
+            n_iteration=n_iteration,
+            window_size=window_size,
+            n_self_attention=n_self_attention,
+            n_shift=n_shift)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
