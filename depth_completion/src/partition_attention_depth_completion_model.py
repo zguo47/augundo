@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torch.nn as nn
 
@@ -22,6 +24,7 @@ class PartitionAttentionDepthCompletionModel(object):
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
+        self.print_inference_time = True
         self.device = device
         self.to(device)
 
@@ -33,8 +36,21 @@ class PartitionAttentionDepthCompletionModel(object):
                       return_all_outputs=False):
         del intrinsics
 
+        time_inference = self.print_inference_time and not self.model_depth.training
+        if time_inference:
+            if image.is_cuda:
+                torch.cuda.synchronize()
+            time_start = time.time()
+
         output_depth = self.model_depth(
             image=image)
+
+        if time_inference:
+            if image.is_cuda:
+                torch.cuda.synchronize()
+            seconds_per_image = \
+                (time.time() - time_start) / image.shape[0]
+            print('Inference time: {:.4f} s/image'.format(seconds_per_image))
 
         return [output_depth] if return_all_outputs else output_depth
 
