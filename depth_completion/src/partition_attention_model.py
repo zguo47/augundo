@@ -281,7 +281,7 @@ class PartitionAttentionDepthModel(nn.Module):
         self.max_predict_depth = max_predict_depth
         self.n_channels = n_channels
         self.n_level = 5
-        self.n_iteration = 2
+        self.n_iteration = 1
         self.n_self_attention = n_self_attention
 
         # The RGB convolutions operate sequentially. R_0 is full resolution,
