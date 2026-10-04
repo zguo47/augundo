@@ -325,7 +325,8 @@ class DepthCompletionModel(object):
             torch.optimizer : optimizer for pose or None if no optimizer is passed in
         '''
 
-        if 'partition_attention' in self.model_name or \
+        if 'scale_propagation' in self.model_name or \
+                'partition_attention' in self.model_name or \
                 'dinov2_guided' in self.model_name:
             train_step, optimizer_depth = self.model.restore_model(
                 restore_path=restore_paths[0],
@@ -383,7 +384,14 @@ class DepthCompletionModel(object):
 
         os.makedirs(checkpoint_dirpath, exist_ok=True)
 
-        if 'partition_attention' in self.model_name:
+        if 'scale_propagation' in self.model_name:
+            self.model.save_model(
+                os.path.join(
+                    checkpoint_dirpath,
+                    'scale-propagation-{}.pth'.format(step)),
+                step=step,
+                optimizer=optimizer_depth)
+        elif 'partition_attention' in self.model_name:
             self.model.save_model(
                 os.path.join(
                     checkpoint_dirpath,
