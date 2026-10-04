@@ -79,25 +79,32 @@ class ConvolutionBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride):
         super(ConvolutionBlock, self).__init__()
 
+        activation = torch.nn.LeakyReLU(
+            negative_slope=0.10,
+            inplace=True)
         self.convolutions = nn.Sequential(
             Conv2d(
                 in_channels,
                 out_channels,
                 kernel_size=3,
                 stride=stride,
-                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
+                activation_func=activation),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
                 stride=1,
-                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
+                activation_func=torch.nn.LeakyReLU(
+                    negative_slope=0.10,
+                    inplace=True)),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
                 stride=1,
-                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
+                activation_func=torch.nn.LeakyReLU(
+                    negative_slope=0.10,
+                    inplace=True)))
 
     def forward(self, feature):
         return self.convolutions(feature)
@@ -109,32 +116,35 @@ class SharedEncoder(nn.Module):
     def __init__(self, n_channels, n_head):
         super(SharedEncoder, self).__init__()
 
-        # The first three resolutions use convolution blocks.
         self.level0 = ConvolutionBlock(4, n_channels, stride=1)
         self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2)
         self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2)
 
-        # A single convolution changes resolution before attention processes
-        # each of the final two resolutions three times.
+        # Only the resolution-changing convolution remains at the last two
+        # levels; spatial processing is performed by two attention blocks.
         self.level3_downsample = Conv2d(
             n_channels,
             n_channels,
             kernel_size=3,
             stride=2,
-            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
+            activation_func=torch.nn.LeakyReLU(
+                negative_slope=0.10,
+                inplace=True))
         self.level4_downsample = Conv2d(
             n_channels,
             n_channels,
             kernel_size=3,
             stride=2,
-            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
+            activation_func=torch.nn.LeakyReLU(
+                negative_slope=0.10,
+                inplace=True))
         self.level3_attention = nn.ModuleList([
             SelfAttentionBlock(n_channels, n_head)
-            for _ in range(3)
+            for _ in range(2)
         ])
         self.level4_attention = nn.ModuleList([
             SelfAttentionBlock(n_channels, n_head)
-            for _ in range(3)
+            for _ in range(2)
         ])
 
     def attention_level(self, feature, attention_blocks):
@@ -168,45 +178,25 @@ class SharedEncoder(nn.Module):
         return [level0, level1, level2, level3, level4]
 
 
-class PropagationDecoderBlock(nn.Module):
-    '''Upsample one level and propagate weighted sparse-depth residuals.'''
+class MultiscaleDecoderBlock(nn.Module):
+    '''Upsample and fuse one encoder skip and the preceding depth estimate.'''
 
-    def __init__(self, n_channels):
-        super(PropagationDecoderBlock, self).__init__()
+    def __init__(self, n_channels, min_predict_depth):
+        super(MultiscaleDecoderBlock, self).__init__()
 
-        # Inputs are the upsampled decoder feature, encoder skip, upsampled
-        # depth, sparse depth, and sparse validity map.
+        self.min_predict_depth = min_predict_depth
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 3,
+            2 * n_channels + 1,
             n_channels,
             stride=1)
-        self.weight = Conv2d(
+        self.depth = Conv2d(
             n_channels,
             1,
             kernel_size=3,
             stride=1,
             activation_func=None)
-        self.correction = nn.Sequential(
-            Conv2d(
-                n_channels + 3,
-                n_channels,
-                kernel_size=3,
-                stride=1,
-                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
-            Conv2d(
-                n_channels,
-                1,
-                kernel_size=3,
-                stride=1,
-                activation_func=None))
 
-    def forward(
-            self,
-            feature,
-            skip,
-            depth,
-            sparse_depth,
-            validity_map):
+    def forward(self, feature, skip, depth):
         feature = functional.interpolate(
             feature,
             size=skip.shape[-2:],
@@ -221,26 +211,15 @@ class PropagationDecoderBlock(nn.Module):
         feature = self.fusion(torch.cat([
             feature,
             skip,
-            depth,
-            sparse_depth,
-            validity_map
+            depth
         ], dim=1))
-
-        propagation_weight = torch.sigmoid(self.weight(feature))
-        weighted_validity = validity_map * propagation_weight
-        sparse_residual = weighted_validity * (sparse_depth - depth)
-        depth_correction = self.correction(torch.cat([
-            feature,
-            depth,
-            sparse_residual,
-            weighted_validity
-        ], dim=1))
-
-        return feature, depth + depth_correction, propagation_weight
+        depth = self.min_predict_depth + functional.softplus(
+            self.depth(feature))
+        return feature, depth
 
 
 class ScalePropagationDepthModel(nn.Module):
-    '''Shared RGB-depth U-Net with global-to-local metric propagation.'''
+    '''Shared encoder, bottom propagation map, and multiscale decoder.'''
 
     def __init__(self,
                  min_predict_depth=0.1,
@@ -256,13 +235,8 @@ class ScalePropagationDepthModel(nn.Module):
             n_channels=n_channels,
             n_head=n_head)
 
-        self.coarse_relative_depth = Conv2d(
-            n_channels,
-            1,
-            kernel_size=3,
-            stride=1,
-            activation_func=None)
-        self.coarse_weight = Conv2d(
+        # The positive map directly scales valid sparse depth at the bottom.
+        self.propagation_map = Conv2d(
             n_channels,
             1,
             kernel_size=3,
@@ -270,7 +244,9 @@ class ScalePropagationDepthModel(nn.Module):
             activation_func=None)
 
         self.decoder = nn.ModuleList([
-            PropagationDecoderBlock(n_channels)
+            MultiscaleDecoderBlock(
+                n_channels=n_channels,
+                min_predict_depth=min_predict_depth)
             for _ in range(4)
         ])
 
@@ -290,75 +266,29 @@ class ScalePropagationDepthModel(nn.Module):
             downsampled_depth * downsampled_validity, \
             downsampled_validity
 
-    def weighted_affine_alignment(
-            self,
-            relative_depth,
-            sparse_depth,
-            validity_map,
-            confidence):
-        '''Fit one global scale and shift using weighted sparse constraints.'''
-        weight = validity_map * confidence
-        weight_sum = torch.sum(weight, dim=(2, 3), keepdim=True) + 1e-7
-
-        relative_mean = torch.sum(
-            weight * relative_depth,
-            dim=(2, 3),
-            keepdim=True) / weight_sum
-        sparse_mean = torch.sum(
-            weight * sparse_depth,
-            dim=(2, 3),
-            keepdim=True) / weight_sum
-
-        centered_relative = relative_depth - relative_mean
-        centered_sparse = sparse_depth - sparse_mean
-        covariance = torch.sum(
-            weight * centered_relative * centered_sparse,
-            dim=(2, 3),
-            keepdim=True)
-        variance = torch.sum(
-            weight * centered_relative * centered_relative,
-            dim=(2, 3),
-            keepdim=True)
-
-        scale = covariance / (variance + 1e-7)
-        shift = sparse_mean - scale * relative_mean
-        return scale * relative_depth + shift
-
     def forward(self, image, sparse_depth):
         features = self.encoder(image, sparse_depth)
 
-        sparse_pyramid = [
-            self.downsample_sparse_depth(
-                sparse_depth,
-                feature.shape[-2:])
-            for feature in features
-        ]
-
         coarse_feature = features[-1]
-        coarse_sparse_depth, coarse_validity = sparse_pyramid[-1]
-        relative_depth = torch.sigmoid(
-            self.coarse_relative_depth(coarse_feature))
-        coarse_confidence = torch.sigmoid(
-            self.coarse_weight(coarse_feature))
-        depth = self.weighted_affine_alignment(
-            relative_depth=relative_depth,
-            sparse_depth=coarse_sparse_depth,
-            validity_map=coarse_validity,
-            confidence=coarse_confidence)
+        coarse_sparse_depth, _ = self.downsample_sparse_depth(
+            sparse_depth,
+            coarse_feature.shape[-2:])
+        propagation_map = functional.softplus(
+            self.propagation_map(coarse_feature))
+        coarse_depth = propagation_map * coarse_sparse_depth
 
         feature = coarse_feature
+        depth = coarse_depth
         for decoder_block, level in zip(
                 self.decoder,
                 range(3, -1, -1)):
-            level_sparse_depth, level_validity = sparse_pyramid[level]
-            feature, depth, _ = decoder_block(
+            feature, depth = decoder_block(
                 feature=feature,
                 skip=features[level],
-                depth=depth,
-                sparse_depth=level_sparse_depth,
-                validity_map=level_validity)
+                depth=depth)
 
-        return torch.clamp(
+        depth = torch.clamp(
             depth,
             min=self.min_predict_depth,
             max=self.max_predict_depth)
+        return [depth, coarse_depth]
