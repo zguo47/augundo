@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 
-from partition_attention_model_multiscale_ablation import PartitionAttentionDepthModel
+from scale_propagation_model import ScalePropagationDepthModel
 from utils.src import loss_utils
 
 
-class PartitionAttentionMultiscaleAblationDepthCompletionModel(object):
-    '''Repository wrapper for the RGB-only multi-scale decoder ablation.'''
+class ScalePropagationDepthCompletionModel(object):
+    '''Repository wrapper for shared-encoder multi-scale propagation.'''
 
     def __init__(self,
                  dataset_name='kitti',
@@ -16,7 +16,7 @@ class PartitionAttentionMultiscaleAblationDepthCompletionModel(object):
                  device=torch.device('cuda')):
         del dataset_name, network_modules
 
-        self.model_depth = PartitionAttentionDepthModel(
+        self.model_depth = ScalePropagationDepthModel(
             min_predict_depth=min_predict_depth,
             max_predict_depth=max_predict_depth)
 
@@ -31,9 +31,11 @@ class PartitionAttentionMultiscaleAblationDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
-        del sparse_depth, validity_map, intrinsics
+        del validity_map, intrinsics
 
-        output_depth = self.model_depth(image=image)
+        output_depth = self.model_depth(
+            image=image,
+            sparse_depth=sparse_depth)
         return [output_depth] if return_all_outputs else output_depth
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):

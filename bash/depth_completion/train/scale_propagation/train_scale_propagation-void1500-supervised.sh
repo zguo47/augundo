@@ -2,7 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# Train the RGB-only full-attention and multi-scale decoder ablation on VOID.
+# Train the shared RGB-sparse scale-propagation model on VOID.
 python depth_completion/src/train_depth_completion.py \
 --train_images_path training/void/supervised/void_train_image_1500.txt \
 --train_sparse_depth_path training/void/supervised/void_train_sparse_depth_1500.txt \
@@ -15,7 +15,7 @@ python depth_completion/src/train_depth_completion.py \
 --n_batch 1 \
 --n_height 512 \
 --n_width 512 \
---model_name partition_attention_multiscale_ablation_void \
+--model_name scale_propagation_void \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \
@@ -57,6 +57,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/partition_attention_multiscale_ablation/void1500/multiscale_decoder \
+    trained_models/depth_completion/scale_propagation/void1500/supervised \
 --device gpu \
 --n_thread 8
