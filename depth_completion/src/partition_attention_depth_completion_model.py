@@ -32,7 +32,7 @@ class PartitionAttentionDepthCompletionModel(object):
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
-        self.print_inference_time = True
+        self.print_inference_time = False
         self.device = device
         self.to(device)
 

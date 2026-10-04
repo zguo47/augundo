@@ -61,6 +61,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/partition_attention_ablation/void1500/supervised_attention_swin_1_iter_16_window_2_sa_4_shift \
+    trained_models/depth_completion/partition_attention_ablation/void1500/supervised_attention_swin_1_iter_16_window_2_sa_4_shift_16_channels \
 --device gpu \
 --n_thread 8
