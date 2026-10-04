@@ -178,25 +178,60 @@ class SharedEncoder(nn.Module):
         return [level0, level1, level2, level3, level4]
 
 
-class MultiscaleDecoderBlock(nn.Module):
-    '''Upsample and fuse one encoder skip and the preceding depth estimate.'''
+def propagate_depth(depth, validity_map, propagation_logits):
+    '''Multiply each local depth neighborhood by learned propagation weights.'''
+    n_batch, _, n_height, n_width = depth.shape
+    propagation_weights = torch.softmax(propagation_logits, dim=1)
 
-    def __init__(self, n_channels, min_predict_depth):
-        super(MultiscaleDecoderBlock, self).__init__()
+    depth_patches = functional.unfold(
+        functional.pad(depth, (1, 1, 1, 1), mode='replicate'),
+        kernel_size=3).reshape(
+            n_batch, 9, n_height, n_width)
+    validity_patches = functional.unfold(
+        functional.pad(validity_map, (1, 1, 1, 1), mode='replicate'),
+        kernel_size=3).reshape(
+            n_batch, 9, n_height, n_width)
 
-        self.min_predict_depth = min_predict_depth
+    valid_weights = propagation_weights * validity_patches
+    weight_sum = torch.sum(valid_weights, dim=1, keepdim=True)
+    propagated_depth = torch.sum(
+        valid_weights * depth_patches,
+        dim=1,
+        keepdim=True) / (weight_sum + 1e-7)
+    propagated_validity = (weight_sum > 0.0).to(depth.dtype)
+    return \
+        propagated_depth * propagated_validity, \
+        propagated_validity
+
+
+class PropagationDecoderBlock(nn.Module):
+    '''Upsample and refine the preceding propagation map at one scale.'''
+
+    def __init__(self, n_channels):
+        super(PropagationDecoderBlock, self).__init__()
+
+        # Inputs are two feature maps, the previous depth, sparse depth,
+        # sparse validity, and the nine upsampled propagation logits.
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 1,
+            2 * n_channels + 12,
             n_channels,
             stride=1)
-        self.depth = Conv2d(
+        self.propagation_update = Conv2d(
             n_channels,
-            1,
+            9,
             kernel_size=3,
             stride=1,
             activation_func=None)
 
-    def forward(self, feature, skip, depth):
+    def forward(
+            self,
+            feature,
+            skip,
+            depth,
+            depth_validity,
+            propagation_logits,
+            sparse_depth,
+            sparse_validity):
         feature = functional.interpolate(
             feature,
             size=skip.shape[-2:],
@@ -207,15 +242,41 @@ class MultiscaleDecoderBlock(nn.Module):
             size=skip.shape[-2:],
             mode='bilinear',
             align_corners=True)
+        depth_validity = functional.interpolate(
+            depth_validity,
+            size=skip.shape[-2:],
+            mode='nearest')
+        propagation_logits = functional.interpolate(
+            propagation_logits,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
 
         feature = self.fusion(torch.cat([
             feature,
             skip,
-            depth
+            depth,
+            sparse_depth,
+            sparse_validity,
+            propagation_logits
         ], dim=1))
-        depth = self.min_predict_depth + functional.softplus(
-            self.depth(feature))
-        return feature, depth
+        propagation_logits = \
+            propagation_logits + self.propagation_update(feature)
+
+        # Valid sparse measurements replace the upsampled coarse estimate.
+        source_depth = \
+            sparse_validity * sparse_depth + \
+            (1.0 - sparse_validity) * depth
+        source_validity = torch.clamp(
+            sparse_validity + depth_validity,
+            min=0.0,
+            max=1.0)
+        depth, depth_validity = propagate_depth(
+            depth=source_depth,
+            validity_map=source_validity,
+            propagation_logits=propagation_logits)
+        return \
+            feature, depth, depth_validity, propagation_logits
 
 
 class ScalePropagationDepthModel(nn.Module):
@@ -235,18 +296,16 @@ class ScalePropagationDepthModel(nn.Module):
             n_channels=n_channels,
             n_head=n_head)
 
-        # The positive map directly scales valid sparse depth at the bottom.
+        # Nine logits define one learned 3 x 3 propagation map per pixel.
         self.propagation_map = Conv2d(
             n_channels,
-            1,
+            9,
             kernel_size=3,
             stride=1,
             activation_func=None)
 
         self.decoder = nn.ModuleList([
-            MultiscaleDecoderBlock(
-                n_channels=n_channels,
-                min_predict_depth=min_predict_depth)
+            PropagationDecoderBlock(n_channels=n_channels)
             for _ in range(4)
         ])
 
@@ -270,25 +329,35 @@ class ScalePropagationDepthModel(nn.Module):
         features = self.encoder(image, sparse_depth)
 
         coarse_feature = features[-1]
-        coarse_sparse_depth, _ = self.downsample_sparse_depth(
+        coarse_sparse_depth, coarse_validity = self.downsample_sparse_depth(
             sparse_depth,
             coarse_feature.shape[-2:])
-        propagation_map = functional.softplus(
-            self.propagation_map(coarse_feature))
-        coarse_depth = propagation_map * coarse_sparse_depth
+        propagation_logits = self.propagation_map(coarse_feature)
+        depth, depth_validity = propagate_depth(
+            depth=coarse_sparse_depth,
+            validity_map=coarse_validity,
+            propagation_logits=propagation_logits)
 
         feature = coarse_feature
-        depth = coarse_depth
         for decoder_block, level in zip(
                 self.decoder,
                 range(3, -1, -1)):
-            feature, depth = decoder_block(
+            level_sparse_depth, level_sparse_validity = \
+                self.downsample_sparse_depth(
+                    sparse_depth,
+                    features[level].shape[-2:])
+            feature, depth, depth_validity, propagation_logits = \
+                decoder_block(
                 feature=feature,
                 skip=features[level],
-                depth=depth)
+                depth=depth,
+                depth_validity=depth_validity,
+                propagation_logits=propagation_logits,
+                sparse_depth=level_sparse_depth,
+                sparse_validity=level_sparse_validity)
 
         depth = torch.clamp(
             depth,
             min=self.min_predict_depth,
             max=self.max_predict_depth)
-        return [depth, coarse_depth]
+        return depth

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as functional
 
 from scale_propagation_model import ScalePropagationDepthModel
 from utils.src import loss_utils
@@ -34,15 +33,14 @@ class ScalePropagationDepthCompletionModel(object):
                       return_all_outputs=False):
         del validity_map, intrinsics
 
-        output_depths = self.model_depth(
+        output_depth = self.model_depth(
             image=image,
             sparse_depth=sparse_depth)
-        return output_depths if return_all_outputs else output_depths[0]
+        return [output_depth] if return_all_outputs else output_depth
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
-        '''Supervise the final depth and valid bottom propagation values.'''
-        final_depth = output_depth[0]
-        coarse_depth = output_depth[1]
+        '''Supervise only the final full-resolution propagated depth.'''
+        output_depth = output_depth[0]
 
         validity = (target_depth > 0.0).to(target_depth.dtype)
         target_depth = torch.where(
@@ -53,47 +51,16 @@ class ScalePropagationDepthCompletionModel(object):
                 max=self.max_predict_depth),
             torch.full_like(target_depth, self.min_predict_depth))
 
-        loss_final = loss_utils.log_l1_loss_func(
-            src=final_depth,
+        loss_log_l1 = loss_utils.log_l1_loss_func(
+            src=output_depth,
             tgt=target_depth,
             w=validity)
-
-        coarse_validity = functional.adaptive_avg_pool2d(
-            validity,
-            output_size=coarse_depth.shape[-2:])
-        coarse_target = functional.adaptive_avg_pool2d(
-            target_depth * validity,
-            output_size=coarse_depth.shape[-2:]) / (coarse_validity + 1e-7)
-        coarse_validity = \
-            (coarse_validity > 0.0).to(target_depth.dtype) * \
-            (coarse_depth > 0.0).to(target_depth.dtype)
-        coarse_depth = torch.where(
-            coarse_validity > 0.0,
-            torch.clamp(
-                coarse_depth,
-                min=self.min_predict_depth,
-                max=self.max_predict_depth),
-            torch.full_like(coarse_depth, self.min_predict_depth))
-        coarse_target = torch.where(
-            coarse_validity > 0.0,
-            torch.clamp(
-                coarse_target,
-                min=self.min_predict_depth,
-                max=self.max_predict_depth),
-            torch.full_like(coarse_target, self.min_predict_depth))
-        loss_coarse = loss_utils.log_l1_loss_func(
-            src=coarse_depth,
-            tgt=coarse_target,
-            w=coarse_validity)
-
         w_supervised = w_losses.get('w_supervised', 1.0)
-        w_coarse = w_losses.get('w_coarse', 1.0)
-        loss = w_supervised * (loss_final + w_coarse * loss_coarse)
+        loss = w_supervised * loss_log_l1
 
         return loss, {
             'loss': loss,
-            'loss_log_l1': loss_final,
-            'loss_coarse': loss_coarse
+            'loss_log_l1': loss_log_l1
         }
 
     def parameters(self):
