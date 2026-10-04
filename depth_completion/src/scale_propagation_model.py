@@ -84,17 +84,20 @@ class ConvolutionBlock(nn.Module):
                 in_channels,
                 out_channels,
                 kernel_size=3,
-                stride=stride),
+                stride=stride,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
-                stride=1),
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
-                stride=1))
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
 
     def forward(self, feature):
         return self.convolutions(feature)
@@ -117,12 +120,14 @@ class SharedEncoder(nn.Module):
             n_channels,
             n_channels,
             kernel_size=3,
-            stride=2)
+            stride=2,
+            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
         self.level4_downsample = Conv2d(
             n_channels,
             n_channels,
             kernel_size=3,
-            stride=2)
+            stride=2,
+            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
         self.level3_attention = nn.ModuleList([
             SelfAttentionBlock(n_channels, n_head)
             for _ in range(3)
@@ -186,7 +191,8 @@ class PropagationDecoderBlock(nn.Module):
                 n_channels + 3,
                 n_channels,
                 kernel_size=3,
-                stride=1),
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 n_channels,
                 1,
