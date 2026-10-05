@@ -222,6 +222,12 @@ class PropagationDecoderBlock(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
+        self.depth_residual = Conv2d(
+            n_channels,
+            1,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
 
     def forward(
             self,
@@ -275,6 +281,12 @@ class PropagationDecoderBlock(nn.Module):
             depth=source_depth,
             validity_map=source_validity,
             propagation_logits=propagation_logits)
+
+        # Propagation can only mix existing depth values. This learned
+        # residual lets the RGB-sparse feature restore spatial detail that
+        # was not represented by the coarse sparse-depth grid.
+        depth = depth + self.depth_residual(feature)
+        depth_validity = torch.ones_like(depth_validity)
         return \
             feature, depth, depth_validity, propagation_logits
 
@@ -296,6 +308,15 @@ class ScalePropagationDepthModel(nn.Module):
             n_channels=n_channels,
             n_head=n_head)
 
+        # Predict the reliability of every input sparse-depth measurement.
+        # The confidence is only used where sparse depth is valid.
+        self.sparse_confidence = Conv2d(
+            n_channels,
+            1,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+
         # Nine logits define one learned 3 x 3 propagation map per pixel.
         self.propagation_map = Conv2d(
             n_channels,
@@ -309,28 +330,34 @@ class ScalePropagationDepthModel(nn.Module):
             for _ in range(4)
         ])
 
-    def downsample_sparse_depth(self, sparse_depth, size):
-        '''Average only valid sparse points inside every output cell.'''
+    def downsample_sparse_depth(self, sparse_depth, confidence, size):
+        '''Confidence-weight valid sparse points inside every output cell.'''
         validity_map = (sparse_depth > 0.0).to(sparse_depth.dtype)
         pooled_depth = functional.adaptive_avg_pool2d(
-            sparse_depth * validity_map,
+            sparse_depth * validity_map * confidence,
+            output_size=size)
+        pooled_confidence = functional.adaptive_avg_pool2d(
+            validity_map * confidence,
             output_size=size)
         pooled_validity = functional.adaptive_avg_pool2d(
             validity_map,
             output_size=size)
-        downsampled_depth = pooled_depth / (pooled_validity + 1e-7)
-        downsampled_validity = \
-            (pooled_validity > 0.0).to(sparse_depth.dtype)
+        downsampled_depth = pooled_depth / (pooled_confidence + 1e-7)
+        downsampled_confidence = \
+            pooled_confidence / (pooled_validity + 1e-7)
         return \
-            downsampled_depth * downsampled_validity, \
-            downsampled_validity
+            downsampled_depth * (pooled_validity > 0.0), \
+            downsampled_confidence
 
     def forward(self, image, sparse_depth):
         features = self.encoder(image, sparse_depth)
+        sparse_confidence = torch.sigmoid(
+            self.sparse_confidence(features[0]))
 
         coarse_feature = features[-1]
         coarse_sparse_depth, coarse_validity = self.downsample_sparse_depth(
             sparse_depth,
+            sparse_confidence,
             coarse_feature.shape[-2:])
         propagation_logits = self.propagation_map(coarse_feature)
         depth, depth_validity = propagate_depth(
@@ -345,6 +372,7 @@ class ScalePropagationDepthModel(nn.Module):
             level_sparse_depth, level_sparse_validity = \
                 self.downsample_sparse_depth(
                     sparse_depth,
+                    sparse_confidence,
                     features[level].shape[-2:])
             feature, depth, depth_validity, propagation_logits = \
                 decoder_block(
