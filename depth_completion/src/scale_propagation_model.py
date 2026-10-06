@@ -277,8 +277,7 @@ class ScalePropagationDepthModel(nn.Module):
             n_channels=n_channels,
             n_head=n_head)
 
-        # The bottom feature predicts a dense coarse depth. Sparse depth is
-        # not pooled into the depth state.
+        # The bottom feature predicts a dense coarse depth. 
         self.coarse_depth = Conv2d(
             n_channels,
             1,
@@ -312,8 +311,7 @@ class ScalePropagationDepthModel(nn.Module):
         features = self.encoder(image, sparse_depth)
 
         coarse_feature = features[-1]
-        depth = functional.softplus(
-            self.coarse_depth(coarse_feature)) + self.min_predict_depth
+        depth = functional.softplus(self.coarse_depth(coarse_feature)) + self.min_predict_depth
         propagation_logits = self.propagation_map(coarse_feature)
         depth, _ = propagate_depth(
             depth=depth,
