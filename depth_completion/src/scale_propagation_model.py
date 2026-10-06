@@ -79,32 +79,25 @@ class ConvolutionBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride):
         super(ConvolutionBlock, self).__init__()
 
-        activation = torch.nn.LeakyReLU(
-            negative_slope=0.10,
-            inplace=True)
         self.convolutions = nn.Sequential(
             Conv2d(
                 in_channels,
                 out_channels,
                 kernel_size=3,
                 stride=stride,
-                activation_func=activation),
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
                 stride=1,
-                activation_func=torch.nn.LeakyReLU(
-                    negative_slope=0.10,
-                    inplace=True)),
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 out_channels,
                 out_channels,
                 kernel_size=3,
                 stride=1,
-                activation_func=torch.nn.LeakyReLU(
-                    negative_slope=0.10,
-                    inplace=True)))
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
 
     def forward(self, feature):
         return self.convolutions(feature)
@@ -127,17 +120,13 @@ class SharedEncoder(nn.Module):
             n_channels,
             kernel_size=3,
             stride=2,
-            activation_func=torch.nn.LeakyReLU(
-                negative_slope=0.10,
-                inplace=True))
+            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
         self.level4_downsample = Conv2d(
             n_channels,
             n_channels,
             kernel_size=3,
             stride=2,
-            activation_func=torch.nn.LeakyReLU(
-                negative_slope=0.10,
-                inplace=True))
+            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
         self.level3_attention = nn.ModuleList([
             SelfAttentionBlock(n_channels, n_head)
             for _ in range(2)
