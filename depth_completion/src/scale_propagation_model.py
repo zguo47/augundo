@@ -195,22 +195,47 @@ def propagate_depth(depth, validity_map, propagation_logits):
     return propagated_depth * propagated_validity, propagated_validity
 
 
+def rejection_keep_mask(rejection_logits, temperature, training):
+    '''Convert two-channel keep/reject logits into a hard keep mask.'''
+
+    if training:
+        rejection_decision = functional.gumbel_softmax(
+            rejection_logits,
+            tau=temperature,
+            hard=True,
+            dim=1)
+        return rejection_decision[:, 0:1, :, :]
+
+    rejection_decision = torch.argmax(
+        rejection_logits,
+        dim=1,
+        keepdim=True)
+    return (rejection_decision == 0).to(rejection_logits.dtype)
+
+
 class PropagationDecoderBlock(nn.Module):
     '''Upsample and refine the preceding propagation map at one scale.'''
 
-    def __init__(self, n_channels):
+    def __init__(self, n_channels, gumbel_temperature):
         super(PropagationDecoderBlock, self).__init__()
 
         # Inputs are decoder features, encoder skip features, previous dense depth, 
-        # and the nine upsampled propagation logits.
-        # C + C + 1 + 9 = 2C + 10
+        # nine upsampled propagation logits, and two rejection logits.
+        # C + C + 1 + 9 + 2 = 2C + 12
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 10,
+            2 * n_channels + 12,
             n_channels,
             stride=1)
+        self.gumbel_temperature = gumbel_temperature
         self.propagation_update = Conv2d(
             n_channels,
             9,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        self.rejection_update = Conv2d(
+            n_channels,
+            2,
             kernel_size=3,
             stride=1,
             activation_func=None)
@@ -226,7 +251,8 @@ class PropagationDecoderBlock(nn.Module):
             feature,
             skip,
             depth,
-            propagation_logits):
+            propagation_logits,
+            rejection_logits):
         # upsample with bilinear interpolation
         feature = functional.interpolate(
             feature,
@@ -243,26 +269,38 @@ class PropagationDecoderBlock(nn.Module):
             size=skip.shape[-2:],
             mode='bilinear',
             align_corners=True)
+        rejection_logits = functional.interpolate(
+            rejection_logits,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
 
         # concat upsampled coarse context, encoder skip features, current depth, 
-        # and upsampled propagation logits and pass through three conv.
+        # propagation logits, and rejection logits and pass through three conv.
         feature = self.fusion(torch.cat([
             feature,
             skip,
             depth,
-            propagation_logits
+            propagation_logits,
+            rejection_logits
         ], dim=1))
         # Refine propagation weights. Conv predicts a nine channel correction.
         propagation_logits = propagation_logits + self.propagation_update(feature)
+        # Refine keep/reject decisions. Conv predicts a two channel correction.
+        rejection_logits = rejection_logits + self.rejection_update(feature)
+        keep_mask = rejection_keep_mask(
+            rejection_logits=rejection_logits,
+            temperature=self.gumbel_temperature,
+            training=self.training)
 
         # Refine depth. Conv predicts a one channel correction.
         depth = depth + self.depth_residual(feature)
         # Propagate the refined depth using the updated propagation logits.
         depth, _ = propagate_depth(
             depth=depth,
-            validity_map=torch.ones_like(depth),
+            validity_map=keep_mask,
             propagation_logits=propagation_logits)
-        return feature, depth, propagation_logits
+        return feature, depth, propagation_logits, rejection_logits, keep_mask
 
 
 class ScalePropagationDepthModel(nn.Module):
@@ -272,11 +310,13 @@ class ScalePropagationDepthModel(nn.Module):
                  min_predict_depth=0.1,
                  max_predict_depth=8.0,
                  n_channels=32,
-                 n_head=4):
+                 n_head=4,
+                 gumbel_temperature=1.0):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
+        self.gumbel_temperature = gumbel_temperature
 
         # Takes in RGB and sparse depth together and produce 5 feature maps.
         self.encoder = SharedEncoder(
@@ -299,8 +339,22 @@ class ScalePropagationDepthModel(nn.Module):
             stride=1,
             activation_func=None)
 
+        # Two logits represent keep and reject for every coarse depth.
+        self.rejection_map = Conv2d(
+            n_channels,
+            2,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        # Outliers are expected to be uncommon, so initialize the categorical
+        # decision with a preference for keeping depth values.
+        self.rejection_bias = nn.Parameter(
+            torch.tensor([2.0, 0.0]).reshape(1, 2, 1, 1))
+
         self.decoder = nn.ModuleList([
-            PropagationDecoderBlock(n_channels=n_channels)
+            PropagationDecoderBlock(
+                n_channels=n_channels,
+                gumbel_temperature=gumbel_temperature)
             for _ in range(4)
         ])
 
@@ -320,30 +374,40 @@ class ScalePropagationDepthModel(nn.Module):
         # Predict initial dense coarse depth. Ensure it is positive.
         depth = functional.softplus(self.coarse_depth(coarse_feature)) + self.min_predict_depth
         propagation_logits = self.propagation_map(coarse_feature)
+        rejection_logits = \
+            self.rejection_map(coarse_feature) + self.rejection_bias
+        keep_mask = rejection_keep_mask(
+            rejection_logits=rejection_logits,
+            temperature=self.gumbel_temperature,
+            training=self.training)
         depth, _ = propagate_depth(
             depth=depth,
-            validity_map=torch.ones_like(depth),
+            validity_map=keep_mask,
             propagation_logits=propagation_logits)
 
         feature = coarse_feature
         for decoder_block, level in zip(
                 self.decoder,
                 range(3, -1, -1)):
-            feature, depth, propagation_logits = \
+            feature, depth, propagation_logits, rejection_logits, keep_mask = \
                 decoder_block(
                 feature=feature,
                 skip=features[level],
                 depth=depth,
-                propagation_logits=propagation_logits)
+                propagation_logits=propagation_logits,
+                rejection_logits=rejection_logits)
 
         # Apply sparse depth constraints only at their original pixel locations.
         sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
-        # Confidence is zero when there is no valid sparse depth.
-        sparse_confidence = torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity
+        # Rejection makes a hard decision; confidence then controls the strength
+        # of each sparse measurement that was kept.
+        sparse_confidence = \
+            torch.sigmoid(self.sparse_confidence(feature)) * \
+            sparse_validity * keep_mask
         depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
         depth, _ = propagate_depth(
             depth=depth,
-            validity_map=torch.ones_like(depth),
+            validity_map=keep_mask,
             propagation_logits=propagation_logits)
 
         depth = torch.clamp(
