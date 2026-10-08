@@ -46,7 +46,7 @@ def add_position_encoding(feature):
 
 
 class SelfAttentionBlock(nn.Module):
-    '''One residual self-attention and feedforward block.'''
+    '''Self-attention and feedforward block.'''
 
     def __init__(self, n_channels, n_head):
         super(SelfAttentionBlock, self).__init__()
@@ -113,8 +113,7 @@ class SharedEncoder(nn.Module):
         self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2)
         self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2)
 
-        # Only the resolution-changing convolution remains at the last two
-        # levels; spatial processing is performed by two attention blocks.
+        # For the last two levels, there is one downsampling conv + 2 attention blocks.
         self.level3_downsample = Conv2d(
             n_channels,
             n_channels,
@@ -169,28 +168,31 @@ class SharedEncoder(nn.Module):
 
 def propagate_depth(depth, validity_map, propagation_logits):
     '''Multiply each local depth neighborhood by learned propagation weights.'''
+
     n_batch, _, n_height, n_width = depth.shape
+    # Convert logits to weights
     propagation_weights = torch.softmax(propagation_logits, dim=1)
 
+    # For every pixel, extract its 3x3 neighborhood patches then reshape to
+    # B x 9 x H x W
     depth_patches = functional.unfold(
         functional.pad(depth, (1, 1, 1, 1), mode='replicate'),
-        kernel_size=3).reshape(
-            n_batch, 9, n_height, n_width)
+        kernel_size=3).reshape(n_batch, 9, n_height, n_width)
     validity_patches = functional.unfold(
         functional.pad(validity_map, (1, 1, 1, 1), mode='replicate'),
-        kernel_size=3).reshape(
-            n_batch, 9, n_height, n_width)
+        kernel_size=3).reshape(n_batch, 9, n_height, n_width)
 
+    # remove invalid neighbors
     valid_weights = propagation_weights * validity_patches
+    # normalize again and average valid depths
     weight_sum = torch.sum(valid_weights, dim=1, keepdim=True)
     propagated_depth = torch.sum(
         valid_weights * depth_patches,
         dim=1,
         keepdim=True) / (weight_sum + 1e-7)
+    # Compute output validity
     propagated_validity = (weight_sum > 0.0).to(depth.dtype)
-    return \
-        propagated_depth * propagated_validity, \
-        propagated_validity
+    return propagated_depth * propagated_validity, propagated_validity
 
 
 class PropagationDecoderBlock(nn.Module):
@@ -199,8 +201,9 @@ class PropagationDecoderBlock(nn.Module):
     def __init__(self, n_channels):
         super(PropagationDecoderBlock, self).__init__()
 
-        # Inputs are two feature maps, the previous dense depth, and the nine
-        # upsampled propagation logits.
+        # Inputs are decoder features, encoder skip features, previous dense depth, 
+        # and the nine upsampled propagation logits.
+        # C + C + 1 + 9 = 2C + 10
         self.fusion = ConvolutionBlock(
             2 * n_channels + 10,
             n_channels,
@@ -224,6 +227,7 @@ class PropagationDecoderBlock(nn.Module):
             skip,
             depth,
             propagation_logits):
+        # upsample with bilinear interpolation
         feature = functional.interpolate(
             feature,
             size=skip.shape[-2:],
@@ -240,24 +244,25 @@ class PropagationDecoderBlock(nn.Module):
             mode='bilinear',
             align_corners=True)
 
+        # concat upsampled coarse context, encoder skip features, current depth, 
+        # and upsampled propagation logits and pass through three conv.
         feature = self.fusion(torch.cat([
             feature,
             skip,
             depth,
             propagation_logits
         ], dim=1))
-        propagation_logits = \
-            propagation_logits + self.propagation_update(feature)
+        # Refine propagation weights. Conv predicts a nine channel correction.
+        propagation_logits = propagation_logits + self.propagation_update(feature)
 
-        # The residual creates new spatial detail instead of restricting the
-        # finer depth to mixtures of the preceding coarse values.
+        # Refine depth. Conv predicts a one channel correction.
         depth = depth + self.depth_residual(feature)
+        # Propagate the refined depth using the updated propagation logits.
         depth, _ = propagate_depth(
             depth=depth,
             validity_map=torch.ones_like(depth),
             propagation_logits=propagation_logits)
-        return \
-            feature, depth, propagation_logits
+        return feature, depth, propagation_logits
 
 
 class ScalePropagationDepthModel(nn.Module):
@@ -273,6 +278,7 @@ class ScalePropagationDepthModel(nn.Module):
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
 
+        # Takes in RGB and sparse depth together and produce 5 feature maps.
         self.encoder = SharedEncoder(
             n_channels=n_channels,
             n_head=n_head)
@@ -298,8 +304,8 @@ class ScalePropagationDepthModel(nn.Module):
             for _ in range(4)
         ])
 
-        # Confidence determines how strongly each original-resolution sparse
-        # measurement constrains the learned dense prediction.
+        # Confidence determines how strongly each original-res sparse depth 
+        # constrains the learned depth.
         self.sparse_confidence = Conv2d(
             n_channels,
             1,
@@ -311,6 +317,7 @@ class ScalePropagationDepthModel(nn.Module):
         features = self.encoder(image, sparse_depth)
 
         coarse_feature = features[-1]
+        # Predict initial dense coarse depth. Ensure it is positive.
         depth = functional.softplus(self.coarse_depth(coarse_feature)) + self.min_predict_depth
         propagation_logits = self.propagation_map(coarse_feature)
         depth, _ = propagate_depth(
@@ -329,13 +336,11 @@ class ScalePropagationDepthModel(nn.Module):
                 depth=depth,
                 propagation_logits=propagation_logits)
 
-        # Apply metric constraints only at their original pixel locations.
+        # Apply sparse depth constraints only at their original pixel locations.
         sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
-        sparse_confidence = \
-            torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity
-        depth = \
-            sparse_confidence * sparse_depth + \
-            (1.0 - sparse_confidence) * depth
+        # Confidence is zero when there is no valid sparse depth.
+        sparse_confidence = torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity
+        depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
         depth, _ = propagate_depth(
             depth=depth,
             validity_map=torch.ones_like(depth),
