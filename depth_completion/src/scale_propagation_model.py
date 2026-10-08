@@ -211,7 +211,6 @@ def rejection_keep_mask(rejection_logits, temperature, training):
         dim=1,
         keepdim=True)
     return (rejection_decision == 0).to(rejection_logits.dtype)
-    # return torch.ones_like(rejection_logits[:, 0:1, :, :])
 
 
 class PropagationDecoderBlock(nn.Module):
@@ -299,7 +298,7 @@ class PropagationDecoderBlock(nn.Module):
         # Propagate the refined depth using the updated propagation logits.
         depth, _ = propagate_depth(
             depth=depth,
-            validity_map=keep_mask,
+            validity_map=torch.ones_like(depth),
             propagation_logits=propagation_logits)
         return feature, depth, propagation_logits, rejection_logits, keep_mask
 
@@ -379,10 +378,9 @@ class ScalePropagationDepthModel(nn.Module):
             rejection_logits=rejection_logits,
             temperature=self.gumbel_temperature,
             training=self.training)
-        print('coarse keep:', keep_mask.mean().item())
         depth, _ = propagate_depth(
             depth=depth,
-            validity_map=keep_mask,
+            validity_map=torch.ones_like(depth),
             propagation_logits=propagation_logits)
 
         feature = coarse_feature
@@ -396,24 +394,16 @@ class ScalePropagationDepthModel(nn.Module):
                 depth=depth,
                 propagation_logits=propagation_logits,
                 rejection_logits=rejection_logits)
-            
-            print(
-                'level:', level,
-                'keep:', keep_mask.mean().item(),
-                'depth:',
-                depth.min().item(),
-                depth.max().item(),
-                depth.std().item())
+
         # Apply sparse depth constraints only at their original pixel locations.
         sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
-        # Rejection makes a hard decision; confidence then controls the strength
-        # of each sparse measurement that was kept.
-        sparse_confidence = torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity * keep_mask
-        # depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
-        depth = sparse_validity * sparse_depth + (1.0 - sparse_validity) * depth
-        depth, propagated_validity = propagate_depth(
+        accepted_sparse_validity = sparse_validity * keep_mask
+        depth = \
+            accepted_sparse_validity * sparse_depth + \
+            (1.0 - accepted_sparse_validity) * depth
+        depth, _ = propagate_depth(
             depth=depth,
-            validity_map=keep_mask,
+            validity_map=torch.ones_like(depth),
             propagation_logits=propagation_logits)
 
         depth = torch.clamp(
