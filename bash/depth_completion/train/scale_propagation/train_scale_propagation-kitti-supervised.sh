@@ -56,7 +56,9 @@ python depth_completion/src/train_depth_completion.py \
 --n_image_per_summary 4 \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
+--restore_paths \
+    trained_models/depth_completion/scale_propagation/kitti/supervised/checkpoints-72000/scale-propagation-72000.pth \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/kitti/supervised \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_disable_gumbel_test \
 --device gpu \
 --n_thread 8

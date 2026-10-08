@@ -59,6 +59,6 @@ python depth_completion/src/train_depth_completion.py \
 --restore_paths \
     trained_models/depth_completion/scale_propagation/void1500/supervised_rej_map_no_conf/checkpoints-62000/scale-propagation-62000.pth \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_rej_map_with_gumbel_test \
+    trained_models/depth_completion/scale_propagation/void1500/supervised_rej_map_no_conf_disable_gumbel_test \
 --device gpu \
 --n_thread 8

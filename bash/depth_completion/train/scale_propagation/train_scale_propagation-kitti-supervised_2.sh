@@ -2,25 +2,25 @@
 
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 
-# Train the shared RGB-sparse scale-propagation model on VOID.
+# Train the shared RGB-sparse scale-propagation model on Kitti.
 python depth_completion/src/train_depth_completion.py \
---train_images_path training/void/supervised/void_train_image_1500.txt \
---train_sparse_depth_path training/void/supervised/void_train_sparse_depth_1500.txt \
---train_intrinsics_path training/void/supervised/void_train_intrinsics_1500.txt \
---train_ground_truth_path training/void/supervised/void_train_ground_truth_1500.txt \
---val_image_path testing/void/void_test_image_1500.txt \
---val_sparse_depth_path testing/void/void_test_sparse_depth_1500.txt \
---val_intrinsics_path testing/void/void_test_intrinsics_1500.txt \
---val_ground_truth_path testing/void/void_test_ground_truth_1500.txt \
+--train_images_path training/kitti/supervised/kitti_train_image.txt \
+--train_sparse_depth_path training/kitti/supervised/kitti_train_sparse_depth.txt \
+--train_intrinsics_path training/kitti/supervised/kitti_train_intrinsics.txt \
+--train_ground_truth_path training/kitti/supervised/kitti_train_ground_truth.txt \
+--val_image_path validation/kitti/kitti_val_image.txt \
+--val_sparse_depth_path validation/kitti/kitti_val_sparse_depth.txt \
+--val_intrinsics_path validation/kitti/kitti_val_intrinsics.txt \
+--val_ground_truth_path validation/kitti/kitti_val_ground_truth.txt \
 --n_batch 4 \
---n_height 480 \
---n_width 640 \
---model_name scale_propagation_void \
+--n_height 320 \
+--n_width 768 \
+--model_name scale_propagation_kitti \
 --input_channels_image 3 \
 --input_channels_depth 2 \
 --normalized_image_range 0 1 \
---min_predict_depth 0.1 \
---max_predict_depth 8.0 \
+--min_predict_depth 1.5 \
+--max_predict_depth 100.0 \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 2 \
@@ -50,15 +50,15 @@ python depth_completion/src/train_depth_completion.py \
 --w_losses w_supervised=1.0 \
 --w_weight_decay_depth 0.00 \
 --w_weight_decay_pose 0.00 \
---min_evaluate_depth 0.2 \
---max_evaluate_depth 5.0 \
+--min_evaluate_depth 0.0 \
+--max_evaluate_depth 100.0 \
 --n_step_per_summary 500 \
 --n_image_per_summary 4 \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --restore_paths \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_rej_map_no_conf/checkpoints-62000/scale-propagation-62000.pth \
+    trained_models/depth_completion/scale_propagation/kitti/supervised/checkpoints-89000/scale-propagation-89000.pth \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_rej_map_with_gumbel_test \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_collapse \
 --device gpu \
 --n_thread 8

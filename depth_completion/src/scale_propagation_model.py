@@ -211,6 +211,7 @@ def rejection_keep_mask(rejection_logits, temperature, training):
         dim=1,
         keepdim=True)
     return (rejection_decision == 0).to(rejection_logits.dtype)
+    # return torch.ones_like(rejection_logits[:, 0:1, :, :])
 
 
 class PropagationDecoderBlock(nn.Module):
@@ -346,8 +347,7 @@ class ScalePropagationDepthModel(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
-        # Outliers are expected to be uncommon, so initialize the categorical
-        # decision with a preference for keeping depth values.
+        # Initialize with a preference for keeping depth values.
         self.rejection_bias = nn.Parameter(
             torch.tensor([2.0, 0.0]).reshape(1, 2, 1, 1))
 
@@ -374,12 +374,12 @@ class ScalePropagationDepthModel(nn.Module):
         # Predict initial dense coarse depth. Ensure it is positive.
         depth = functional.softplus(self.coarse_depth(coarse_feature)) + self.min_predict_depth
         propagation_logits = self.propagation_map(coarse_feature)
-        rejection_logits = \
-            self.rejection_map(coarse_feature) + self.rejection_bias
+        rejection_logits = self.rejection_map(coarse_feature) + self.rejection_bias
         keep_mask = rejection_keep_mask(
             rejection_logits=rejection_logits,
             temperature=self.gumbel_temperature,
             training=self.training)
+        print('coarse keep:', keep_mask.mean().item())
         depth, _ = propagate_depth(
             depth=depth,
             validity_map=keep_mask,
@@ -396,16 +396,22 @@ class ScalePropagationDepthModel(nn.Module):
                 depth=depth,
                 propagation_logits=propagation_logits,
                 rejection_logits=rejection_logits)
-
+            
+            print(
+                'level:', level,
+                'keep:', keep_mask.mean().item(),
+                'depth:',
+                depth.min().item(),
+                depth.max().item(),
+                depth.std().item())
         # Apply sparse depth constraints only at their original pixel locations.
         sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
         # Rejection makes a hard decision; confidence then controls the strength
         # of each sparse measurement that was kept.
-        sparse_confidence = \
-            torch.sigmoid(self.sparse_confidence(feature)) * \
-            sparse_validity * keep_mask
-        depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
-        depth, _ = propagate_depth(
+        sparse_confidence = torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity * keep_mask
+        # depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
+        depth = sparse_validity * sparse_depth + (1.0 - sparse_validity) * depth
+        depth, propagated_validity = propagate_depth(
             depth=depth,
             validity_map=keep_mask,
             propagation_logits=propagation_logits)
