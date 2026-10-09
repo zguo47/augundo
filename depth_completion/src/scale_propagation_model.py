@@ -397,10 +397,14 @@ class ScalePropagationDepthModel(nn.Module):
 
         # Apply sparse depth constraints only at their original pixel locations.
         sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
-        accepted_sparse_validity = sparse_validity * keep_mask
-        depth = \
-            accepted_sparse_validity * sparse_depth + \
-            (1.0 - accepted_sparse_validity) * depth
+        # Rejection makes a hard decision; confidence then controls the strength
+        # of each sparse measurement that was kept.
+        sparse_confidence = torch.sigmoid(self.sparse_confidence(feature)) * sparse_validity * keep_mask
+        depth = sparse_confidence * sparse_depth + (1.0 - sparse_confidence) * depth
+        # accepted_sparse_validity = sparse_validity * keep_mask
+        # depth = \
+        #     accepted_sparse_validity * sparse_depth + \
+        #     (1.0 - accepted_sparse_validity) * depth
         depth, _ = propagate_depth(
             depth=depth,
             validity_map=torch.ones_like(depth),
