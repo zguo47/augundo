@@ -38,6 +38,7 @@ def train(train_images_path,
           window_size,
           n_self_attention,
           n_shift,
+          use_outlier_rejection,
           # Loss function settings
           supervision_type,
           w_losses,
@@ -267,6 +268,7 @@ def train(train_images_path,
         window_size=window_size,
         n_self_attention=n_self_attention,
         n_shift=n_shift,
+        use_outlier_rejection=use_outlier_rejection,
         device=device)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
@@ -328,6 +330,7 @@ def train(train_images_path,
         network_modules=network_modules,
         min_predict_depth=min_predict_depth,
         max_predict_depth=max_predict_depth,
+        use_outlier_rejection=use_outlier_rejection,
         # Weight settings
         parameters_depth_model=parameters_depth_model,
         parameters_pose_model=parameters_pose_model)
@@ -945,6 +948,7 @@ def run(image_path,
         window_size,
         n_self_attention,
         n_shift,
+        use_outlier_rejection,
         # Evaluation settings
         min_evaluate_depth,
         max_evaluate_depth,
@@ -1050,6 +1054,7 @@ def run(image_path,
         window_size=window_size,
         n_self_attention=n_self_attention,
         n_shift=n_shift,
+        use_outlier_rejection=use_outlier_rejection,
         device=device)
 
     # Restore model and set to evaluation mode
@@ -1092,6 +1097,7 @@ def run(image_path,
         network_modules=network_modules,
         min_predict_depth=min_predict_depth,
         max_predict_depth=max_predict_depth,
+        use_outlier_rejection=use_outlier_rejection,
         # Weight settings
         parameters_depth_model=parameters_depth_model)
 
@@ -1288,6 +1294,7 @@ def log_network_settings(log_path,
                          network_modules,
                          min_predict_depth,
                          max_predict_depth,
+                         use_outlier_rejection=True,
                          # Pose network settings
                          encoder_type_pose=None,
                          rotation_parameterization_pose=None,
@@ -1325,6 +1332,8 @@ def log_network_settings(log_path,
         log_path)
     log('min_predict_depth={:.2f}  max_predict_depth={:.2f}'.format(
         min_predict_depth, max_predict_depth),
+        log_path)
+    log('use_outlier_rejection={}'.format(use_outlier_rejection),
         log_path)
     log('', log_path)
 

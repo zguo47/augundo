@@ -21,6 +21,7 @@ python depth_completion/src/train_depth_completion.py \
 --normalized_image_range 0 1 \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
+--use_outlier_rejection ${USE_OUTLIER_REJECTION:-true} \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 2 \

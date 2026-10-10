@@ -16,6 +16,10 @@ class ParseStrFloatKeyValueAction(argparse.Action):
                 raise argparse.ArgumentError(self, str(message))
 
 
+def parse_boolean(value):
+    return value.lower() in ['true', '1', 'yes']
+
+
 parser = argparse.ArgumentParser()
 
 # Training and validation input filepaths
@@ -71,6 +75,8 @@ parser.add_argument('--n_self_attention',
     type=int, default=2, help='Number of consecutive self-attention blocks')
 parser.add_argument('--n_shift',
     type=int, default=4, help='Number of regular/shifted attention pairs')
+parser.add_argument('--use_outlier_rejection',
+    type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 
 # Training settings
 parser.add_argument('--learning_rates',
@@ -228,6 +234,7 @@ if __name__ == '__main__':
           window_size=args.window_size,
           n_self_attention=args.n_self_attention,
           n_shift=args.n_shift,
+          use_outlier_rejection=args.use_outlier_rejection,
           # Loss function settings
           supervision_type=args.supervision_type,
           w_losses=args.w_losses,

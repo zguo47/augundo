@@ -3,6 +3,10 @@ import torch
 from depth_completion import run
 
 
+def parse_boolean(value):
+    return value.lower() in ['true', '1', 'yes']
+
+
 parser = argparse.ArgumentParser()
 
 # Input filepaths
@@ -44,6 +48,8 @@ parser.add_argument('--n_self_attention',
     type=int, default=2, help='Number of consecutive self-attention blocks')
 parser.add_argument('--n_shift',
     type=int, default=4, help='Number of regular/shifted attention pairs')
+parser.add_argument('--use_outlier_rejection',
+    type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 
 # Evaluation settings
 parser.add_argument('--min_evaluate_depth',
@@ -97,6 +103,7 @@ if __name__ == '__main__':
         window_size=args.window_size,
         n_self_attention=args.n_self_attention,
         n_shift=args.n_shift,
+        use_outlier_rejection=args.use_outlier_rejection,
         # Evaluation settings
         min_evaluate_depth=args.min_evaluate_depth,
         max_evaluate_depth=args.max_evaluate_depth,

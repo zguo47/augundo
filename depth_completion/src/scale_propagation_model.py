@@ -241,7 +241,11 @@ def rejection_keep_mask(rejection_logits, temperature, training):
 class PropagationDecoderBlock(nn.Module):
     '''Refine scaleless depth and propagate metric scale at one resolution.'''
 
-    def __init__(self, n_channels, gumbel_temperature):
+    def __init__(
+            self,
+            n_channels,
+            gumbel_temperature,
+            use_outlier_rejection):
         super(PropagationDecoderBlock, self).__init__()
 
         # Inputs are decoder features, encoder skip features, scaleless depth,
@@ -252,6 +256,7 @@ class PropagationDecoderBlock(nn.Module):
             n_channels,
             stride=1)
         self.gumbel_temperature = gumbel_temperature
+        self.use_outlier_rejection = use_outlier_rejection
         self.propagation_update = Conv2d(
             n_channels,
             9,
@@ -317,11 +322,15 @@ class PropagationDecoderBlock(nn.Module):
             rejection_logits
         ], dim=1))
         propagation_logits = propagation_logits + self.propagation_update(feature)
-        rejection_logits = rejection_logits + self.rejection_update(feature)
-        keep_mask = rejection_keep_mask(
-            rejection_logits=rejection_logits,
-            temperature=self.gumbel_temperature,
-            training=self.training)
+        if self.use_outlier_rejection:
+            rejection_logits = rejection_logits + self.rejection_update(feature)
+            keep_mask = rejection_keep_mask(
+                rejection_logits=rejection_logits,
+                temperature=self.gumbel_temperature,
+                training=self.training)
+        else:
+            rejection_logits = torch.zeros_like(rejection_logits)
+            keep_mask = torch.ones_like(scaleless_depth)
 
         # Preserves positivity and prevent huge negative residual.
         scaleless_depth = scaleless_depth * torch.exp(torch.tanh(
@@ -346,11 +355,11 @@ class PropagationDecoderBlock(nn.Module):
         # Keep accepted sparse depth anchors exact after the local scale propagation.
         scale = accepted_sparse_validity * sparse_scale + \
             (1.0 - accepted_sparse_validity) * scale
-        return feature, 
-            scaleless_depth, 
-            scale, 
-            propagation_logits, 
-            rejection_logits, 
+        return feature, \
+            scaleless_depth, \
+            scale, \
+            propagation_logits, \
+            rejection_logits, \
             keep_mask
 
 
@@ -362,12 +371,14 @@ class ScalePropagationDepthModel(nn.Module):
                  max_predict_depth=8.0,
                  n_channels=32,
                  n_head=4,
-                 gumbel_temperature=1.0):
+                 gumbel_temperature=1.0,
+                 use_outlier_rejection=True):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.gumbel_temperature = gumbel_temperature
+        self.use_outlier_rejection = use_outlier_rejection
 
         # Takes in RGB and sparse depth together and produce 5 feature maps.
         self.encoder = SharedEncoder(
@@ -404,7 +415,8 @@ class ScalePropagationDepthModel(nn.Module):
         self.decoder = nn.ModuleList([
             PropagationDecoderBlock(
                 n_channels=n_channels,
-                gumbel_temperature=gumbel_temperature)
+                gumbel_temperature=gumbel_temperature,
+                use_outlier_rejection=use_outlier_rejection)
             for _ in range(4)
         ])
 
@@ -417,12 +429,20 @@ class ScalePropagationDepthModel(nn.Module):
         scaleless_depth = normalize_scaleless_depth(scaleless_depth)
         # B x 9 x H_4 x W_4 scale propagation logits.
         propagation_logits = self.propagation_map(coarse_feature)
-        # Predict which sparse depth points to keep.
-        rejection_logits = self.rejection_map(coarse_feature) + self.rejection_bias
-        keep_mask = rejection_keep_mask(
-            rejection_logits=rejection_logits,
-            temperature=self.gumbel_temperature,
-            training=self.training)
+        if self.use_outlier_rejection:
+            # Predict which sparse depth points to keep.
+            rejection_logits = \
+                self.rejection_map(coarse_feature) + self.rejection_bias
+            keep_mask = rejection_keep_mask(
+                rejection_logits=rejection_logits,
+                temperature=self.gumbel_temperature,
+                training=self.training)
+        else:
+            # Keep the decoder input shape unchanged while accepting all
+            # sparse depth points.
+            rejection_logits = torch.zeros_like(
+                propagation_logits[:, 0:2, :, :])
+            keep_mask = torch.ones_like(scaleless_depth)
 
         # Convert sparse depth to sparse scale.
         sparse_scale, sparse_validity = sparse_scale_at_resolution(
@@ -455,19 +475,19 @@ class ScalePropagationDepthModel(nn.Module):
 
         feature = coarse_feature
         for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
-            feature, 
-            scaleless_depth, 
-            scale, 
-            propagation_logits, 
-            rejection_logits, 
+            feature, \
+            scaleless_depth, \
+            scale, \
+            propagation_logits, \
+            rejection_logits, \
             keep_mask = decoder_block(
-            feature=feature,
-            skip=features[level],
-            scaleless_depth=scaleless_depth,
-            scale=scale,
-            sparse_depth=sparse_depth,
-            propagation_logits=propagation_logits,
-            rejection_logits=rejection_logits)
+                feature=feature,
+                skip=features[level],
+                scaleless_depth=scaleless_depth,
+                scale=scale,
+                sparse_depth=sparse_depth,
+                propagation_logits=propagation_logits,
+                rejection_logits=rejection_logits)
 
         # Apply scale to the scaleless depth before final output.
         depth = scaleless_depth * scale

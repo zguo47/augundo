@@ -13,12 +13,14 @@ class ScalePropagationDepthCompletionModel(object):
                  network_modules=None,
                  min_predict_depth=1.5,
                  max_predict_depth=100.0,
+                 use_outlier_rejection=True,
                  device=torch.device('cuda')):
         del dataset_name, network_modules
 
         self.model_depth = ScalePropagationDepthModel(
             min_predict_depth=min_predict_depth,
-            max_predict_depth=max_predict_depth)
+            max_predict_depth=max_predict_depth,
+            use_outlier_rejection=use_outlier_rejection)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
