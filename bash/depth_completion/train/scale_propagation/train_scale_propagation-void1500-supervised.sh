@@ -21,7 +21,7 @@ python depth_completion/src/train_depth_completion.py \
 --normalized_image_range 0 1 \
 --min_predict_depth 0.1 \
 --max_predict_depth 8.0 \
---use_outlier_rejection ${USE_OUTLIER_REJECTION:-true} \
+--use_outlier_rejection false \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 2 \
@@ -58,6 +58,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale \
+    trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale_wo_rej_map \
 --device gpu \
 --n_thread 8
