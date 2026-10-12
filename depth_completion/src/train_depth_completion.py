@@ -85,6 +85,12 @@ parser.add_argument('--learning_schedule',
     nargs='+', type=int, default=[5, 10], help='Space delimited list to change learning rate')
 parser.add_argument('--n_step_per_gradient_accumulation',
     type=int, default=1, help='Number of batches to accumulate before updating weights')
+parser.add_argument('--debug_depth',
+    type=parse_boolean, default=False, help='Log depth, scale, gradient and validation diagnostics')
+parser.add_argument('--debug_interval',
+    type=int, default=500, help='Optimizer-step interval for detailed training diagnostics')
+parser.add_argument('--debug_max_samples',
+    type=int, default=3, help='Maximum saved worst/failing validation examples per category')
 
 # Augmentation settings
 parser.add_argument('--augmentation_probabilities',
@@ -284,4 +290,7 @@ if __name__ == '__main__':
           restore_paths=args.restore_paths,
           # Hardware settings
           device=args.device,
-          n_thread=args.n_thread)
+          n_thread=args.n_thread,
+          debug_depth=args.debug_depth,
+          debug_interval=args.debug_interval,
+          debug_max_samples=args.debug_max_samples)

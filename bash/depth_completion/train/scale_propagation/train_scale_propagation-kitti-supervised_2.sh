@@ -22,6 +22,9 @@ python depth_completion/src/train_depth_completion.py \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
 --use_outlier_rejection false \
+--debug_depth ${DEBUG_DEPTH:-false} \
+--debug_interval ${DEBUG_INTERVAL:-500} \
+--debug_max_samples ${DEBUG_MAX_SAMPLES:-3} \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 2 \

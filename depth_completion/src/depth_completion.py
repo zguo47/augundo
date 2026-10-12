@@ -87,7 +87,10 @@ def train(train_images_path,
           restore_paths,
           # Hardware settings
           device='cuda',
-          n_thread=8):
+          n_thread=8,
+          debug_depth=False,
+          debug_interval=500,
+          debug_max_samples=3):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -279,6 +282,27 @@ def train(train_images_path,
         parameters_pose_model = []
 
     depth_completion_model.train()
+
+    depth_debug = None
+    if debug_depth:
+        from depth_completion_debug import DepthCompletionDebug
+        depth_debug = DepthCompletionDebug(
+            depth_completion_model,
+            checkpoint_path,
+            interval=debug_interval,
+            max_samples=debug_max_samples)
+        depth_debug.provenance(
+            settings=dict(
+                model_name=model_name, supervision_type=supervision_type,
+                w_losses=dict(w_losses), learning_rates=learning_rates,
+                learning_schedule=learning_schedule, restore_paths=restore_paths,
+                accumulation=n_step_per_gradient_accumulation,
+                train_shape=[n_height, n_width], batch_size=n_batch,
+                min_evaluate_depth=min_evaluate_depth, max_evaluate_depth=max_evaluate_depth,
+                normalized_image_range=normalized_image_range,
+                debug_interval=debug_interval, debug_max_samples=debug_max_samples),
+            datasets=dict(train=train_dataloader.dataset,
+                          validation=val_dataloader.dataset if is_available_validation else None))
 
     # Set up tensorboard summary writers
     train_summary_writer = SummaryWriter(event_path + '-train')
@@ -500,6 +524,11 @@ def train(train_images_path,
                 is_optimizer_step and \
                 next_train_step % n_step_per_summary == 0
 
+            is_debug_step = depth_debug is not None and is_optimizer_step and \
+                (next_train_step == 1 or next_train_step % depth_debug.interval == 0)
+            if depth_debug is not None:
+                depth_debug.begin('train', next_train_step, active=is_debug_step)
+
             # Fetch data
             inputs = [
                 in_.to(device) for in_ in inputs
@@ -525,6 +554,9 @@ def train(train_images_path,
                 raise ValueError('Unsupported supervision type: {}'.format(supervision_type))
 
             # Validity map is where sparse depth is available
+            if is_debug_step:
+                depth_debug.inputs('before_augmentation', image0, sparse_depth0, ground_truth0)
+
             validity_map0 = torch.where(
                 sparse_depth0 > 0,
                 torch.ones_like(sparse_depth0),
@@ -596,6 +628,13 @@ def train(train_images_path,
 
             # Forward through the network
             # Inputs: augmented image, augmented sparse depth map, original (but aligned) validity map
+            if is_debug_step:
+                depth_debug.inputs('network_input', input_image0, input_sparse_depth0)
+                depth_debug.pooling(input_sparse_depth0)
+                depth_debug.emit('augmentation', operations=list(transform_performed_geometric),
+                                 epoch=epoch, micro_step=micro_step,
+                                 accumulation=n_step_per_gradient_accumulation)
+
             output_depth0 = depth_completion_model.forward_depth(
                 image=input_image0,
                 sparse_depth=input_sparse_depth0,
@@ -635,6 +674,10 @@ def train(train_images_path,
                 supervision_type=supervision_type,
                 w_losses=w_losses)
 
+            if is_debug_step:
+                depth_debug.training_prediction(
+                    output_depth0[0], ground_truth0, sparse_depth0, loss_info)
+
             # Compute gradient and backpropagate
 
             parameter = next(
@@ -645,7 +688,11 @@ def train(train_images_path,
             accumulated_loss.backward()
 
             if is_optimizer_step:
+                if is_debug_step:
+                    depth_debug.before_step(optimizer_depth)
                 optimizer_depth.step()
+                if is_debug_step:
+                    depth_debug.after_step()
 
                 if 'unsupervised' in supervision_type:
                     optimizer_pose.step()
@@ -720,7 +767,8 @@ def train(train_images_path,
                             device=device,
                             summary_writer=val_summary_writer,
                             n_image_per_summary=n_image_per_summary,
-                            log_path=log_path)
+                            log_path=log_path,
+                            depth_debug=depth_debug)
                         last_validation_step = train_step
 
                     # Switch back to training
@@ -778,7 +826,8 @@ def train(train_images_path,
                 device=device,
                 summary_writer=val_summary_writer,
                 n_image_per_summary=n_image_per_summary,
-                log_path=log_path)
+                log_path=log_path,
+                depth_debug=depth_debug)
 
     # Save checkpoints
     depth_completion_model.save_model(
@@ -786,6 +835,9 @@ def train(train_images_path,
         train_step,
         optimizer_depth,
         optimizer_pose)
+
+    if depth_debug is not None:
+        depth_debug.close()
 
 def validate(depth_model,
              dataloader,
@@ -798,7 +850,8 @@ def validate(depth_model,
              summary_writer,
              n_image_per_summary=4,
              n_interval_per_summary=250,
-             log_path=None):
+             log_path=None,
+             depth_debug=None):
 
     n_sample = len(dataloader)
     mae = np.zeros(n_sample)
@@ -812,7 +865,14 @@ def validate(depth_model,
     validity_map_summary = []
     ground_truth_summary = []
 
+    if depth_debug is not None:
+        depth_debug.start_validation(step)
+
     for idx, inputs in enumerate(dataloader):
+
+        if depth_debug is not None:
+            depth_debug.begin('validation', step, sample=idx,
+                              active=idx < depth_debug.max_samples)
 
         # Move inputs to device
         inputs = [
@@ -839,6 +899,14 @@ def validate(depth_model,
                 validity_map=validity_map,
                 intrinsics=intrinsics,
                 return_all_outputs=False)
+
+        if depth_debug is not None:
+            if depth_debug.active:
+                depth_debug.inputs('validation_input', image, sparse_depth, ground_truth)
+                depth_debug.pooling(sparse_depth)
+            depth_debug.validation_sample(
+                idx, image, sparse_depth, ground_truth, output_depth,
+                min_evaluate_depth, max_evaluate_depth, dataloader.dataset)
 
         if (idx % n_interval_per_summary) == 0 and summary_writer is not None:
             image_summary.append(image)
@@ -868,6 +936,9 @@ def validate(depth_model,
         rmse[idx] = eval_utils.root_mean_sq_err(1000.0 * output_depth, 1000.0 * ground_truth)
         imae[idx] = eval_utils.inv_mean_abs_err(0.001 * output_depth, 0.001 * ground_truth)
         irmse[idx] = eval_utils.inv_root_mean_sq_err(0.001 * output_depth, 0.001 * ground_truth)
+
+    if depth_debug is not None:
+        depth_debug.finish_validation()
 
     # Compute mean metrics
     mae   = np.mean(mae)
