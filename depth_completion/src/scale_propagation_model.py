@@ -167,13 +167,25 @@ class SharedEncoder(nn.Module):
 
 
 def sparse_depth_at_resolution(sparse_depth, output_size):
-    '''Select original sparse measurements on the given resolution level.
+    '''Select one positive sparse measurement from each coarse spatial region.
+
+    Adaptive regions match the requested shape, including odd input sizes.
+    Select the first positive entry in row-major order without averaging or
+    favoring larger depth values. Regions without measurements remain zero.
     '''
 
-    return functional.interpolate(
-        sparse_depth,
-        size=output_size,
-        mode='nearest')
+    # Pool only the positive-entry indicator to locate a valid measurement.
+    # Returned indices refer to the original flattened image; gathering from
+    # sparse_depth preserves that measurement's exact metric value.
+    has_measurement, measurement_indices = functional.adaptive_max_pool2d(
+        (sparse_depth > 0.0).to(sparse_depth.dtype),
+        output_size=output_size,
+        return_indices=True)
+    selected_depth = torch.gather(
+        sparse_depth.flatten(2),
+        dim=2,
+        index=measurement_indices.flatten(2))
+    return selected_depth.reshape_as(has_measurement) * has_measurement
 
 
 def propagate_scale(depth, sparse_depth, keep_mask, propagation_logits):
@@ -250,7 +262,7 @@ class PropagationDecoderBlock(nn.Module):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry only features and dense metric depth from the previous level.
-        # Add this level's encoder skip and nearest-sampled sparse measurements:
+        # Add this level's encoder skip and region-selected sparse measurements:
         # C + C + 1 + 1 = 2C + 2 input channels.
         self.fusion = ConvolutionBlock(
             2 * n_channels + 2,
@@ -366,7 +378,7 @@ class ScalePropagationDepthModel(nn.Module):
             n_head=n_head)
 
         # Positive bottom prediction supplies both a normalized scaleless shape
-        # and a learned metric fallback if nearest sampling leaves no anchors.
+        # and a learned metric fallback if there are no accepted sparse anchors.
         self.coarse_scaleless_depth = Conv2d(
             n_channels,
             1,

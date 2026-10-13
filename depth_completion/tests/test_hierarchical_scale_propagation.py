@@ -14,16 +14,35 @@ from scale_propagation_model import (
 
 class HierarchicalScalePropagationTest(unittest.TestCase):
 
-    def test_nearest_copies_values_instead_of_averaging(self):
+    def test_selects_first_valid_value_instead_of_averaging(self):
         sparse = torch.tensor([[[[2., 40., 0., 60.],
                                 [70., 80., 90., 100.],
                                 [0., 110., 6., 120.],
                                 [130., 140., 150., 160.]]]])
         sampled = sparse_depth_at_resolution(sparse, (2, 2))
         self.assertTrue(torch.equal(
-            sampled, torch.tensor([[[[2., 0.], [0., 6.]]]])))
+            sampled, torch.tensor([[[[2., 60.], [110., 6.]]]])))
         self.assertTrue(torch.equal(
             sparse_depth_at_resolution(sparse, (4, 4)), sparse))
+
+    def test_preserves_measurements_between_nearest_sampling_coordinates(self):
+        sparse = torch.zeros(2, 1, 4, 4)
+        sparse[0, 0, 1, 1] = 3.
+        sparse[0, 0, 1, 3] = 5.
+        sparse[0, 0, 3, 1] = 7.
+        sparse[0, 0, 3, 3] = 9.
+        expected = torch.tensor([[[[3., 5.], [7., 9.]]],
+                                 [[[0., 0.], [0., 0.]]]])
+        self.assertTrue(torch.equal(
+            sparse_depth_at_resolution(sparse, (2, 2)), expected))
+
+    def test_selects_valid_measurements_for_odd_shapes(self):
+        sparse = torch.zeros(1, 1, 5, 7)
+        sparse[0, 0, 0, 1] = 3.
+        sparse[0, 0, 4, 5] = 7.
+        sampled = sparse_depth_at_resolution(sparse, (2, 3))
+        expected = torch.tensor([[[[3., 0., 0.], [0., 0., 7.]]]])
+        self.assertTrue(torch.equal(sampled, expected))
 
     def test_one_source_sends_to_the_right(self):
         depth = torch.full((1, 1, 5, 5), 2.)
@@ -88,7 +107,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             image = torch.rand(2, 3, 17, 25)
             sparse = torch.zeros(2, 1, 17, 25)
             # The first image has no sparse points. The second has a point
-            # which nearest sampling can miss at lower resolutions.
+            # between the coordinates that ordinary nearest sampling selects.
             sparse[1, 0, 7, 11] = 5.
             output = model(image, sparse)
             self.assertEqual(output.shape, sparse.shape)
