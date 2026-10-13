@@ -203,20 +203,22 @@ class DepthCompletionDebug(object):
                     if name == 'encoder':
                         self.emit('encoder', levels=[statistics(x) for x in output])
                     elif name.startswith('decoder.'):
-                        feature, shape, scale, logits, rejection, keep = output
-                        weights = torch.softmax(logits.detach(), dim=1)
-                        self.emit('decoder', level=name, device=str(shape.device),
-                                  scaleless=statistics(shape), scale=statistics(scale),
+                        feature, depth, logits, rejection, keep = output
+                        weights = torch.sigmoid(logits.detach())
+                        sparse = functional.interpolate(
+                            inputs[3], size=depth.shape[-2:], mode='nearest')
+                        self.emit('decoder', level=name, device=str(depth.device),
+                                  metric_depth=statistics(depth),
                                   feature=statistics(feature),
-                                  implied_depth=statistics(shape * scale),
-                                  preclamp_below_min=float((shape * scale < self.minimum).float().mean()),
-                                  preclamp_above_max=float((shape * scale > self.maximum).float().mean()),
-                                  fraction_shape_below_scale_denominator_floor=float((shape < 1e-3).float().mean()),
-                                  propagation_entropy=float((-(weights * weights.clamp_min(1e-30).log()).sum(1)).mean()),
-                                  center_weight=float(weights[:, 4].mean()),
-                                  max_weight=float(weights.max(1)[0].mean()),
+                                  preclamp_below_min=float((depth < self.minimum).float().mean()),
+                                  preclamp_above_max=float((depth > self.maximum).float().mean()),
+                                  outgoing_weight_mean=float(weights.mean()),
+                                  center_outgoing_weight=float(weights[:, 4].mean()),
+                                  max_outgoing_weight=float(weights.max(1)[0].mean()),
                                   rejection_logits=statistics(rejection),
-                                  keep_fraction=float(keep.float().mean()))
+                                  keep_fraction=float(keep.float().mean()),
+                                  keep_fraction_at_sparse=float(
+                                      keep.sum() / (sparse > 0).sum().clamp_min(1)))
                     else:
                         self.emit('activation', name=name, values=statistics(output))
                         if name == 'model_output' and output.requires_grad:
@@ -243,21 +245,20 @@ class DepthCompletionDebug(object):
             self.emit('sparse_vs_target', name=name,
                       errors=errors(s, t, (t > 0) & (s > 0)))
 
-    def pooling(self, sparse):
+    def sparse_levels(self, sparse):
+        '''Report the same direct nearest sampling used by the model.'''
         with torch.no_grad():
-            validity = (sparse > 0).to(sparse.dtype)
             h, w = sparse.shape[-2:]
             for level in range(5):
                 size = ((h + 2 ** level - 1) // 2 ** level,
                         (w + 2 ** level - 1) // 2 ** level)
-                density = functional.adaptive_avg_pool2d(validity, size)
-                mean = functional.adaptive_avg_pool2d(sparse, size) / (density + 1e-7)
-                square = functional.adaptive_avg_pool2d(sparse ** 2, size) / (density + 1e-7)
-                spread = (square - mean ** 2).clamp_min(0).sqrt()
-                self.emit('sparse_pooling', level=level, size=size,
-                          occupied_fraction=float((density > 0).float().mean()),
-                          depth=statistics(mean[density > 0]),
-                          within_cell_std_m=statistics(spread[density > 0]))
+                sampled = functional.interpolate(sparse, size=size, mode='nearest')
+                self.emit('sparse_sampling', level=level, size=size,
+                          occupied_fraction=float((sampled > 0).float().mean()),
+                          measurement_count=int((sampled > 0).sum()),
+                          images_without_measurements=int(
+                              ((sampled > 0).flatten(1).sum(1) == 0).sum()),
+                          depth=statistics(sampled[sampled > 0]))
 
     def training_prediction(self, prediction, target, sparse, loss_info):
         if target is None:

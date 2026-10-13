@@ -630,7 +630,7 @@ def train(train_images_path,
             # Inputs: augmented image, augmented sparse depth map, original (but aligned) validity map
             if is_debug_step:
                 depth_debug.inputs('network_input', input_image0, input_sparse_depth0)
-                depth_debug.pooling(input_sparse_depth0)
+                depth_debug.sparse_levels(input_sparse_depth0)
                 depth_debug.emit('augmentation', operations=list(transform_performed_geometric),
                                  epoch=epoch, micro_step=micro_step,
                                  accumulation=n_step_per_gradient_accumulation)
@@ -903,7 +903,7 @@ def validate(depth_model,
         if depth_debug is not None:
             if depth_debug.active:
                 depth_debug.inputs('validation_input', image, sparse_depth, ground_truth)
-                depth_debug.pooling(sparse_depth)
+                depth_debug.sparse_levels(sparse_depth)
             depth_debug.validation_sample(
                 idx, image, sparse_depth, ground_truth, output_depth,
                 min_evaluate_depth, max_evaluate_depth, dataloader.dataset)

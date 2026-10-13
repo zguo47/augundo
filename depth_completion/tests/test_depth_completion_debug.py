@@ -45,7 +45,7 @@ class DepthDebugTest(unittest.TestCase):
                 debug = self.make_debug(observed, directory)
                 debug.begin('train', 1)
                 debug.inputs('network_input', image, sparse, target)
-                debug.pooling(sparse)
+                debug.sparse_levels(sparse)
                 actual = observed(image, sparse)
                 debug.training_prediction(actual, target, sparse, {'loss': actual.mean()})
                 actual.mean().backward()

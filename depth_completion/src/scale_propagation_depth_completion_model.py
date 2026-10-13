@@ -33,6 +33,8 @@ class ScalePropagationDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False):
+        # Keep the shared repository call signature; this model derives sparse
+        # measurement locations directly from positive depths at each level.
         del validity_map, intrinsics
 
         output_depth = self.model_depth(
