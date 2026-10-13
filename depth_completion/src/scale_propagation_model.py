@@ -167,16 +167,7 @@ class SharedEncoder(nn.Module):
 
 
 def sparse_depth_at_resolution(sparse_depth, output_size):
-    '''Select original sparse measurements on the grid of one encoder level.
-
-    Nearest-neighbor sampling copies one input value per output pixel. It does
-    not average different surfaces or pool a separate validity map. Zeros stay
-    missing measurements; positive values identify measurements whenever needed.
-    Each level samples the original sparse image directly, rather than an
-    already downsampled sparse image. This also supports odd image dimensions.
-
-    Nearest sampling can discard measurements, including every measurement at
-    a coarse level. The dense prediction below therefore remains a fallback.
+    '''Select original sparse measurements on the given resolution level.
     '''
 
     return functional.interpolate(
@@ -186,7 +177,7 @@ def sparse_depth_at_resolution(sparse_depth, output_size):
 
 
 def propagate_scale(depth, sparse_depth, keep_mask, propagation_logits):
-    '''Send scale corrections FROM accepted sparse sources to their neighbors.
+    '''Send scale corrections from accepted sparse sources to their neighbors.
 
     Arg(s):
         depth : torch.Tensor[float32]
@@ -196,27 +187,10 @@ def propagate_scale(depth, sparse_depth, keep_mask, propagation_logits):
         keep_mask : torch.Tensor[float32]
             B x 1 x H x W keep decisions, zero at missing or rejected points
         propagation_logits : torch.Tensor[float32]
-            B x 9 x H x W outgoing weights, indexed at the SOURCE pixel
+            B x 9 x H x W outgoing weights, indexed at the source pixel
     Returns:
         torch.Tensor[float32] : B x 1 x H x W refined dense metric depth
 
-    Source p proposes correction s_p = sparse_p / depth_p. Its nine sigmoid
-    weights describe how strongly to send that correction to p + (dy, dx),
-    where dy and dx run through {-1, 0, 1} in row-major order. Thus channel 5
-    sends to the right, and channel 4 sends to the source itself.
-
-    At destination q, accumulate incoming weighted corrections and weights:
-        A_q = sum_p w_(p -> q) * keep_p * s_p
-        M_q = sum_p w_(p -> q) * keep_p
-        correction_q = (1 + A_q) / (1 + M_q)
-        output_q = depth_q * correction_q
-
-    The unit term is one vote for retaining the decoder's current metric
-    depth (scale correction 1). It keeps uncovered pixels dense, bounds the
-    denominator away from zero even if every source is rejected, and lets the
-    network suppress an unreliable source without exact anchor replacement.
-    Only accepted sparse pixels send messages; dense predictions do not send
-    messages. This is one local correction per level, not full-image diffusion.
     '''
 
     n_batch, _, n_height, n_width = depth.shape
@@ -245,12 +219,7 @@ def propagate_scale(depth, sparse_depth, keep_mask, propagation_logits):
 
 
 def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
-    '''Make fresh keep/reject decisions for this level's sparse measurements.
-
-    The two logits represent keep and reject. During training, hard Gumbel
-    decisions use the straight-through gradient; evaluation uses argmax.
-    Missing measurements are excluded directly with sparse_depth > 0.
-    No previous level's rejection logits or keep decisions enter this function.
+    '''Make keep/reject decisions for this level's sparse depth.
     '''
 
     if training:
@@ -271,7 +240,7 @@ def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
 
 
 class PropagationDecoderBlock(nn.Module):
-    '''Upsample dense metric depth, then apply fresh sparse scale corrections.'''
+    '''Upsample dense metric depth, then apply sparse scale corrections.'''
 
     def __init__(
             self,

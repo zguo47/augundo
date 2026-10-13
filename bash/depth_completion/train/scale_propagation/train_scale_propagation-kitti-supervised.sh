@@ -12,7 +12,7 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path validation/kitti/kitti_val_sparse_depth.txt \
 --val_intrinsics_path validation/kitti/kitti_val_intrinsics.txt \
 --val_ground_truth_path validation/kitti/kitti_val_ground_truth.txt \
---n_batch 4 \
+--n_batch 8 \
 --n_height 320 \
 --n_width 768 \
 --model_name scale_propagation_kitti \
@@ -22,7 +22,7 @@ python depth_completion/src/train_depth_completion.py \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
 --use_outlier_rejection true \
---debug_depth true \
+--debug_depth false \
 --debug_interval 100 \
 --debug_max_samples 3 \
 --learning_rates ${LR:-1e-4} \
@@ -61,6 +61,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale_debug \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale \
 --device gpu \
 --n_thread 8
