@@ -180,6 +180,7 @@ def sparse_depth_at_resolution(sparse_depth, output_size):
     '''Average only valid sparse measurements inside each output cell.'''
 
     sparse_validity = (sparse_depth > 0.0).to(sparse_depth.dtype)
+    # nearest neighbor? validy map not useful.
     pooled_depth = functional.adaptive_avg_pool2d(
         sparse_depth,
         output_size=output_size)

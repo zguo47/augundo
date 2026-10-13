@@ -614,7 +614,8 @@ def setup_dataset_kitti_training(paths_only=False, n_thread=8):
 
                     # Save paths for supervised training
                     train_supervised_image_paths += image_paths
-                    train_supervised_sparse_depth_paths += sparse_depth_left_paths
+                    # train_supervised_sparse_depth_paths += sparse_depth_left_paths
+                    train_supervised_sparse_depth_paths += sparse_depth_paths
                     train_supervised_ground_truth_paths += ground_truth_paths
                     train_supervised_focal_length_baseline_paths += focal_length_baseline_paths
                     train_supervised_intrinsics_paths += intrinsics_paths
