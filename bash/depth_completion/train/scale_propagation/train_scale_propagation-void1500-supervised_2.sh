@@ -61,8 +61,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_image_per_summary 4 \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
---restore_paths \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale/checkpoints-53000/scale-propagation-53000.pth \
 --checkpoint_path \
     trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale_debug \
 --device gpu \
