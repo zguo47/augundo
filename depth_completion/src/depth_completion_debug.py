@@ -137,6 +137,7 @@ class DepthCompletionDebug(object):
                   cuda_version=torch.version.cuda, source_sha256=sources,
                   settings=settings, model_min=self.minimum, model_max=self.maximum,
                   rejection_enabled=getattr(self.model, 'use_outlier_rejection', None),
+                  propagation_iterations=getattr(self.model, 'n_propagation_iterations', None),
                   model=str(self.model),
                   loss_formula='mean_per_image(log(1 + abs(pred - clamped_target)))')
         for split, dataset in datasets.items():
@@ -205,9 +206,9 @@ class DepthCompletionDebug(object):
                     elif name.startswith('decoder.'):
                         feature, depth, logits, rejection, keep = output
                         weights = torch.sigmoid(logits.detach())
-                        sparse = functional.interpolate(
-                            inputs[3], size=depth.shape[-2:], mode='nearest')
+                        sparse = self.sparse_at_resolution(inputs[3], depth.shape[-2:])
                         self.emit('decoder', level=name, device=str(depth.device),
+                                  propagation_iterations=module.n_propagation_iterations,
                                   metric_depth=statistics(depth),
                                   feature=statistics(feature),
                                   preclamp_below_min=float((depth < self.minimum).float().mean()),
@@ -245,14 +246,22 @@ class DepthCompletionDebug(object):
             self.emit('sparse_vs_target', name=name,
                       errors=errors(s, t, (t > 0) & (s > 0)))
 
+    def sparse_at_resolution(self, sparse, output_size):
+        '''Use the model's sparse selector when reporting measurements.'''
+        sampler = getattr(sys.modules[type(self.model).__module__],
+                          'sparse_depth_at_resolution', None)
+        if sampler is not None:
+            return sampler(sparse, output_size)
+        return functional.interpolate(sparse, size=output_size, mode='nearest')
+
     def sparse_levels(self, sparse):
-        '''Report the same direct nearest sampling used by the model.'''
+        '''Report sparse coverage using the same selection as the model.'''
         with torch.no_grad():
             h, w = sparse.shape[-2:]
             for level in range(5):
                 size = ((h + 2 ** level - 1) // 2 ** level,
                         (w + 2 ** level - 1) // 2 ** level)
-                sampled = functional.interpolate(sparse, size=size, mode='nearest')
+                sampled = self.sparse_at_resolution(sparse, size)
                 self.emit('sparse_sampling', level=level, size=size,
                           occupied_fraction=float((sampled > 0).float().mean()),
                           measurement_count=int((sampled > 0).sum()),

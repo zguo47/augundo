@@ -188,46 +188,73 @@ def sparse_depth_at_resolution(sparse_depth, output_size):
     return selected_depth.reshape_as(has_measurement) * has_measurement
 
 
-def propagate_scale(depth, sparse_depth, keep_mask, propagation_logits):
-    '''Send scale corrections from accepted sparse sources to their neighbors.
+def propagate_scale(
+        depth,
+        sparse_depth,
+        keep_mask,
+        propagation_logits,
+        n_propagation_iterations=1):
+    '''Iteratively relay scale corrections while preserving accepted anchors.
 
     Arg(s):
         depth : torch.Tensor[float32]
-            B x 1 x H x W positive dense depth before this propagation step
+            B x 1 x H x W positive dense metric depth, fixed during this loop
         sparse_depth : torch.Tensor[float32]
             B x 1 x H x W measurements sampled at this resolution
         keep_mask : torch.Tensor[float32]
             B x 1 x H x W keep decisions, zero at missing or rejected points
         propagation_logits : torch.Tensor[float32]
             B x 9 x H x W outgoing weights, indexed at the source pixel
+        n_propagation_iterations : int
+            number of neighboring exchanges at this resolution
     Returns:
         torch.Tensor[float32] : B x 1 x H x W refined dense metric depth
 
     '''
 
     n_batch, _, n_height, n_width = depth.shape
-    sparse_scale = sparse_depth / depth.clamp_min(1e-3)
-    # Each source has independent outgoing gates. Unlike a softmax, sigmoid
-    # also allows ALL of a source's outgoing messages to be weak.
-    outgoing_weights = torch.sigmoid(propagation_logits) * keep_mask
-    outgoing_scale = outgoing_weights * sparse_scale
+    # The ratio is relative to THIS level's decoder-produced metric depth.
+    # Compute it only once: updating the denominator during propagation would
+    # change the meaning of the correction being relayed between pixels.
+    sparse_scale = sparse_depth / depth.clamp_min(1e-7)
+    correction = keep_mask * sparse_scale + (1.0 - keep_mask)
+
+    # Every pixel can relay its current correction, including pixels without
+    # original measurements. Accepted points initialize and anchor the field;
+    # missing/rejected points initialize it to 1 (no change to metric depth).
+    # Evaluate the learned gates once and reuse them throughout the loop.
+    outgoing_weights = torch.sigmoid(propagation_logits)
 
     # Each column of fold is one SOURCE pixel's 3 x 3 outgoing message patch.
     # Overlapping patches sum at their DESTINATIONS. Padding here describes
     # the fold geometry: messages outside the image are discarded, not wrapped
     # around or replicated into extra boundary measurements.
-    incoming_scale = functional.fold(
-        outgoing_scale.reshape(n_batch, 9, n_height * n_width),
-        output_size=(n_height, n_width),
-        kernel_size=3,
-        padding=1)
     incoming_weight = functional.fold(
         outgoing_weights.reshape(n_batch, 9, n_height * n_width),
         output_size=(n_height, n_width),
         kernel_size=3,
         padding=1)
-    correction = (1.0 + incoming_scale) / (1.0 + incoming_weight)
-    return depth * correction
+    for _ in range(n_propagation_iterations):
+        outgoing_scale = outgoing_weights * correction
+        incoming_scale = functional.fold(
+            outgoing_scale.reshape(n_batch, 9, n_height * n_width),
+            output_size=(n_height, n_width),
+            kernel_size=3,
+            padding=1)
+
+        # Retain the previous correction, not a new unit prior at every step.
+        # Normalizing positive incoming weights gives a weighted average and
+        # allows a correction received on one step to travel farther next time.
+        correction = (correction + incoming_scale) / (1.0 + incoming_weight)
+
+        # Accepted measurements remain fixed anchors after EVERY exchange.
+        # Rejected points can relay corrections but cannot inject their depths.
+        correction = keep_mask * sparse_scale + (1.0 - keep_mask) * correction
+
+    depth = depth * correction
+    # Restore exact metric values before handing depth to the next decoder.
+    # This also avoids floating-point roundoff from multiplying D by S / D.
+    return keep_mask * sparse_depth + (1.0 - keep_mask) * depth
 
 
 def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
@@ -258,7 +285,8 @@ class PropagationDecoderBlock(nn.Module):
             self,
             n_channels,
             gumbel_temperature,
-            use_outlier_rejection):
+            use_outlier_rejection,
+            n_propagation_iterations=2):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry only features and dense metric depth from the previous level.
@@ -270,6 +298,7 @@ class PropagationDecoderBlock(nn.Module):
             stride=1)
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
+        self.n_propagation_iterations = n_propagation_iterations
         self.depth_update = Conv2d(
             n_channels,
             1,
@@ -340,11 +369,12 @@ class PropagationDecoderBlock(nn.Module):
             depth=depth,
             sparse_depth=sparse_depth,
             keep_mask=keep_mask,
-            propagation_logits=propagation_logits)
+            propagation_logits=propagation_logits,
+            n_propagation_iterations=self.n_propagation_iterations)
 
-        # Rejected points never enter the explicit scale messages and there is
-        # no subsequent sparse-depth overwrite. Original sparse measurements
-        # are reconsidered independently at the next level, as requested.
+        # Accepted values have been restored in this level's metric depth.
+        # Original sparse measurements are reconsidered independently at the
+        # next level; rejected values are not restored at this level.
         return feature, depth, propagation_logits, rejection_logits, keep_mask
 
 
@@ -352,7 +382,7 @@ class ScalePropagationDepthModel(nn.Module):
     '''Five-resolution encoder with hierarchical source-directed scale updates.
 
     The bottom level predicts a positive depth shape, establishes metric scale
-    from its accepted sparse measurements, and sends local scale corrections.
+    from its accepted sparse measurements, and iteratively relays corrections.
     Each decoder block upsamples the resulting dense metric depth, refines it
     using encoder features, and repeats rejection and source-directed correction.
     Only final full-resolution depth is supervised by the existing wrapper.
@@ -364,13 +394,17 @@ class ScalePropagationDepthModel(nn.Module):
                  n_channels=32,
                  n_head=4,
                  gumbel_temperature=1.0,
-                 use_outlier_rejection=True):
+                 use_outlier_rejection=True,
+                 n_propagation_iterations=(16, 8, 4, 2, 2)):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
+        # Iteration counts are ordered from the bottom to full resolution.
+        # More exchanges at coarse scales cover larger original-image regions.
+        self.n_propagation_iterations = n_propagation_iterations
 
         # Takes in RGB and sparse depth together and produce 5 feature maps.
         self.encoder = SharedEncoder(
@@ -403,8 +437,9 @@ class ScalePropagationDepthModel(nn.Module):
             PropagationDecoderBlock(
                 n_channels=n_channels,
                 gumbel_temperature=gumbel_temperature,
-                use_outlier_rejection=use_outlier_rejection)
-            for _ in range(4)
+                use_outlier_rejection=use_outlier_rejection,
+                n_propagation_iterations=n_iteration)
+            for n_iteration in n_propagation_iterations[1:]
         ])
 
     def forward(self, image, sparse_depth):
@@ -452,7 +487,8 @@ class ScalePropagationDepthModel(nn.Module):
             depth=depth,
             sparse_depth=coarse_sparse_depth,
             keep_mask=keep_mask,
-            propagation_logits=propagation_logits)
+            propagation_logits=propagation_logits,
+            n_propagation_iterations=self.n_propagation_iterations[0])
 
         feature = coarse_feature
         for decoder_block, level in zip(self.decoder, range(3, -1, -1)):

@@ -90,6 +90,27 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(saved['prediction'][2, 3], 0.)
             self.assertTrue(os.path.isfile(os.path.join(directory, 'debug', 'worst_0.npz')))
 
+    def test_sparse_counts_and_rejection_ratios_use_actual_selection(self):
+        model = ScalePropagationDepthModel(
+            n_channels=8, use_outlier_rejection=False).eval()
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            sparse = torch.zeros(1, 1, 16, 16)
+            # Nearest sampling misses this point at every coarse level.
+            sparse[0, 0, 7, 7] = 5.
+            debug.begin('validation', 1)
+            debug.sparse_levels(sparse)
+            with torch.no_grad():
+                model(torch.rand(1, 3, 16, 16), sparse)
+            debug.close()
+            with open(debug.path) as stream:
+                records = [json.loads(line) for line in stream]
+            levels = [r for r in records if r['event'] == 'sparse_sampling']
+            self.assertEqual([r['measurement_count'] for r in levels], [1] * 5)
+            blocks = [r for r in records if r['event'] == 'decoder']
+            self.assertEqual([r['keep_fraction_at_sparse'] for r in blocks], [1.] * 4)
+            self.assertEqual([r['propagation_iterations'] for r in blocks], [8, 4, 2, 2])
+
     def test_empty_ground_truth_does_not_crash_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             debug = self.make_debug(ScalePropagationDepthModel(n_channels=8), directory)

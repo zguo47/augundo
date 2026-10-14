@@ -53,15 +53,68 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         logits[0, 5, 2, 2] = 100.
         result = propagate_scale(depth, sparse, keep, logits)
         expected = depth.clone()
+        expected[0, 0, 2, 2] = 6.
         # Source scale is 6 / 2 = 3. The destination combines that message
-        # with its unit prior: 2 * (1 + 3) / (1 + 1) = 4.
+        # with its previous correction: 2 * (1 + 3) / (1 + 1) = 4.
+        # The accepted source itself is restored exactly to its measurement.
         expected[0, 0, 2, 3] = 4.
         torch.testing.assert_close(result, expected)
 
-        # Weights at non-measurement pixels cannot send messages.
-        logits[0, :, 1, 1] = 100.
+    def test_corrections_relay_beyond_the_original_source_neighborhood(self):
+        depth = torch.full((1, 1, 5, 7), 2.)
+        sparse = torch.zeros_like(depth)
+        sparse[0, 0, 2, 2] = 6.
+        keep = (sparse > 0).float()
+        logits = torch.full((1, 9, 5, 7), -100.)
+        logits[0, 5, 2, 2] = 100.
+        logits[0, 5, 2, 3] = 100.
+        first = propagate_scale(depth, sparse, keep, logits, 1)
+        second = propagate_scale(depth, sparse, keep, logits, 2)
+        self.assertEqual(float(first[0, 0, 2, 4]), 2.)
+        self.assertEqual(float(second[0, 0, 2, 4]), 3.)
+        self.assertEqual(float(second[0, 0, 2, 3]), 5.)
+        self.assertEqual(float(second[0, 0, 2, 2]), 6.)
+
+        # A rejected point cannot originate its own measurement, but it can
+        # relay the accepted source's correction to the next pixel.
+        sparse[0, 0, 2, 3] = 100.
         torch.testing.assert_close(
-            propagate_scale(depth, sparse, keep, logits), expected)
+            propagate_scale(depth, sparse, keep, logits, 2), second)
+
+    def test_propagates_scale_instead_of_averaging_metric_depth(self):
+        depth = torch.full((1, 1, 3, 4), 2.)
+        depth[0, 0, 1, 2] = 8.
+        sparse = torch.zeros_like(depth)
+        sparse[0, 0, 1, 1] = 6.
+        logits = torch.full((1, 9, 3, 4), -100.)
+        logits[0, 5, 1, 1] = 100.
+        result = propagate_scale(depth, sparse, (sparse > 0).float(), logits)
+        # Neighbor keeps its base depth 8 and adopts correction (1 + 3) / 2.
+        self.assertEqual(float(result[0, 0, 1, 2]), 16.)
+
+    def test_restores_exact_anchors_and_trains_relay_weights(self):
+        depth = torch.full((1, 1, 5, 7), 2., requires_grad=True)
+        sparse = torch.zeros_like(depth)
+        sparse[0, 0, 2, 2] = 6.
+        logits = torch.zeros(1, 9, 5, 7, requires_grad=True)
+        keep = (sparse > 0).float()
+        result = propagate_scale(depth, sparse, keep, logits, 4)
+        self.assertTrue(torch.equal(result[keep > 0], sparse[keep > 0]))
+        result[0, 0, 2, 4].backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertGreater(float(logits.grad[0, :, 2, 3].abs().sum()), 0.)
+        self.assertTrue(torch.isfinite(depth.grad).all())
+
+    def test_zero_gates_preserve_detail_except_at_accepted_anchors(self):
+        depth = torch.rand(1, 1, 5, 7) + 1.
+        sparse = torch.zeros_like(depth)
+        sparse[0, 0, 2, 2] = 6.
+        logits = torch.full((1, 9, 5, 7), -100.)
+        expected = depth.clone()
+        expected[0, 0, 2, 2] = 6.
+        self.assertTrue(torch.equal(
+            propagate_scale(depth, sparse, (sparse > 0).float(), logits, 16),
+            expected))
 
     def test_outgoing_boundary_messages_do_not_wrap(self):
         depth = torch.full((1, 1, 3, 3), 2.)
@@ -69,23 +122,25 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse[0, 0, 0, 0] = 6.
         logits = torch.full((1, 9, 3, 3), -100.)
         logits[0, 0, 0, 0] = 100.
+        expected = depth.clone()
+        expected[0, 0, 0, 0] = 6.
         torch.testing.assert_close(
-            propagate_scale(depth, sparse, (sparse > 0).float(), logits),
-            depth)
+            propagate_scale(depth, sparse, (sparse > 0).float(), logits, 4),
+            expected)
 
     def test_rejected_and_empty_sources_preserve_dense_prediction(self):
         depth = torch.rand(2, 1, 5, 7) + 1.
         sparse = torch.full_like(depth, 50.)
         logits = torch.zeros(2, 9, 5, 7)
         keep = torch.zeros_like(depth, requires_grad=True)
-        result = propagate_scale(depth, sparse, keep, logits)
+        result = propagate_scale(depth, sparse, keep, logits, 16)
         self.assertTrue(torch.equal(result, depth))
         result.sum().backward()
         self.assertTrue(torch.isfinite(keep.grad).all())
         self.assertGreater(float(keep.grad.abs().sum()), 0.)
         sparse.zero_()
         self.assertTrue(torch.equal(
-            propagate_scale(depth, sparse, torch.zeros_like(depth), logits),
+            propagate_scale(depth, sparse, torch.zeros_like(depth), logits, 16),
             depth))
 
     def test_rejection_masks_missing_points_and_has_finite_gradients(self):
@@ -138,6 +193,29 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         for i, keep in enumerate(decisions[:4]):
             self.assertTrue(torch.equal(
                 keep, torch.full_like(keep, 1. if i % 2 == 0 else 0.)))
+
+    def test_decoder_receives_and_returns_restored_metric_anchors(self):
+        model = ScalePropagationDepthModel(
+            n_channels=8, use_outlier_rejection=False).eval()
+        sparse = torch.zeros(1, 1, 17, 25)
+        sparse[0, 0, 7, 11] = 5.
+        received = []
+        decoded = []
+        model.decoder[0].register_forward_pre_hook(
+            lambda module, inputs: received.append(inputs[2].clone()))
+        for block in model.decoder:
+            block.register_forward_hook(
+                lambda module, inputs, output: decoded.append(output[1].clone()))
+        with torch.no_grad():
+            model(torch.rand(1, 3, 17, 25), sparse)
+        for depth in received + decoded:
+            anchors = sparse_depth_at_resolution(sparse, depth.shape[-2:])
+            accepted = anchors > 0
+            self.assertTrue(torch.equal(depth[accepted], anchors[accepted]))
+        self.assertEqual(model.n_propagation_iterations, (16, 8, 4, 2, 2))
+        self.assertEqual(
+            [block.n_propagation_iterations for block in model.decoder],
+            [8, 4, 2, 2])
 
 
 if __name__ == '__main__':
