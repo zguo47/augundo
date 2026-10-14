@@ -21,7 +21,7 @@ python depth_completion/src/train_depth_completion.py \
 --normalized_image_range 0 1 \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
---use_outlier_rejection false \
+--use_outlier_rejection true \
 --debug_depth true \
 --debug_interval 100 \
 --debug_max_samples 3 \
@@ -60,7 +60,9 @@ python depth_completion/src/train_depth_completion.py \
 --n_image_per_summary 4 \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
+--restore_paths \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale/checkpoints-115000/scale-propagation-115000.pth \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale_wo_rej_map_debug \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale_debug \
 --device gpu \
 --n_thread 8

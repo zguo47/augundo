@@ -12,7 +12,7 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path validation/kitti/kitti_val_sparse_depth.txt \
 --val_intrinsics_path validation/kitti/kitti_val_intrinsics.txt \
 --val_ground_truth_path validation/kitti/kitti_val_ground_truth.txt \
---n_batch 8 \
+--n_batch 4 \
 --n_height 320 \
 --n_width 768 \
 --model_name scale_propagation_kitti \

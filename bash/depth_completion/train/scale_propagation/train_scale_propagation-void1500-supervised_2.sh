@@ -12,7 +12,7 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path testing/void/void_test_sparse_depth_1500.txt \
 --val_intrinsics_path testing/void/void_test_intrinsics_1500.txt \
 --val_ground_truth_path testing/void/void_test_ground_truth_1500.txt \
---n_batch 6 \
+--n_batch 4 \
 --n_height 480 \
 --n_width 640 \
 --model_name scale_propagation_void \
@@ -25,7 +25,6 @@ python depth_completion/src/train_depth_completion.py \
 --debug_depth true \
 --debug_interval 100 \
 --debug_max_samples 3 \
---use_outlier_rejection ${USE_OUTLIER_REJECTION:-true} \
 --learning_rates ${LR:-1e-4} \
 --learning_schedule 40 \
 --n_step_per_gradient_accumulation 2 \
