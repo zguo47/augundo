@@ -166,7 +166,7 @@ class SharedEncoder(nn.Module):
         return [level0, level1, level2, level3, level4]
 
 
-def sparse_depth_at_resolution(sparse_depth, output_size):
+def sparse_depth_at_resolution(sparse_depth, output_size, return_indices=False):
     '''Sparse depth at requested resolution.
     '''
 
@@ -179,7 +179,27 @@ def sparse_depth_at_resolution(sparse_depth, output_size):
         sparse_depth.flatten(2),
         dim=2,
         index=measurement_indices.flatten(2))
-    return selected_depth.reshape_as(has_measurement) * has_measurement
+    selected_depth = selected_depth.reshape_as(has_measurement) * has_measurement
+    # Debug comparisons use the selected original pixel, not pooled ground truth.
+    if return_indices:
+        return selected_depth, measurement_indices
+    return selected_depth
+
+
+def normalize_rejection_input(feature, depth, sparse_depth):
+    '''Combine normalized feature channels and already-scaled depth inputs.
+
+    Normalize channels independently at each pixel without learned affine
+    parameters. Callers divide metric depths by max_predict_depth; the bottom
+    scaleless depth already has unit mean and needs no additional scaling.
+    Only rejection uses this representation. Metric propagation is unchanged.
+    '''
+
+    n_channel = feature.shape[1]
+    feature = functional.layer_norm(
+        feature.permute(0, 2, 3, 1),
+        normalized_shape=(n_channel,)).permute(0, 3, 1, 2)
+    return torch.cat([feature, depth, sparse_depth], dim=1)
 
 
 def propagate_scale(
@@ -238,7 +258,12 @@ def propagate_scale(
 
     depth = depth * correction
     # Restore exact metric values before handing depth to the next decoder.
-    return keep_mask * sparse_depth + (1.0 - keep_mask) * depth
+    # The loop has already anchored the correction. Another differentiable
+    # blend here cancels the accepted point's gradient to its keep decision.
+    # Copy exact values in the forward pass, but keep the backward path through
+    # the propagated correction, including its straight-through keep mask.
+    restored_depth = torch.where(keep_mask > 0.0, sparse_depth, depth)
+    return restored_depth.detach() + (depth - depth.detach())
 
 
 def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
@@ -270,7 +295,8 @@ class PropagationDecoderBlock(nn.Module):
             n_channels,
             gumbel_temperature,
             use_outlier_rejection,
-            n_propagation_iterations=2):
+            n_propagation_iterations=2,
+            max_predict_depth=8.0):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry only features and dense metric depth from the previous level.
@@ -283,6 +309,7 @@ class PropagationDecoderBlock(nn.Module):
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
         self.n_propagation_iterations = n_propagation_iterations
+        self.max_predict_depth = max_predict_depth
         self.depth_update = Conv2d(
             n_channels,
             1,
@@ -335,8 +362,12 @@ class PropagationDecoderBlock(nn.Module):
 
         propagation_input = torch.cat([feature, depth, sparse_depth], dim=1)
         if self.use_outlier_rejection:
+            rejection_input = normalize_rejection_input(
+                feature=feature,
+                depth=depth / self.max_predict_depth,
+                sparse_depth=sparse_depth / self.max_predict_depth)
             rejection_logits = \
-                self.rejection_map(propagation_input) + self.rejection_bias
+                self.rejection_map(rejection_input) + self.rejection_bias
             keep_mask = rejection_keep_mask(
                 rejection_logits=rejection_logits,
                 sparse_depth=sparse_depth,
@@ -413,7 +444,8 @@ class ScalePropagationDepthModel(nn.Module):
                 n_channels=n_channels,
                 gumbel_temperature=gumbel_temperature,
                 use_outlier_rejection=use_outlier_rejection,
-                n_propagation_iterations=n_iteration)
+                n_propagation_iterations=n_iteration,
+                max_predict_depth=max_predict_depth)
             for n_iteration in n_propagation_iterations[1:]
         ])
 
@@ -437,8 +469,12 @@ class ScalePropagationDepthModel(nn.Module):
         # Reject before computing either the global metric initialization or
         # local messages.
         if self.use_outlier_rejection:
+            rejection_input = normalize_rejection_input(
+                feature=coarse_feature,
+                depth=scaleless_depth,
+                sparse_depth=coarse_sparse_depth / self.max_predict_depth)
             rejection_logits = \
-                self.rejection_map(propagation_input) + self.rejection_bias
+                self.rejection_map(rejection_input) + self.rejection_bias
             keep_mask = rejection_keep_mask(
                 rejection_logits=rejection_logits,
                 sparse_depth=coarse_sparse_depth,

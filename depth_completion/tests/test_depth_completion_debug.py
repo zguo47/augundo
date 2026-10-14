@@ -65,6 +65,15 @@ class DepthDebugTest(unittest.TestCase):
                     records = [json.loads(line) for line in stream]
                 self.assertEqual(sum(r['event'] == 'decoder' for r in records), 4)
                 self.assertTrue(any(r['event'] == 'output_gradient' for r in records))
+                gradients = next(r for r in records if r['event'] == 'gradients_before_optimizer')
+                self.assertEqual(set(gradients['rejection_heads']),
+                                 {'bottom', 'decoder.0', 'decoder.1', 'decoder.2', 'decoder.3'})
+                if rejection:
+                    self.assertEqual(sum(r['event'] == 'rejection' for r in records), 5)
+                    self.assertTrue(any(g['grad_norm'] > 0.
+                                        for g in gradients['rejection_heads'].values()))
+                else:
+                    self.assertFalse(any(r['event'] == 'rejection' for r in records))
 
     def test_inverse_failure_and_worst_sample_capture(self):
         model = ScalePropagationDepthModel(n_channels=8)
@@ -120,6 +129,48 @@ class DepthDebugTest(unittest.TestCase):
             debug.validation_sample(0, image, depth, depth, depth, 0., 100., SimpleNamespace())
             debug.finish_validation()
             debug.close()
+
+    def test_rejection_quality_uses_selected_original_measurement_coordinates(self):
+        model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
+        with torch.no_grad():
+            for stage in [model] + list(model.decoder):
+                stage.rejection_map.conv.weight.zero_()
+                stage.rejection_bias.copy_(torch.tensor([100., -100.]).reshape(1, 2, 1, 1))
+            model.decoder[0].rejection_bias.copy_(
+                torch.tensor([-100., 100.]).reshape(1, 2, 1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            sparse = torch.zeros(1, 1, 16, 16)
+            target = torch.zeros_like(sparse)
+            sparse[0, 0, 7, 7] = 20.
+            sparse[0, 0, 7, 15] = 5.
+            target[0, 0, 7, 7] = 5.
+            target[0, 0, 7, 15] = 5.
+            image = torch.rand(1, 3, 16, 16)
+            debug.begin('validation', 1)
+            with torch.no_grad():
+                model(image, sparse)
+            debug.inputs('validation_input', image, sparse, target)
+            debug.close()
+            with open(debug.path) as stream:
+                records = [json.loads(line) for line in stream]
+            quality = {r['level']: r for r in records if r['event'] == 'rejection_quality'}
+            self.assertEqual(len(quality), 5)
+            bottom = quality['bottom']['categories']
+            self.assertEqual(bottom['all_with_ground_truth']['count'], 1)
+            self.assertEqual(bottom['disagreement_over_3m']['count'], 1)
+            self.assertEqual(bottom['disagreement_over_3m']['rejection_fraction'], 0.)
+            coarse = quality['decoder.0']['categories']
+            self.assertEqual(coarse['accurate_within_0_1m']['count'], 1)
+            self.assertEqual(coarse['accurate_within_0_1m']['rejection_fraction'], 1.)
+            self.assertEqual(coarse['disagreement_over_3m']['rejection_fraction'], 1.)
+            finest = quality['decoder.3']['categories']
+            self.assertEqual(finest['all_with_ground_truth']['count'], 2)
+            self.assertEqual(finest['disagreement_over_3m']['rejection_fraction'], 0.)
+            margins = [r for r in records if r['event'] == 'rejection']
+            self.assertEqual(margins[0]['keep_minus_reject_at_sparse']['mean'], 200.)
+            self.assertEqual(margins[1]['keep_minus_reject_at_sparse']['mean'], -200.)
+            self.assertAlmostEqual(margins[0]['scaled_sparse_input']['max'], 0.2)
 
     def test_cli_accumulation_validation_and_disabled_equivalence(self):
         with tempfile.TemporaryDirectory() as directory:

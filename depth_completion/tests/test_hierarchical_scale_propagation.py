@@ -7,6 +7,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from scale_propagation_model import (
     ScalePropagationDepthModel,
+    normalize_rejection_input,
     propagate_scale,
     rejection_keep_mask,
     sparse_depth_at_resolution)
@@ -104,6 +105,60 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits.grad).all())
         self.assertGreater(float(logits.grad[0, :, 2, 3].abs().sum()), 0.)
         self.assertTrue(torch.isfinite(depth.grad).all())
+
+    def test_accepted_anchor_error_trains_its_keep_decision(self):
+        depth = torch.full((1, 1, 5, 5), 2.)
+        sparse = torch.zeros_like(depth)
+        sparse[0, 0, 2, 2] = 6.
+        keep = torch.zeros_like(depth)
+        keep[0, 0, 2, 2] = 1.
+        keep.requires_grad_()
+        logits = torch.zeros(1, 9, 5, 5)
+        result = propagate_scale(depth, sparse, keep, logits, 8)
+        self.assertEqual(float(result[0, 0, 2, 2]), 6.)
+        # This measurement is wrong relative to target 3. Its own loss must
+        # now provide a gradient that pushes the keep decision downward.
+        loss = torch.log1p(torch.abs(result[0, 0, 2, 2] - 3.))
+        loss.backward()
+        self.assertTrue(torch.isfinite(keep.grad).all())
+        self.assertGreater(float(keep.grad[0, 0, 2, 2]), 0.)
+
+    def test_rejection_input_normalizes_features_without_mutating_them(self):
+        feature = torch.arange(8.).reshape(1, 8, 1, 1).expand(1, 8, 3, 4).clone()
+        original = feature.clone()
+        feature.requires_grad_()
+        depth = torch.full((1, 1, 3, 4), 60.)
+        sparse = torch.full_like(depth, 55.)
+        result = normalize_rejection_input(feature, depth / 100., sparse / 100.)
+        self.assertTrue(torch.equal(feature, original))
+        torch.testing.assert_close(result[:, :8].mean(dim=1), torch.zeros(1, 3, 4))
+        torch.testing.assert_close(result[:, :8].var(dim=1, unbiased=False), torch.ones(1, 3, 4))
+        torch.testing.assert_close(result[:, -2:-1], torch.full_like(depth, 0.6))
+        torch.testing.assert_close(result[:, -1:], torch.full_like(sparse, 0.55))
+        result[:, 0].sum().backward()
+        self.assertTrue(torch.isfinite(feature.grad).all())
+
+    def test_only_rejection_receives_scaled_depth_at_every_level(self):
+        model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
+        captured = []
+        for stage in [model] + list(model.decoder):
+            pair = dict(rejection=[], propagation=[])
+            stage.rejection_map.register_forward_pre_hook(
+                lambda module, inputs, pair=pair: pair['rejection'].append(inputs[0].clone()))
+            stage.propagation_map.register_forward_pre_hook(
+                lambda module, inputs, pair=pair: pair['propagation'].append(inputs[0].clone()))
+            captured.append(pair)
+        sparse = torch.zeros(1, 1, 17, 25)
+        sparse[0, 0, 7, 11] = 55.
+        with torch.no_grad():
+            model(torch.rand(1, 3, 17, 25), sparse)
+        for level, pair in enumerate(captured):
+            rejection, propagation = pair['rejection'][0], pair['propagation'][0]
+            torch.testing.assert_close(rejection[:, :8].mean(dim=1),
+                                       torch.zeros_like(rejection[:, 0]), atol=1e-5, rtol=0.)
+            torch.testing.assert_close(rejection[:, -1:], propagation[:, -1:] / 100.)
+            depth_scale = 1. if level == 0 else 100.
+            torch.testing.assert_close(rejection[:, -2:-1], propagation[:, -2:-1] / depth_scale)
 
     def test_zero_gates_preserve_detail_except_at_accepted_anchors(self):
         depth = torch.rand(1, 1, 5, 7) + 1.

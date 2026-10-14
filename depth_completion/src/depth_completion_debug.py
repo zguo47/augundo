@@ -108,6 +108,7 @@ class DepthCompletionDebug(object):
         self.worst = []
         self.buckets = {}
         self.inverse_failures = 0
+        self.rejection_observations = {}
         self.register_hooks()
 
     def emit(self, event, **values):
@@ -194,6 +195,7 @@ class DepthCompletionDebug(object):
     def begin(self, phase, step, sample=None, active=True):
         self.active = active
         self.context = dict(phase=phase, step=int(step), sample=sample)
+        self.rejection_observations = {}
 
     def register_hooks(self):
         def hook(name):
@@ -229,6 +231,77 @@ class DepthCompletionDebug(object):
             if name in ['encoder', 'coarse_scaleless_depth', 'propagation_map',
                         'rejection_map', ''] or (name.startswith('decoder.') and name.count('.') == 1):
                 self.handles.append(module.register_forward_hook(hook(name or 'model_output')))
+            if name == 'rejection_map' or name.endswith('.rejection_map'):
+                level = 'bottom' if name == 'rejection_map' else name.rsplit('.', 1)[0]
+                parent = self.model if level == 'bottom' else self.model.decoder[int(level.split('.')[1])]
+                self.handles.append(module.register_forward_hook(self.rejection_hook(level, parent)))
+
+    def rejection_hook(self, level, parent):
+        '''Report both class scores after the head's learned bias is added.'''
+        def observe(module, inputs, output):
+            if not self.active:
+                return
+            with torch.no_grad():
+                logits = output + parent.rejection_bias.to(output.device)
+                margin = logits[:, 0:1] - logits[:, 1:2]
+                probability = functional.softmax(logits, dim=1)[:, 0:1]
+                # Rejection input ends in scaled sparse depth; positivity still
+                # identifies the same selected measurements as the metric map.
+                measured = inputs[0][:, -1:] > 0.0
+                self.emit('rejection', level=level,
+                          measurement_count=int(measured.sum()),
+                          keep_minus_reject_at_sparse=statistics(margin[measured]),
+                          keep_probability_at_sparse=statistics(probability[measured]),
+                          deterministic_keep_fraction_at_sparse=float(
+                              ((margin >= 0.0) & measured).sum() / measured.sum().clamp_min(1)),
+                          depth_context_input=statistics(inputs[0][:, -2:-1]),
+                          scaled_sparse_input=statistics(inputs[0][:, -1:]))
+                # Validation uses argmax, so this is the actual keep decision.
+                # Training uses sampled Gumbel decisions; do not label those
+                # using untransformed ground truth from the training batch.
+                if self.context['phase'] == 'validation':
+                    self.rejection_observations[level] = dict(
+                        size=tuple(margin.shape[-2:]),
+                        keep=(margin >= 0.0).detach())
+        return observe
+
+    def rejection_quality(self, sparse, target):
+        '''Compare selected measurements with GT at their original coordinates.
+
+        These categories describe disagreement with the supplied ground truth;
+        they are diagnostics, not outlier labels or additional training losses.
+        Missing GT is excluded. No depth/validity averaging is used.
+        '''
+        sampler = getattr(sys.modules[type(self.model).__module__],
+                          'sparse_depth_at_resolution', None)
+        if sampler is None:
+            return
+        with torch.no_grad():
+            for level, observation in self.rejection_observations.items():
+                sampled, indices = sampler(sparse, observation['size'], return_indices=True)
+                selected_target = torch.gather(
+                    target.flatten(2), 2, indices.flatten(2)).reshape_as(sampled)
+                known = (sampled > 0.0) & (selected_target > 0.0) & torch.isfinite(selected_target)
+                difference = torch.abs(sampled - selected_target)
+                keep = observation['keep'].to(sparse.device)
+                categories = {
+                    'all_with_ground_truth': known,
+                    'accurate_within_0_1m': known & (difference <= 0.1),
+                    'disagreement_over_3m': known & (difference > 3.0),
+                    'disagreement_over_5percent': known & (
+                        difference / selected_target.clamp_min(1e-7) > 0.05)
+                }
+                reports = {}
+                for name, mask in categories.items():
+                    count = int(mask.sum())
+                    rejected = int((mask & ~keep).sum())
+                    reports[name] = dict(
+                        count=count, kept=count - rejected, rejected=rejected,
+                        rejection_fraction=None if count == 0 else rejected / count)
+                self.emit('rejection_quality', level=level,
+                          ground_truth_scope='original_selected_pixel',
+                          sparse_vs_target=errors(sampled, selected_target, array(known)),
+                          categories=reports)
 
     def output_gradient(self, gradient):
         self.emit('output_gradient', values=statistics(gradient))
@@ -245,6 +318,8 @@ class DepthCompletionDebug(object):
             s, t = array(sparse), array(target)
             self.emit('sparse_vs_target', name=name,
                       errors=errors(s, t, (t > 0) & (s > 0)))
+        if name == 'validation_input' and target is not None:
+            self.rejection_quality(sparse, target)
 
     def sparse_at_resolution(self, sparse, output_size):
         '''Use the model's sparse selector when reporting measurements.'''
@@ -289,23 +364,43 @@ class DepthCompletionDebug(object):
 
     def before_step(self, optimizer):
         groups = {}
+        rejection_heads = {}
         self.before = {}
         for name, parameter in self.model.named_parameters():
             group = '.'.join(name.split('.')[:2])
             item = groups.setdefault(group, dict(grad_squared=0., weight_squared=0.,
                                                  no_gradient=0, nonfinite_gradient=0))
-            item['weight_squared'] += float(parameter.detach().double().square().sum())
+            # Separate each rejection head from its decoder's other parameters.
+            head_name = None
+            if name == 'rejection_bias' or name.startswith('rejection_map.'):
+                head_name = 'bottom'
+            elif '.rejection_map.' in name or name.endswith('.rejection_bias'):
+                head_name = name.split('.rejection_')[0]
+            head = None if head_name is None else rejection_heads.setdefault(
+                head_name, dict(grad_squared=0., weight_squared=0.,
+                                no_gradient=0, nonfinite_gradient=0))
+            weight_squared = float(parameter.detach().double().square().sum())
+            item['weight_squared'] += weight_squared
+            if head is not None:
+                head['weight_squared'] += weight_squared
             if parameter.grad is None:
                 item['no_gradient'] += 1
+                if head is not None:
+                    head['no_gradient'] += 1
                 continue
             gradient = parameter.grad.detach()
-            item['nonfinite_gradient'] += int((~torch.isfinite(gradient)).sum())
-            item['grad_squared'] += float(gradient.double().square().sum())
+            nonfinite = int((~torch.isfinite(gradient)).sum())
+            grad_squared = float(gradient.double().square().sum())
+            item['nonfinite_gradient'] += nonfinite
+            item['grad_squared'] += grad_squared
+            if head is not None:
+                head['nonfinite_gradient'] += nonfinite
+                head['grad_squared'] += grad_squared
             self.before[name] = parameter.detach().cpu().clone()
-        for item in groups.values():
+        for item in list(groups.values()) + list(rejection_heads.values()):
             item['grad_norm'] = float(np.sqrt(item['grad_squared']))
             item['weight_norm'] = float(np.sqrt(item['weight_squared']))
-        self.emit('gradients_before_optimizer', groups=groups,
+        self.emit('gradients_before_optimizer', groups=groups, rejection_heads=rejection_heads,
                   learning_rates=[g['lr'] for g in optimizer.param_groups],
                   global_grad_norm=float(np.sqrt(sum(g['grad_squared'] for g in groups.values()))))
 
