@@ -22,7 +22,7 @@ python depth_completion/src/train_depth_completion.py \
 --min_predict_depth 1.5 \
 --max_predict_depth 100.0 \
 --use_outlier_rejection true \
---debug_depth false \
+--debug_depth true \
 --debug_interval 100 \
 --debug_max_samples 3 \
 --learning_rates ${LR:-1e-4} \
@@ -61,6 +61,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale \
+    trained_models/depth_completion/scale_propagation/kitti/supervised_prop_scale_learnable_scalemap \
 --device gpu \
 --n_thread 8

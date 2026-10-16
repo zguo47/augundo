@@ -12,7 +12,7 @@ python depth_completion/src/train_depth_completion.py \
 --val_sparse_depth_path testing/void/void_test_sparse_depth_1500.txt \
 --val_intrinsics_path testing/void/void_test_intrinsics_1500.txt \
 --val_ground_truth_path testing/void/void_test_ground_truth_1500.txt \
---n_batch 6 \
+--n_batch 4 \
 --n_height 480 \
 --n_width 640 \
 --model_name scale_propagation_void \
@@ -22,7 +22,7 @@ python depth_completion/src/train_depth_completion.py \
 --min_predict_depth 0.1 \
 --max_predict_depth 8.0 \
 --use_outlier_rejection true \
---debug_depth false \
+--debug_depth true \
 --debug_interval 100 \
 --debug_max_samples 3 \
 --learning_rates ${LR:-1e-4} \
@@ -61,6 +61,6 @@ python depth_completion/src/train_depth_completion.py \
 --n_step_per_checkpoint 1000 \
 --start_step_validation 1000 \
 --checkpoint_path \
-    trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale \
+    trained_models/depth_completion/scale_propagation/void1500/supervised_prop_scale_learnable_scalemap \
 --device gpu \
 --n_thread 8
