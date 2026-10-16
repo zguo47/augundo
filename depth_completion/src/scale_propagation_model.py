@@ -187,14 +187,6 @@ def sparse_depth_at_resolution(sparse_depth, output_size, return_indices=False):
 
 
 def normalize_rejection_input(feature, depth, sparse_depth):
-    '''Combine normalized feature channels and already-scaled depth inputs.
-
-    Normalize channels independently at each pixel without learned affine
-    parameters. Callers divide metric depths by max_predict_depth; the bottom
-    scaleless depth already has unit mean and needs no additional scaling.
-    Only rejection uses this representation. Metric propagation is unchanged.
-    '''
-
     n_channel = feature.shape[1]
     feature = functional.layer_norm(
         feature.permute(0, 2, 3, 1),
@@ -258,10 +250,6 @@ def propagate_scale(
 
     depth = depth * correction
     # Restore exact metric values before handing depth to the next decoder.
-    # The loop has already anchored the correction. Another differentiable
-    # blend here cancels the accepted point's gradient to its keep decision.
-    # Copy exact values in the forward pass, but keep the backward path through
-    # the propagated correction, including its straight-through keep mask.
     restored_depth = torch.where(keep_mask > 0.0, sparse_depth, depth)
     return restored_depth.detach() + (depth - depth.detach())
 
