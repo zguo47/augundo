@@ -140,7 +140,10 @@ class DepthCompletionDebug(object):
                   rejection_enabled=getattr(self.model, 'use_outlier_rejection', None),
                   propagation_iterations=getattr(self.model, 'n_propagation_iterations', None),
                   model=str(self.model),
-                  loss_formula='mean_per_image(log(1 + abs(pred - clamped_target)))')
+                  loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
+                                ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..3'),
+                  propagation_activation='sigmoid',
+                  sparse_injection='once_per_level_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
                 continue
@@ -205,13 +208,17 @@ class DepthCompletionDebug(object):
                 with torch.no_grad():
                     if name == 'encoder':
                         self.emit('encoder', levels=[statistics(x) for x in output])
-                    elif name.startswith('decoder.'):
-                        feature, depth, logits, rejection, keep = output
+                    elif name.startswith('decoder.') and name.count('.') == 1:
+                        feature, geometry, scale, logits, rejection, keep = output
+                        depth = geometry * scale
                         weights = torch.sigmoid(logits.detach())
-                        sparse = self.sparse_at_resolution(inputs[3], depth.shape[-2:])
+                        sparse = self.sparse_at_resolution(inputs[4], depth.shape[-2:])
                         self.emit('decoder', level=name, device=str(depth.device),
                                   propagation_iterations=module.n_propagation_iterations,
                                   metric_depth=statistics(depth),
+                                  scaleless_depth=statistics(geometry),
+                                  scale_map=statistics(scale),
+                                  scaleless_mean_per_image=geometry.mean(dim=[1, 2, 3]).cpu().tolist(),
                                   feature=statistics(feature),
                                   preclamp_below_min=float((depth < self.minimum).float().mean()),
                                   preclamp_above_max=float((depth > self.maximum).float().mean()),
@@ -223,18 +230,56 @@ class DepthCompletionDebug(object):
                                   keep_fraction_at_sparse=float(
                                       keep.sum() / (sparse > 0).sum().clamp_min(1)))
                     else:
-                        self.emit('activation', name=name, values=statistics(output))
-                        if name == 'model_output' and output.requires_grad:
-                            output.register_hook(self.output_gradient)
+                        value = output['depth'] if isinstance(output, dict) else output
+                        self.emit('activation', name=name, values=statistics(value))
+                        if name == 'model_output':
+                            if value.requires_grad:
+                                value.register_hook(self.output_gradient)
+                            if isinstance(output, dict):
+                                metric = output['metric_depths_for_loss'][0]
+                                if metric.requires_grad:
+                                    metric.register_hook(self.output_gradient)
             return observe
         for name, module in self.model.named_modules():
-            if name in ['encoder', 'coarse_scaleless_depth', 'propagation_map',
+            if name in ['encoder', 'coarse_scaleless_depth', 'scale_update', 'propagation_map',
                         'rejection_map', ''] or (name.startswith('decoder.') and name.count('.') == 1):
                 self.handles.append(module.register_forward_hook(hook(name or 'model_output')))
+            if name == 'scale_propagation' or name.endswith('.scale_propagation'):
+                level = 'bottom' if name == 'scale_propagation' else name.rsplit('.', 1)[0]
+                self.handles.append(module.register_forward_hook(self.scale_hook(level)))
+            if name.endswith('.scale_update'):
+                self.handles.append(module.register_forward_hook(hook(name)))
             if name == 'rejection_map' or name.endswith('.rejection_map'):
                 level = 'bottom' if name == 'rejection_map' else name.rsplit('.', 1)[0]
                 parent = self.model if level == 'bottom' else self.model.decoder[int(level.split('.')[1])]
                 self.handles.append(module.register_forward_hook(self.rejection_hook(level, parent)))
+
+    def scale_hook(self, level):
+        '''Compare inherited/learned scale, one-time sparse injection, and diffusion.'''
+        def observe(module, inputs, output):
+            if not self.active:
+                return
+            with torch.no_grad():
+                scale, geometry, sparse, keep, logits = inputs
+                target = sparse / geometry.detach().clamp_min(1e-7)
+                seeded = keep * target + (1.0 - keep) * scale
+                accepted = keep > 0.0
+                weights = torch.sigmoid(logits)
+                self.emit('scale_propagation', level=level,
+                          propagation_iterations=module.n_propagation_iterations,
+                          scale_before_injection=statistics(scale),
+                          scale_after_injection=statistics(seeded),
+                          scale_after_propagation=statistics(output),
+                          sparse_scale_target=statistics(target[accepted]),
+                          accepted_metric_residual=statistics(
+                              (geometry * output - sparse)[accepted]),
+                          scaleless_depth=statistics(geometry),
+                          propagation_change=statistics(output - seeded),
+                          outgoing_weight_sum=statistics(weights.sum(dim=1)),
+                          center_outgoing_weight=statistics(weights[:, 4]),
+                          propagation_activation='sigmoid',
+                          restores_anchors=False)
+        return observe
 
     def rejection_hook(self, level, parent):
         '''Report both class scores after the head's learned bias is added.'''
@@ -400,7 +445,25 @@ class DepthCompletionDebug(object):
         for item in list(groups.values()) + list(rejection_heads.values()):
             item['grad_norm'] = float(np.sqrt(item['grad_squared']))
             item['weight_norm'] = float(np.sqrt(item['weight_squared']))
+        prediction_heads = {}
+        for name, parameter in self.model.named_parameters():
+            if not any(part in ['coarse_scaleless_depth', 'depth_update',
+                                'scale_update', 'propagation_map']
+                       for part in name.split('.')):
+                continue
+            key = name.split('.conv.')[0]
+            item = prediction_heads.setdefault(
+                key, dict(grad_squared=0., no_gradient=0, nonfinite_gradient=0))
+            if parameter.grad is None:
+                item['no_gradient'] += 1
+            else:
+                gradient = parameter.grad.detach()
+                item['grad_squared'] += float(gradient.double().square().sum())
+                item['nonfinite_gradient'] += int((~torch.isfinite(gradient)).sum())
+        for item in prediction_heads.values():
+            item['grad_norm'] = float(np.sqrt(item['grad_squared']))
         self.emit('gradients_before_optimizer', groups=groups, rejection_heads=rejection_heads,
+                  prediction_heads=prediction_heads,
                   learning_rates=[g['lr'] for g in optimizer.param_groups],
                   global_grad_norm=float(np.sqrt(sum(g['grad_squared'] for g in groups.values()))))
 

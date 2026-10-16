@@ -118,7 +118,12 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual([r['measurement_count'] for r in levels], [1] * 5)
             blocks = [r for r in records if r['event'] == 'decoder']
             self.assertEqual([r['keep_fraction_at_sparse'] for r in blocks], [1.] * 4)
-            self.assertEqual([r['propagation_iterations'] for r in blocks], [8, 4, 2, 2])
+            self.assertEqual([r['propagation_iterations'] for r in blocks], [2, 3, 4, 6])
+            scales = [r for r in records if r['event'] == 'scale_propagation']
+            self.assertEqual(len(scales), 5)
+            self.assertTrue(all(not r['restores_anchors'] for r in scales))
+            self.assertTrue(all(r['propagation_activation'] == 'sigmoid' for r in scales))
+            self.assertTrue(all('scaleless_depth' in r and 'scale_map' in r for r in blocks))
 
     def test_empty_ground_truth_does_not_crash_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -173,6 +178,7 @@ class DepthDebugTest(unittest.TestCase):
             self.assertAlmostEqual(margins[0]['scaled_sparse_input']['max'], 0.2)
 
     def test_cli_accumulation_validation_and_disabled_equivalence(self):
+        import matplotlib
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {}
@@ -218,7 +224,10 @@ class DepthDebugTest(unittest.TestCase):
                                                '--checkpoint_path', str(root / enabled)]
                 # The repository targets older Pillow; adapt only this test's environment.
                 lanczos = getattr(Image, 'Resampling', Image).LANCZOS
+                get_cmap = getattr(
+                    matplotlib.cm, 'get_cmap', lambda name: matplotlib.colormaps[name])
                 with mock.patch.object(Image, 'ANTIALIAS', lanczos, create=True), \
+                        mock.patch.object(matplotlib.cm, 'get_cmap', get_cmap, create=True), \
                         mock.patch.object(sys, 'argv', argv):
                     runpy.run_path(script, run_name='__main__')
             records = [json.loads(line) for line in
@@ -226,6 +235,16 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(sum(r['event'] == 'gradients_before_optimizer' for r in records), 1)
             self.assertEqual(sum(r['event'] == 'validation_sample' for r in records), 2)
             self.assertFalse((root / 'false/debug').exists())
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+            for enabled in ['false', 'true']:
+                for phase in ['train', 'val']:
+                    events = EventAccumulator(str(root / enabled / ('events-' + phase))).Reload()
+                    prefix = 'train' if phase == 'train' else 'eval'
+                    self.assertIn(prefix + '/scaleless_depths/r0', events.Tags()['images'])
+                    self.assertIn(prefix + '/scale_maps/r4', events.Tags()['images'])
+                    if phase == 'train':
+                        self.assertIn('train_loss_si_r3', events.Tags()['scalars'])
+                        self.assertIn('train_loss_log_l1_r0', events.Tags()['scalars'])
             checkpoints = []
             for enabled in ['false', 'true']:
                 path = next((root / enabled).glob('checkpoints-1*'))

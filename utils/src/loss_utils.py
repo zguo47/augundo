@@ -226,6 +226,24 @@ def log_l1_loss_func(src, tgt, w, epsilon=EPSILON):
 
     return torch.mean(loss)
 
+def scale_invariant_loss_func(src, tgt, w, epsilon=EPSILON):
+    '''Centered log-depth error, invariant to one scale factor per image.
+
+    Predictions and targets share full resolution. Only positive target pixels
+    contribute; centering is performed independently for each image. Computing
+    centered squares avoids cancellation in mean(error**2) - mean(error)**2.
+    '''
+    valid = (w > 0) & (tgt > 0)
+    weights = torch.where(valid, w, torch.zeros_like(w))
+    error = torch.log(src.clamp_min(epsilon)) - torch.log(tgt.clamp_min(epsilon))
+    error = torch.where(valid, error, torch.zeros_like(error))
+    count = weights.sum(dim=[1, 2, 3])
+    mean = (weights * error).sum(dim=[1, 2, 3]) / count.clamp_min(epsilon)
+    centered = error - mean[:, None, None, None]
+    loss = (weights * centered.square()).sum(dim=[1, 2, 3])
+    return torch.mean(loss / count.clamp_min(epsilon))
+
+
 def prior_depth_consistency_loss_func(src, tgt, w, normalize=False):
     '''
     Computes the prior depth consistency loss

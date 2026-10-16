@@ -738,7 +738,8 @@ def train(train_images_path,
                     pose0to1=pose0to1,
                     pose0to2=pose0to2,
                     scalars=loss_info,
-                    n_image_per_summary=min(n_batch, n_image_per_summary))
+                    n_image_per_summary=min(n_batch, n_image_per_summary),
+                    scale_outputs=depth_completion_model.scale_outputs(output_depth0))
 
             # Log results and save checkpoints
             if is_optimizer_step and \
@@ -864,6 +865,9 @@ def validate(depth_model,
     sparse_depth_summary = []
     validity_map_summary = []
     ground_truth_summary = []
+    scale_output_summary = dict(
+        scaleless_depths=[[] for _ in range(5)],
+        scale_maps=[[] for _ in range(5)])
 
     if depth_debug is not None:
         depth_debug.start_validation(step)
@@ -892,13 +896,24 @@ def validate(depth_model,
                 images_arr=[image],
                 random_transform_probability=0.0)
 
+            # Collect explicit auxiliary maps only for displayed scale-model
+            # samples; all other validation calls keep the single-depth API.
+            collect_scale = (
+                summary_writer is not None and idx % n_interval_per_summary == 0 and
+                'scale_propagation' in depth_model.model_name)
             # Forward through network
             output_depth = depth_model.forward_depth(
                 image=image,
                 sparse_depth=sparse_depth,
                 validity_map=validity_map,
                 intrinsics=intrinsics,
-                return_all_outputs=False)
+                return_all_outputs=collect_scale)
+            if collect_scale:
+                maps = depth_model.scale_outputs(output_depth)
+                for name, levels in maps.items():
+                    for collected, value in zip(scale_output_summary[name], levels):
+                        collected.append(value.detach())
+                output_depth = output_depth[0]
 
         if depth_debug is not None:
             if depth_debug.active:
@@ -958,7 +973,11 @@ def validate(depth_model,
             validity_map0=torch.cat(validity_map_summary, dim=0),
             ground_truth0=torch.cat(ground_truth_summary, dim=0),
             scalars={'mae' : mae, 'rmse' : rmse, 'imae' : imae, 'irmse': irmse},
-            n_image_per_summary=n_image_per_summary)
+            n_image_per_summary=n_image_per_summary,
+            scale_outputs={
+                name: [torch.cat(values, dim=0) for values in levels]
+                for name, levels in scale_output_summary.items()
+            } if scale_output_summary['scale_maps'][0] else None)
 
     # Print validation results to console
     log('Validation results:', log_path)

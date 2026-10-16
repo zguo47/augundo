@@ -195,16 +195,19 @@ def normalize_rejection_input(feature, depth, sparse_depth):
 
 
 def propagate_scale(
-        depth,
+        scale,
+        scaleless_depth,
         sparse_depth,
         keep_mask,
         propagation_logits,
         n_propagation_iterations=1):
-    '''Iteratively relay scale corrections while preserving accepted anchors.
+    '''Inject accepted scale estimates once, then relay the persistent scale map.
 
     Arg(s):
-        depth : torch.Tensor[float32]
-            B x 1 x H x W positive dense metric depth, fixed during this loop
+        scale : torch.Tensor[float32]
+            B x 1 x H x W inherited and learned positive scale map
+        scaleless_depth : torch.Tensor[float32]
+            B x 1 x H x W positive geometry; detached on the metric path
         sparse_depth : torch.Tensor[float32]
             B x 1 x H x W measurements sampled at this resolution
         keep_mask : torch.Tensor[float32]
@@ -214,16 +217,15 @@ def propagate_scale(
         n_propagation_iterations : int
             number of neighboring exchanges at this resolution
     Returns:
-        torch.Tensor[float32] : B x 1 x H x W refined dense metric depth
+            torch.Tensor[float32] : B x 1 x H x W refined scale map
 
     '''
 
-    n_batch, _, n_height, n_width = depth.shape
-    sparse_scale = sparse_depth / depth.clamp_min(1e-7)
-    correction = keep_mask * sparse_scale + (1.0 - keep_mask)
-
-    #Accepted points initialize and anchor the field; missing/rejected points 
-    # initialize it to 1.
+    n_batch, _, n_height, n_width = scale.shape
+    sparse_scale = sparse_depth / scaleless_depth.detach().clamp_min(1e-7)
+    # Accepted measurements seed absolute scale, not a correction around 1.
+    # Injection occurs only here. Neither iterations nor the return restore it.
+    scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
     outgoing_weights = torch.sigmoid(propagation_logits)
 
     # Each column of fold is one source pixel's 3 x 3 outgoing message patch.
@@ -234,24 +236,35 @@ def propagate_scale(
         kernel_size=3,
         padding=1)
     for _ in range(n_propagation_iterations):
-        outgoing_scale = outgoing_weights * correction
+        outgoing_scale = outgoing_weights * scale
         incoming_scale = functional.fold(
             outgoing_scale.reshape(n_batch, 9, n_height * n_width),
             output_size=(n_height, n_width),
             kernel_size=3,
             padding=1)
 
-        # Retain the previous correction.
-        correction = (correction + incoming_scale) / (1.0 + incoming_weight)
+        # Average the current scale with incoming messages. The learned center
+        # connection is retained in addition to this fixed self-retention term.
+        scale = (scale + incoming_scale) / (1.0 + incoming_weight)
+    return scale
 
-        # Accepted sparse depth remain anchors after every exchange.
-        # Rejected points can relay corrections but cannot inject their depths.
-        correction = keep_mask * sparse_scale + (1.0 - keep_mask) * correction
 
-    depth = depth * correction
-    # Restore exact metric values before handing depth to the next decoder.
-    restored_depth = torch.where(keep_mask > 0.0, sparse_depth, depth)
-    return restored_depth.detach() + (depth - depth.detach())
+class ScalePropagation(nn.Module):
+    '''Expose propagation as a module so optional debug hooks see its inputs.'''
+
+    def __init__(self, n_propagation_iterations):
+        super(ScalePropagation, self).__init__()
+        self.n_propagation_iterations = n_propagation_iterations
+
+    def forward(self, scale, scaleless_depth, sparse_depth, keep_mask, logits):
+        return propagate_scale(
+            scale, scaleless_depth, sparse_depth, keep_mask, logits,
+            self.n_propagation_iterations)
+
+
+def normalize_scaleless_depth(depth):
+    '''Fix the geometry's global magnitude; the scale map carries metric units.'''
+    return depth / depth.mean(dim=[2, 3], keepdim=True).clamp_min(1e-7)
 
 
 def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
@@ -276,7 +289,7 @@ def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
 
 
 class PropagationDecoderBlock(nn.Module):
-    '''Upsample dense metric depth, then apply sparse scale corrections.'''
+    '''Refine scaleless geometry and the inherited scale map at a finer level.'''
 
     def __init__(
             self,
@@ -287,11 +300,10 @@ class PropagationDecoderBlock(nn.Module):
             max_predict_depth=8.0):
         super(PropagationDecoderBlock, self).__init__()
 
-        # Carry only features and dense metric depth from the previous level.
-        # Add this level's encoder skip and selected sparse depth:
-        # C + C + 1 + 1 = 2C + 2 input channels.
+        # Carry features, scaleless geometry, and scale separately. Add this
+        # level's encoder skip and sparse measurements: C + C + 1 + 1 + 1.
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 2,
+            2 * n_channels + 3,
             n_channels,
             stride=1)
         self.gumbel_temperature = gumbel_temperature
@@ -304,6 +316,15 @@ class PropagationDecoderBlock(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
+        self.scale_update = Conv2d(
+            n_channels,
+            1,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        # Start by retaining the inherited scale rather than changing it.
+        nn.init.zeros_(self.scale_update.conv.weight)
+        self.scale_propagation = ScalePropagation(n_propagation_iterations)
 
         # Heads see features, current metric depth, and current sparse depth.
         # Both heads are freshly evaluated at each level
@@ -322,15 +343,20 @@ class PropagationDecoderBlock(nn.Module):
         self.rejection_bias = nn.Parameter(
             torch.tensor([2.0, 0.0]).reshape(1, 2, 1, 1))
 
-    def forward(self, feature, skip, depth, sparse_depth):
+    def forward(self, feature, skip, scaleless_depth, scale, sparse_depth):
 
         feature = functional.interpolate(
             feature,
             size=skip.shape[-2:],
             mode='bilinear',
             align_corners=True)
-        depth = functional.interpolate(
-            depth,
+        scaleless_depth = functional.interpolate(
+            scaleless_depth,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
+        scale = functional.interpolate(
+            scale,
             size=skip.shape[-2:],
             mode='bilinear',
             align_corners=True)
@@ -341,12 +367,19 @@ class PropagationDecoderBlock(nn.Module):
         feature = self.fusion(torch.cat([
             feature,
             skip,
-            depth,
+            # Shared features can train under both objectives, but map inputs
+            # are context only: SI losses must not train preceding scale heads.
+            scaleless_depth.detach(),
+            scale.detach(),
             sparse_depth
         ], dim=1))
-        # A positive multiplicative refinement learns detail before applying
-        # metric constraints. 
-        depth = depth * torch.exp(torch.tanh(self.depth_update(feature)))
+        # Geometry stays positive and mean-one at every resolution. Only the
+        # SI objectives directly train this prediction and its preceding maps.
+        scaleless_depth = normalize_scaleless_depth(
+            scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
+        scale = scale * torch.exp(torch.tanh(self.scale_update(feature)))
+        # Metric heads see current metric context without a gradient into Z.
+        depth = scaleless_depth.detach() * scale
 
         propagation_input = torch.cat([feature, depth, sparse_depth], dim=1)
         if self.use_outlier_rejection:
@@ -366,21 +399,16 @@ class PropagationDecoderBlock(nn.Module):
             keep_mask = (sparse_depth > 0.0).to(sparse_depth.dtype)
 
         propagation_logits = self.propagation_map(propagation_input)
-        depth = propagate_scale(
-            depth=depth,
-            sparse_depth=sparse_depth,
-            keep_mask=keep_mask,
-            propagation_logits=propagation_logits,
-            n_propagation_iterations=self.n_propagation_iterations)
+        scale = self.scale_propagation(
+            scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits)
 
-        # Accepted values have been restored in this level's metric depth.
-        # Original sparse measurements are reconsidered independently at the
-        # next level; rejected values are not restored at this level.
-        return feature, depth, propagation_logits, rejection_logits, keep_mask
+        # No exact measurement restoration: the next decoder receives learned,
+        # propagated scale, and makes its own fresh rejection decisions.
+        return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
 
 class ScalePropagationDepthModel(nn.Module):
-    '''Five-resolution encoder with hierarchical scale updates.
+    '''Shared encoder with persistent geometry and metric scale at five levels.
     '''
 
     def __init__(self,
@@ -390,7 +418,7 @@ class ScalePropagationDepthModel(nn.Module):
                  n_head=4,
                  gumbel_temperature=1.0,
                  use_outlier_rejection=True,
-                 n_propagation_iterations=(16, 8, 4, 2, 2)):
+                 n_propagation_iterations=(1, 2, 3, 4, 6)):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -398,7 +426,7 @@ class ScalePropagationDepthModel(nn.Module):
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
         # Iteration counts are ordered from the bottom to full resolution.
-        # More exchanges at coarse scales cover larger original-image regions.
+        # Coarse scales are denser; finer scales receive more exchanges.
         self.n_propagation_iterations = n_propagation_iterations
 
         # Takes in RGB and sparse depth together and produce 5 feature maps.
@@ -413,6 +441,14 @@ class ScalePropagationDepthModel(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
+        self.scale_update = Conv2d(
+            n_channels,
+            1,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        nn.init.zeros_(self.scale_update.conv.weight)
+        self.scale_propagation = ScalePropagation(n_propagation_iterations[0])
         self.propagation_map = Conv2d(
             n_channels + 2,
             9,
@@ -437,7 +473,7 @@ class ScalePropagationDepthModel(nn.Module):
             for n_iteration in n_propagation_iterations[1:]
         ])
 
-    def forward(self, image, sparse_depth):
+    def forward(self, image, sparse_depth, return_all_outputs=False):
         features = self.encoder(image, sparse_depth)
         coarse_feature = features[-1]
         coarse_sparse_depth = sparse_depth_at_resolution(
@@ -447,10 +483,11 @@ class ScalePropagationDepthModel(nn.Module):
         coarse_depth = functional.softplus(
             self.coarse_scaleless_depth(coarse_feature)) + 1e-3
         fallback_scale = torch.mean(coarse_depth, dim=[2, 3], keepdim=True)
-        scaleless_depth = coarse_depth / fallback_scale
+        scaleless_depth = normalize_scaleless_depth(coarse_depth)
+        metric_geometry = scaleless_depth.detach()
         propagation_input = torch.cat([
             coarse_feature,
-            scaleless_depth,
+            metric_geometry,
             coarse_sparse_depth
         ], dim=1)
 
@@ -459,7 +496,7 @@ class ScalePropagationDepthModel(nn.Module):
         if self.use_outlier_rejection:
             rejection_input = normalize_rejection_input(
                 feature=coarse_feature,
-                depth=scaleless_depth,
+                depth=metric_geometry,
                 sparse_depth=coarse_sparse_depth / self.max_predict_depth)
             rejection_logits = \
                 self.rejection_map(rejection_input) + self.rejection_bias
@@ -472,30 +509,48 @@ class ScalePropagationDepthModel(nn.Module):
             keep_mask = (coarse_sparse_depth > 0.0).to(sparse_depth.dtype)
 
         # Each accepted measurement proposes a metric scale d_sparse / scaleless.
-        sparse_scale = coarse_sparse_depth / scaleless_depth.clamp_min(1e-3)
+        sparse_scale = coarse_sparse_depth / metric_geometry.clamp_min(1e-3)
         scale = (
             torch.sum(keep_mask * sparse_scale, dim=[2, 3], keepdim=True) +
-            fallback_scale) / (
+            fallback_scale.detach()) / (
                 torch.sum(keep_mask, dim=[2, 3], keepdim=True) + 1.0)
-        depth = scaleless_depth * scale
+        # Initialize a dense constant scale from the existing global estimate,
+        # then allow the head and sparse-guided propagation to refine it.
+        scale = scale.expand_as(scaleless_depth)
+        scale = scale * torch.exp(torch.tanh(self.scale_update(coarse_feature)))
         propagation_logits = self.propagation_map(propagation_input)
-        depth = propagate_scale(
-            depth=depth,
-            sparse_depth=coarse_sparse_depth,
-            keep_mask=keep_mask,
-            propagation_logits=propagation_logits,
-            n_propagation_iterations=self.n_propagation_iterations[0])
+        scale = self.scale_propagation(
+            scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits)
 
         feature = coarse_feature
+        scaleless_depths = [scaleless_depth]
+        scale_maps = [scale]
         for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
-            feature, depth, _, _, _ = decoder_block(
+            feature, scaleless_depth, scale, _, _, _ = decoder_block(
                 feature,
                 features[level],
-                depth,
+                scaleless_depth,
+                scale,
                 sparse_depth)
+            scaleless_depths.append(scaleless_depth)
+            scale_maps.append(scale)
 
         # Clamp before output.
-        return torch.clamp(
-            depth,
+        depth = torch.clamp(
+            scaleless_depth * scale,
             min=self.min_predict_depth,
             max=self.max_predict_depth)
+        if not return_all_outputs:
+            return depth
+        # Full resolution first. Explicit outputs also work with DataParallel;
+        # no retained per-forward graph or replica-local cache is needed.
+        scaleless_depths = scaleless_depths[::-1]
+        scale_maps = scale_maps[::-1]
+        return dict(
+            depth=depth,
+            scaleless_depths=scaleless_depths,
+            scale_maps=scale_maps,
+            metric_depths_for_loss=[
+                geometry.detach() * metric_scale
+                for geometry, metric_scale in zip(
+                    scaleless_depths[:4], scale_maps[:4])])

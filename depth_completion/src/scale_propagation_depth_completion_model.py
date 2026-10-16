@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 from scale_propagation_model import ScalePropagationDepthModel
 from utils.src import loss_utils
@@ -39,12 +40,27 @@ class ScalePropagationDepthCompletionModel(object):
 
         output_depth = self.model_depth(
             image=image,
-            sparse_depth=sparse_depth)
-        return [output_depth] if return_all_outputs else output_depth
+            sparse_depth=sparse_depth,
+            return_all_outputs=return_all_outputs)
+        if not return_all_outputs:
+            return output_depth
+        # Flat, full-resolution tensors follow the repository's transform API.
+        # Reverse geometric augmentation on every map before computing losses.
+        # Layout: final depth, five Z maps, five M maps, four metric-loss maps.
+        maps = output_depth['scaleless_depths'] + output_depth['scale_maps'] + \
+            output_depth['metric_depths_for_loss']
+        return [output_depth['depth']] + [
+            functional.interpolate(
+                value, size=image.shape[-2:], mode='bilinear', align_corners=True)
+            for value in maps]
+
+    @staticmethod
+    def scale_outputs(outputs):
+        '''Extract aligned maps from the explicit full-resolution output list.'''
+        return dict(scaleless_depths=outputs[1:6], scale_maps=outputs[6:11])
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
-        '''Supervise only the final full-resolution propagated depth.'''
-        output_depth = output_depth[0]
+        '''Supervise the four decoder geometries and their metric products.'''
 
         validity = (target_depth > 0.0).to(target_depth.dtype)
         target_depth = torch.where(
@@ -55,17 +71,31 @@ class ScalePropagationDepthCompletionModel(object):
                 max=self.max_predict_depth),
             torch.full_like(target_depth, self.min_predict_depth))
 
-        loss_log_l1 = loss_utils.log_l1_loss_func(
-            src=output_depth,
-            tgt=target_depth,
-            w=validity)
+        loss_si = target_depth.new_zeros(())
+        loss_log_l1 = target_depth.new_zeros(())
+        loss_info = {}
+        for resolution, (geometry, metric) in enumerate(zip(
+                output_depth[1:5], output_depth[11:15])):
+            # The model already detached geometry in these metric products;
+            # SI receives the undetached, geometrically aligned prediction.
+            scale_invariant = loss_utils.scale_invariant_loss_func(
+                src=geometry, tgt=target_depth, w=validity)
+            metric_loss = loss_utils.log_l1_loss_func(
+                src=metric, tgt=target_depth, w=validity)
+            weight = 1.0 / (4 ** resolution)
+            loss_si = loss_si + weight * scale_invariant
+            loss_log_l1 = loss_log_l1 + weight * metric_loss
+            loss_info['loss_si_r{}'.format(resolution)] = scale_invariant
+            loss_info['loss_log_l1_r{}'.format(resolution)] = metric_loss
         w_supervised = w_losses.get('w_supervised', 1.0)
-        loss = w_supervised * loss_log_l1
+        loss = w_supervised * (loss_si + loss_log_l1)
 
-        return loss, {
+        loss_info.update({
             'loss': loss,
+            'loss_si': loss_si,
             'loss_log_l1': loss_log_l1
-        }
+        })
+        return loss, loss_info
 
     def parameters(self):
         return list(self.model_depth.parameters())

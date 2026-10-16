@@ -436,6 +436,37 @@ class DepthCompletionModel(object):
         else:
             raise ValueError('Unsupported depth completion model: {}'.format(self.model_name))
 
+    def scale_outputs(self, outputs):
+        '''Return explicit geometry/scale maps only for the scale model.'''
+        if 'scale_propagation' in self.model_name:
+            return self.model.scale_outputs(outputs)
+        return None
+
+    def log_scale_summary(self, summary_writer, tag, step, outputs, n_image):
+        '''Use one color range across all five levels of each representation.'''
+        with torch.no_grad():
+            for name, maps in outputs.items():
+                maps = [value[:n_image].detach().cpu() for value in maps]
+                minimum = min(float(value.min()) for value in maps)
+                maximum = max(float(value.max()) for value in maps)
+                summary_writer.add_scalar(
+                    tag + '/' + name + '/color_min', minimum, global_step=step)
+                summary_writer.add_scalar(
+                    tag + '/' + name + '/color_max', maximum, global_step=step)
+                for resolution, value in enumerate(maps):
+                    key = tag + '/' + name + '/r{}'.format(resolution)
+                    normalized = ((value - minimum) / max(maximum - minimum, 1e-7)).clamp(0, 1)
+                    heatmap = log_utils.colorize(normalized, colormap='viridis')
+                    summary_writer.add_image(
+                        key, torchvision.utils.make_grid(heatmap, nrow=n_image),
+                        global_step=step)
+                    summary_writer.add_histogram(key + '/distribution', value, global_step=step)
+                    summary_writer.add_scalar(key + '/mean', value.mean(), global_step=step)
+                    summary_writer.add_scalar(
+                        key + '/spatial_std',
+                        value.flatten(1).std(dim=1, unbiased=False).mean(),
+                        global_step=step)
+
     def log_summary(self,
                     summary_writer,
                     tag,
@@ -450,7 +481,8 @@ class DepthCompletionModel(object):
                     pose0to1=None,
                     pose0to2=None,
                     scalars={},
-                    n_image_per_summary=4):
+                    n_image_per_summary=4,
+                    scale_outputs=None):
         '''
         Logs summary to Tensorboard
 
@@ -652,6 +684,9 @@ class DepthCompletionModel(object):
                 summary_writer.add_histogram(tag + '_tz0to2_distro', pose0to2[:, 2, 3], global_step=step)
 
         # Log scalars to tensorboard
+        if scale_outputs is not None:
+            self.log_scale_summary(
+                summary_writer, tag, step, scale_outputs, n_image_per_summary)
         for (name, value) in scalars.items():
             summary_writer.add_scalar(tag + '_' + name, value, global_step=step)
 
