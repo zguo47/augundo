@@ -442,7 +442,46 @@ class DepthCompletionModel(object):
             return self.model.scale_outputs(outputs)
         return None
 
-    def log_scale_summary(self, summary_writer, tag, step, outputs, n_image):
+    def log_scaleless_comparison(
+            self, summary_writer, tag, step, resolution, image, geometry, target):
+        '''Display RGB | Z | GT | aZ | relative error; alignment is logging only.'''
+        with torch.no_grad():
+            image = image.detach().cpu()
+            geometry = geometry.detach().cpu()
+            target = target.detach().cpu()
+            valid = target > 0.0
+            # One log-space alignment per image, using only valid GT pixels.
+            # This never modifies model predictions or contributes to a loss.
+            log_ratio = torch.log(target.clamp_min(1e-7)) - \
+                torch.log(geometry.clamp_min(1e-7))
+            count = valid.sum(dim=[1, 2, 3], keepdim=True).clamp_min(1)
+            alignment = torch.exp(
+                (log_ratio * valid).sum(dim=[1, 2, 3], keepdim=True) / count)
+            aligned = alignment * geometry
+            relative_error = torch.where(
+                valid, (aligned - target).abs() / target.clamp_min(1e-7),
+                torch.zeros_like(target))
+
+            # Fixed ranges: Z in [0, 2], GT/aZ in [0, max_predict_depth],
+            # relative error in [0, 20%]. Missing GT/error pixels are black.
+            raw_color = log_utils.colorize((geometry / 2.0).clamp(0, 1), colormap='viridis')
+            target_color = log_utils.colorize(
+                (target / self.max_predict_depth).clamp(0, 1), colormap='viridis') * valid
+            aligned_color = log_utils.colorize(
+                (aligned / self.max_predict_depth).clamp(0, 1), colormap='viridis')
+            error_color = log_utils.colorize(
+                (relative_error / 0.20).clamp(0, 1), colormap='inferno') * valid
+            panels = torch.cat([
+                image.clamp(0, 1), raw_color, target_color, aligned_color, error_color
+            ], dim=3)
+            # One sample per row preserves the requested five-column order.
+            summary_writer.add_image(
+                tag + '/scaleless_comparison/r{}'.format(resolution),
+                torchvision.utils.make_grid(panels, nrow=1), global_step=step)
+
+    def log_scale_summary(
+            self, summary_writer, tag, step, outputs, n_image,
+            image=None, ground_truth=None):
         '''Use one color range across all five levels of each representation.'''
         with torch.no_grad():
             for name, maps in outputs.items():
@@ -466,6 +505,10 @@ class DepthCompletionModel(object):
                         key + '/spatial_std',
                         value.flatten(1).std(dim=1, unbiased=False).mean(),
                         global_step=step)
+                    if name == 'scaleless_depths' and image is not None and ground_truth is not None:
+                        self.log_scaleless_comparison(
+                            summary_writer, tag, step, resolution,
+                            image[:n_image], value, ground_truth[:n_image])
 
     def log_summary(self,
                     summary_writer,
@@ -686,7 +729,8 @@ class DepthCompletionModel(object):
         # Log scalars to tensorboard
         if scale_outputs is not None:
             self.log_scale_summary(
-                summary_writer, tag, step, scale_outputs, n_image_per_summary)
+                summary_writer, tag, step, scale_outputs, n_image_per_summary,
+                image=image0, ground_truth=ground_truth0)
         for (name, value) in scalars.items():
             summary_writer.add_scalar(tag + '_' + name, value, global_step=step)
 

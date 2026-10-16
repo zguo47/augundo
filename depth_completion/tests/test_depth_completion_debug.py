@@ -242,6 +242,8 @@ class DepthDebugTest(unittest.TestCase):
                     prefix = 'train' if phase == 'train' else 'eval'
                     self.assertIn(prefix + '/scaleless_depths/r0', events.Tags()['images'])
                     self.assertIn(prefix + '/scale_maps/r4', events.Tags()['images'])
+                    self.assertIn(prefix + '/scaleless_comparison/r0', events.Tags()['images'])
+                    self.assertIn(prefix + '/scaleless_comparison/r4', events.Tags()['images'])
                     if phase == 'train':
                         self.assertIn('train_loss_si_r3', events.Tags()['scalars'])
                         self.assertIn('train_loss_log_l1_r0', events.Tags()['scalars'])
