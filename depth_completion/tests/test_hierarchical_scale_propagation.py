@@ -327,7 +327,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         metric = [torch.ones_like(target) * (3. + r) for r in range(4)]
         outputs = [target] + geometry + scale + metric
         loss, info = wrapper.compute_loss_supervised(target, outputs, {})
-        expected = sum(torch.log(torch.tensor(2. + r)) / (4 ** r) for r in range(4))
+        expected = sum(torch.tensor(1. + r) / (4 ** r) for r in range(4))
         torch.testing.assert_close(loss, expected)
         self.assertEqual(float(info['loss_si']), 0.)
 

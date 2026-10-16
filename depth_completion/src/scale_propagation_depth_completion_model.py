@@ -80,8 +80,10 @@ class ScalePropagationDepthCompletionModel(object):
             # SI receives the undetached, geometrically aligned prediction.
             scale_invariant = loss_utils.scale_invariant_loss_func(
                 src=geometry, tgt=target_depth, w=validity)
-            metric_loss = loss_utils.log_l1_loss_func(
-                src=metric, tgt=target_depth, w=validity)
+            metric_loss = loss_utils.l1_loss_func(
+                src=metric, tgt=target_depth,
+                w=validity / validity.mean(
+                    dim=[1, 2, 3], keepdim=True).clamp_min(loss_utils.EPSILON))
             weight = 1.0 / (4 ** resolution)
             loss_si = loss_si + weight * scale_invariant
             loss_log_l1 = loss_log_l1 + weight * metric_loss
