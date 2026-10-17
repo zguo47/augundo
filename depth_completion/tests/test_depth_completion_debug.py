@@ -247,6 +247,8 @@ class DepthDebugTest(unittest.TestCase):
                     if phase == 'train':
                         self.assertIn('train_loss_si_r3', events.Tags()['scalars'])
                         self.assertIn('train_loss_log_l1_r0', events.Tags()['scalars'])
+                        self.assertIn('train_loss_si_r4', events.Tags()['scalars'])
+                        self.assertIn('train_loss_log_l1_r4', events.Tags()['scalars'])
             checkpoints = []
             for enabled in ['false', 'true']:
                 path = next((root / enabled).glob('checkpoints-1*'))

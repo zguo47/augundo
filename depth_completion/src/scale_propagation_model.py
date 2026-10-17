@@ -553,4 +553,4 @@ class ScalePropagationDepthModel(nn.Module):
             metric_depths_for_loss=[
                 geometry.detach() * metric_scale
                 for geometry, metric_scale in zip(
-                    scaleless_depths[:4], scale_maps[:4])])
+                    scaleless_depths, scale_maps)])

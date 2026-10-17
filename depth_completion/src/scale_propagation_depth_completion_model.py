@@ -46,7 +46,7 @@ class ScalePropagationDepthCompletionModel(object):
             return output_depth
         # Flat, full-resolution tensors follow the repository's transform API.
         # Reverse geometric augmentation on every map before computing losses.
-        # Layout: final depth, five Z maps, five M maps, four metric-loss maps.
+        # Layout: final depth, five Z maps, five M maps, five metric-loss maps.
         maps = output_depth['scaleless_depths'] + output_depth['scale_maps'] + \
             output_depth['metric_depths_for_loss']
         return [output_depth['depth']] + [
@@ -60,7 +60,7 @@ class ScalePropagationDepthCompletionModel(object):
         return dict(scaleless_depths=outputs[1:6], scale_maps=outputs[6:11])
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
-        '''Supervise the four decoder geometries and their metric products.'''
+        '''Supervise all five geometries and metric products, including bottom.'''
 
         validity = (target_depth > 0.0).to(target_depth.dtype)
         target_depth = torch.where(
@@ -75,15 +75,13 @@ class ScalePropagationDepthCompletionModel(object):
         loss_log_l1 = target_depth.new_zeros(())
         loss_info = {}
         for resolution, (geometry, metric) in enumerate(zip(
-                output_depth[1:5], output_depth[11:15])):
+                output_depth[1:6], output_depth[11:16])):
             # The model already detached geometry in these metric products;
             # SI receives the undetached, geometrically aligned prediction.
             scale_invariant = loss_utils.scale_invariant_loss_func(
                 src=geometry, tgt=target_depth, w=validity)
-            metric_loss = loss_utils.l1_loss_func(
-                src=metric, tgt=target_depth,
-                w=validity / validity.mean(
-                    dim=[1, 2, 3], keepdim=True).clamp_min(loss_utils.EPSILON))
+            metric_loss = loss_utils.log_l1_loss_func(
+                src=metric, tgt=target_depth, w=validity)
             weight = 1.0 / (4 ** resolution)
             loss_si = loss_si + weight * scale_invariant
             loss_log_l1 = loss_log_l1 + weight * metric_loss

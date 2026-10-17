@@ -213,7 +213,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             sparse = torch.zeros(2, 1, 17, 25)
             sparse[1, 0, 7, 11] = 5.
             outputs = wrapper.forward_depth(image, sparse, return_all_outputs=True)
-            self.assertEqual(len(outputs), 15)
+            self.assertEqual(len(outputs), 16)
             self.assertTrue(all(value.shape == sparse.shape for value in outputs))
             self.assertTrue(all(torch.isfinite(value).all() for value in outputs))
             target = torch.rand_like(sparse) * 5 + 1.
@@ -222,7 +222,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             gradients = [p.grad for p in wrapper.parameters() if p.grad is not None]
             self.assertTrue(all(torch.isfinite(g).all() for g in gradients))
             self.assertGreater(float(wrapper.model_depth.coarse_scaleless_depth.conv.weight.grad.abs().sum()), 0.)
-            self.assertEqual(len([key for key in info if key.startswith('loss_si_r')]), 4)
+            self.assertEqual(len([key for key in info if key.startswith('loss_si_r')]), 5)
 
     def test_fresh_rejection_at_each_level_and_deterministic_eval(self):
         model = ScalePropagationDepthModel(n_channels=8).eval()
@@ -290,7 +290,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         outputs = model(torch.rand(1, 3, 17, 25), sparse, True)
         loss = sum(loss_utils.scale_invariant_loss_func(
             value, torch.rand_like(value) + 1., torch.ones_like(value))
-            for value in outputs['scaleless_depths'][:4])
+            for value in outputs['scaleless_depths'])
         loss.backward()
         for stage in [model] + list(model.decoder):
             for name in ['scale_update', 'propagation_map', 'rejection_map']:
@@ -324,12 +324,31 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         target = torch.ones(1, 1, 3, 4) * 2.
         geometry = [torch.ones_like(target) for _ in range(5)]
         scale = [torch.ones_like(target) for _ in range(5)]
-        metric = [torch.ones_like(target) * (3. + r) for r in range(4)]
+        metric = [torch.ones_like(target) * (3. + r) for r in range(5)]
         outputs = [target] + geometry + scale + metric
         loss, info = wrapper.compute_loss_supervised(target, outputs, {})
-        expected = sum(torch.tensor(1. + r) / (4 ** r) for r in range(4))
+        expected = sum(torch.log(torch.tensor(2. + r)) / (4 ** r) for r in range(5))
         torch.testing.assert_close(loss, expected)
         self.assertEqual(float(info['loss_si']), 0.)
+
+    def test_bottom_losses_contribute_with_one_over_256_weight(self):
+        wrapper = self.make_wrapper()
+        target = torch.ones(1, 1, 2, 2) * 2.
+        geometry = [torch.ones_like(target) for _ in range(4)] + [
+            torch.tensor([[[[0.5, 1.], [1., 1.5]]]], requires_grad=True)]
+        metric = [target.clone() for _ in range(4)] + [
+            torch.full_like(target, 5., requires_grad=True)]
+        outputs = [target] + geometry + [torch.ones_like(target)] * 5 + metric
+        loss, info = wrapper.compute_loss_supervised(target, outputs, {})
+        expected_si = loss_utils.scale_invariant_loss_func(
+            geometry[-1], target, torch.ones_like(target))
+        expected_metric = torch.log(torch.tensor(4.))
+        torch.testing.assert_close(info['loss_si_r4'], expected_si)
+        torch.testing.assert_close(info['loss_log_l1_r4'], expected_metric)
+        torch.testing.assert_close(loss, (expected_si + expected_metric) / 256.)
+        loss.backward()
+        self.assertGreater(float(geometry[-1].grad.abs().sum()), 0.)
+        self.assertGreater(float(metric[-1].grad.abs().sum()), 0.)
 
     def test_all_auxiliary_outputs_follow_geometric_reversal(self):
         wrapper = self.make_wrapper()
