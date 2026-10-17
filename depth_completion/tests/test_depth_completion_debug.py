@@ -102,6 +102,11 @@ class DepthDebugTest(unittest.TestCase):
     def test_sparse_counts_and_rejection_ratios_use_actual_selection(self):
         model = ScalePropagationDepthModel(
             n_channels=8, use_outlier_rejection=False).eval()
+        effective_weights = []
+        handles = [stage.scale_propagation.register_forward_pre_hook(
+            lambda module, inputs: effective_weights.append(
+                torch.sigmoid(inputs[4]) * inputs[5]))
+            for stage in [model] + list(model.decoder)]
         with tempfile.TemporaryDirectory() as directory:
             debug = self.make_debug(model, directory)
             sparse = torch.zeros(1, 1, 16, 16)
@@ -123,7 +128,16 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(len(scales), 5)
             self.assertTrue(all(not r['restores_anchors'] for r in scales))
             self.assertTrue(all(r['propagation_activation'] == 'sigmoid' for r in scales))
+            for record, weights in zip(scales, effective_weights):
+                self.assertIsNotNone(record['surface_compatibility'])
+                self.assertAlmostEqual(record['outgoing_weight_sum']['mean'],
+                                       float(weights.sum(dim=1).mean()), places=6)
+            for record, weights in zip(blocks, effective_weights[1:]):
+                self.assertAlmostEqual(record['outgoing_weight_mean'],
+                                       float(weights.mean()), places=6)
             self.assertTrue(all('scaleless_depth' in r and 'scale_map' in r for r in blocks))
+        for handle in handles:
+            handle.remove()
 
     def test_empty_ground_truth_does_not_crash_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:

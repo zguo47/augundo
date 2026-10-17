@@ -194,13 +194,69 @@ def normalize_rejection_input(feature, depth, sparse_depth):
     return torch.cat([feature, depth, sparse_depth], dim=1)
 
 
+class SurfaceCompatibility(nn.Module):
+    '''Compare both endpoints before allowing a source to send scale.'''
+
+    def __init__(self, n_channels):
+        super(SurfaceCompatibility, self).__init__()
+
+        n_pair_channels = max(1, n_channels // 4)
+        # Factor the first pair-MLP layer into source, destination, and depth
+        # projections. This avoids concatenating nine pairs of C-channel maps.
+        self.source_projection = Conv2d(
+            n_channels, n_pair_channels, kernel_size=1, activation_func=None)
+        self.destination_projection = Conv2d(
+            n_channels, n_pair_channels, kernel_size=1, activation_func=None)
+        self.geometry_projection = Conv2d(
+            1, n_pair_channels, kernel_size=1, activation_func=None)
+        self.activation = nn.LeakyReLU(negative_slope=0.10, inplace=True)
+        self.compatibility_projection = Conv2d(
+            n_pair_channels, 1, kernel_size=1, activation_func=None)
+
+    def forward(self, feature, scaleless_depth):
+        n_channel = feature.shape[1]
+        n_height, n_width = feature.shape[-2:]
+        # Normalize only the gate's feature inputs; encoder/decoder features
+        # themselves are unchanged. Geometry stays detached on the metric path.
+        feature = functional.layer_norm(
+            feature.permute(0, 2, 3, 1),
+            normalized_shape=(n_channel,)).permute(0, 3, 1, 2)
+        source = self.source_projection(feature)
+        destination = functional.pad(
+            self.destination_projection(feature), (1, 1, 1, 1))
+        log_depth = torch.log(scaleless_depth.detach().clamp_min(1e-7))
+        neighboring_log_depth = functional.pad(log_depth, (1, 1, 1, 1))
+
+        gates = []
+        for row in range(3):
+            for column in range(3):
+                if row == 1 and column == 1:
+                    # Self-messages cannot cross a surface boundary. Preserve
+                    # the existing learned center weight without attenuating it.
+                    gates.append(torch.ones_like(scaleless_depth))
+                    continue
+                # At source p, this slice reads q = p + (row - 1, column - 1).
+                # Channel order matches the outgoing 3 x 3 patches in fold.
+                target = destination[
+                    :, :, row:row + n_height, column:column + n_width]
+                depth_difference = torch.abs(log_depth - neighboring_log_depth[
+                    :, :, row:row + n_height, column:column + n_width])
+                pair = self.activation(
+                    source + target + self.geometry_projection(depth_difference))
+                gates.append(torch.sigmoid(self.compatibility_projection(pair)))
+        # B x 9 x H x W source-indexed permissions, computed once per level.
+        # Out-of-image messages are discarded by fold, as before.
+        return torch.cat(gates, dim=1)
+
+
 def propagate_scale(
         scale,
         scaleless_depth,
         sparse_depth,
         keep_mask,
         propagation_logits,
-        n_propagation_iterations=1):
+        n_propagation_iterations=1,
+        surface_compatibility=None):
     '''Inject accepted scale estimates once, then relay the persistent scale map.
 
     Arg(s):
@@ -216,6 +272,8 @@ def propagate_scale(
             B x 9 x H x W outgoing weights, indexed at the source pixel
         n_propagation_iterations : int
             number of neighboring exchanges at this resolution
+        surface_compatibility : torch.Tensor[float32] or None
+            B x 9 x H x W source-destination gates; None leaves weights unchanged
     Returns:
             torch.Tensor[float32] : B x 1 x H x W refined scale map
 
@@ -227,6 +285,9 @@ def propagate_scale(
     # Injection occurs only here. Neither iterations nor the return restore it.
     scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
     outgoing_weights = torch.sigmoid(propagation_logits)
+    if surface_compatibility is not None:
+        # The same gated weights must normalize and carry every scale message.
+        outgoing_weights = outgoing_weights * surface_compatibility
 
     # Each column of fold is one source pixel's 3 x 3 outgoing message patch.
     # Overlapping patches sum at their destinations. 
@@ -256,10 +317,12 @@ class ScalePropagation(nn.Module):
         super(ScalePropagation, self).__init__()
         self.n_propagation_iterations = n_propagation_iterations
 
-    def forward(self, scale, scaleless_depth, sparse_depth, keep_mask, logits):
+    def forward(
+            self, scale, scaleless_depth, sparse_depth, keep_mask, logits,
+            surface_compatibility=None):
         return propagate_scale(
             scale, scaleless_depth, sparse_depth, keep_mask, logits,
-            self.n_propagation_iterations)
+            self.n_propagation_iterations, surface_compatibility)
 
 
 def normalize_scaleless_depth(depth):
@@ -325,6 +388,7 @@ class PropagationDecoderBlock(nn.Module):
         # Start by retaining the inherited scale rather than changing it.
         nn.init.zeros_(self.scale_update.conv.weight)
         self.scale_propagation = ScalePropagation(n_propagation_iterations)
+        self.surface_compatibility = SurfaceCompatibility(n_channels)
 
         # Heads see features, current metric depth, and current sparse depth.
         # Both heads are freshly evaluated at each level
@@ -399,8 +463,10 @@ class PropagationDecoderBlock(nn.Module):
             keep_mask = (sparse_depth > 0.0).to(sparse_depth.dtype)
 
         propagation_logits = self.propagation_map(propagation_input)
+        surface_compatibility = self.surface_compatibility(feature, scaleless_depth)
         scale = self.scale_propagation(
-            scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits)
+            scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
+            surface_compatibility)
 
         # No exact measurement restoration: the next decoder receives learned,
         # propagated scale, and makes its own fresh rejection decisions.
@@ -449,6 +515,7 @@ class ScalePropagationDepthModel(nn.Module):
             activation_func=None)
         nn.init.zeros_(self.scale_update.conv.weight)
         self.scale_propagation = ScalePropagation(n_propagation_iterations[0])
+        self.surface_compatibility = SurfaceCompatibility(n_channels)
         self.propagation_map = Conv2d(
             n_channels + 2,
             9,
@@ -519,8 +586,10 @@ class ScalePropagationDepthModel(nn.Module):
         scale = scale.expand_as(scaleless_depth)
         scale = scale * torch.exp(torch.tanh(self.scale_update(coarse_feature)))
         propagation_logits = self.propagation_map(propagation_input)
+        surface_compatibility = self.surface_compatibility(coarse_feature, metric_geometry)
         scale = self.scale_propagation(
-            scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits)
+            scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits,
+            surface_compatibility)
 
         feature = coarse_feature
         scaleless_depths = [scaleless_depth]

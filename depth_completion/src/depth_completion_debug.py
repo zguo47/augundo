@@ -109,6 +109,7 @@ class DepthCompletionDebug(object):
         self.buckets = {}
         self.inverse_failures = 0
         self.rejection_observations = {}
+        self.propagation_observations = {}
         self.register_hooks()
 
     def emit(self, event, **values):
@@ -143,6 +144,7 @@ class DepthCompletionDebug(object):
                   loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
                                 ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..4'),
                   propagation_activation='sigmoid',
+                  surface_aware_propagation=hasattr(self.model, 'surface_compatibility'),
                   sparse_injection='once_per_level_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
@@ -199,6 +201,7 @@ class DepthCompletionDebug(object):
         self.active = active
         self.context = dict(phase=phase, step=int(step), sample=sample)
         self.rejection_observations = {}
+        self.propagation_observations = {}
 
     def register_hooks(self):
         def hook(name):
@@ -212,6 +215,11 @@ class DepthCompletionDebug(object):
                         feature, geometry, scale, logits, rejection, keep = output
                         depth = geometry * scale
                         weights = torch.sigmoid(logits.detach())
+                        weight_summary = self.propagation_observations.get(
+                            (name, str(depth.device)), dict(
+                                outgoing_weight_mean=float(weights.mean()),
+                                center_outgoing_weight=float(weights[:, 4].mean()),
+                                max_outgoing_weight=float(weights.max(1)[0].mean())))
                         sparse = self.sparse_at_resolution(inputs[4], depth.shape[-2:])
                         self.emit('decoder', level=name, device=str(depth.device),
                                   propagation_iterations=module.n_propagation_iterations,
@@ -222,9 +230,7 @@ class DepthCompletionDebug(object):
                                   feature=statistics(feature),
                                   preclamp_below_min=float((depth < self.minimum).float().mean()),
                                   preclamp_above_max=float((depth > self.maximum).float().mean()),
-                                  outgoing_weight_mean=float(weights.mean()),
-                                  center_outgoing_weight=float(weights[:, 4].mean()),
-                                  max_outgoing_weight=float(weights.max(1)[0].mean()),
+                                  **weight_summary,
                                   rejection_logits=statistics(rejection),
                                   keep_fraction=float(keep.float().mean()),
                                   keep_fraction_at_sparse=float(
@@ -260,11 +266,20 @@ class DepthCompletionDebug(object):
             if not self.active:
                 return
             with torch.no_grad():
-                scale, geometry, sparse, keep, logits = inputs
+                scale, geometry, sparse, keep, logits = inputs[:5]
                 target = sparse / geometry.detach().clamp_min(1e-7)
                 seeded = keep * target + (1.0 - keep) * scale
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
+                gates = inputs[5] if len(inputs) > 5 else None
+                if gates is not None:
+                    weights = weights * gates
+                # Retain only scalars for the subsequent decoder hook, never
+                # a feature tensor or computation graph. Key by replica device.
+                self.propagation_observations[(level, str(scale.device))] = dict(
+                    outgoing_weight_mean=float(weights.mean()),
+                    center_outgoing_weight=float(weights[:, 4].mean()),
+                    max_outgoing_weight=float(weights.max(1)[0].mean()))
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
                           scale_before_injection=statistics(scale),
@@ -277,6 +292,7 @@ class DepthCompletionDebug(object):
                           propagation_change=statistics(output - seeded),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),
                           center_outgoing_weight=statistics(weights[:, 4]),
+                          surface_compatibility=None if gates is None else statistics(gates),
                           propagation_activation='sigmoid',
                           restores_anchors=False)
         return observe
@@ -448,7 +464,7 @@ class DepthCompletionDebug(object):
         prediction_heads = {}
         for name, parameter in self.model.named_parameters():
             if not any(part in ['coarse_scaleless_depth', 'depth_update',
-                                'scale_update', 'propagation_map']
+                                'scale_update', 'propagation_map', 'surface_compatibility']
                        for part in name.split('.')):
                 continue
             key = name.split('.conv.')[0]
