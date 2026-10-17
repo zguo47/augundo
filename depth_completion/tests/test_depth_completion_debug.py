@@ -102,10 +102,9 @@ class DepthDebugTest(unittest.TestCase):
     def test_sparse_counts_and_rejection_ratios_use_actual_selection(self):
         model = ScalePropagationDepthModel(
             n_channels=8, use_outlier_rejection=False).eval()
-        effective_weights = []
+        propagation_inputs = []
         handles = [stage.scale_propagation.register_forward_pre_hook(
-            lambda module, inputs: effective_weights.append(
-                torch.sigmoid(inputs[4]) * inputs[5]))
+            lambda module, inputs: propagation_inputs.append(inputs))
             for stage in [model] + list(model.decoder)]
         with tempfile.TemporaryDirectory() as directory:
             debug = self.make_debug(model, directory)
@@ -128,11 +127,20 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(len(scales), 5)
             self.assertTrue(all(not r['restores_anchors'] for r in scales))
             self.assertTrue(all(r['propagation_activation'] == 'sigmoid' for r in scales))
-            for record, weights in zip(scales, effective_weights):
-                self.assertIsNotNone(record['surface_compatibility'])
+            for record, inputs in zip(scales, propagation_inputs):
+                weights = torch.sigmoid(inputs[4])
+                accepted = inputs[3] > 0
+                self.assertNotIn('surface_compatibility', record)
+                self.assertIn('accepted_scale_residual', record)
+                self.assertEqual(record['accepted_metric_residual_scope'], 'native_cell_geometry')
+                self.assertEqual(record['sparse_scale_coordinates'],
+                                 'original_selected_pixel_align_corners_true')
+                self.assertAlmostEqual(record['sparse_scale_target']['mean'],
+                                       float(inputs[5][accepted].double().mean()), places=6)
                 self.assertAlmostEqual(record['outgoing_weight_sum']['mean'],
                                        float(weights.sum(dim=1).mean()), places=6)
-            for record, weights in zip(blocks, effective_weights[1:]):
+            for record, inputs in zip(blocks, propagation_inputs[1:]):
+                weights = torch.sigmoid(inputs[4])
                 self.assertAlmostEqual(record['outgoing_weight_mean'],
                                        float(weights.mean()), places=6)
             self.assertTrue(all('scaleless_depth' in r and 'scale_map' in r for r in blocks))
