@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from scale_propagation_model import (
     FeatureGuidedScaleUpsampling,
+    PropagationDecoderBlock,
     ScalePropagationDepthModel,
     geometry_at_sparse_points,
     normalize_rejection_input,
@@ -393,6 +394,63 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             model.decoder[-1].scale_update.conv.weight.fill_(0.1)
             after = model(image, sparse, True)['scale_maps'][0]
         self.assertFalse(torch.equal(before, after))
+
+    def test_every_level_refines_after_propagation_and_restores_only_accepted_scales(self):
+        model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
+        observations, order = [], []
+        for level, stage in enumerate([model] + list(model.decoder)):
+            record = {}
+            observations.append(record)
+            with torch.no_grad():
+                stage.rejection_map.conv.weight.zero_()
+                bias = [-100., 100.] if level == 1 else [100., -100.]
+                stage.rejection_bias.copy_(torch.tensor(bias).reshape(1, 2, 1, 1))
+                stage.scale_update.conv.weight[0, -3, 1, 1] = 0.05
+            def propagated(module, inputs, output, record=record, level=level):
+                order.append(('propagate', level))
+                record.update(propagated=output, keep=inputs[3], ratio=inputs[5])
+            def refined(module, inputs, output, record=record, level=level):
+                order.append(('refine', level))
+                record.update(refinement_input=inputs[0], update=output)
+            stage.scale_propagation.register_forward_hook(propagated)
+            stage.scale_update.register_forward_hook(refined)
+        sparse = torch.zeros(1, 1, 33, 49)
+        sparse[0, 0, 9, 13] = 5.
+        with torch.no_grad():
+            outputs = model(torch.rand(1, 3, 33, 49), sparse, True)
+        self.assertEqual(order, [(operation, level) for level in range(5)
+                                 for operation in ['propagate', 'refine']])
+        for record, actual in zip(observations, reversed(outputs['scale_maps'])):
+            context, propagated = record['refinement_input'], record['propagated']
+            keep, ratio = record['keep'], record['ratio']
+            torch.testing.assert_close(context[:, -3:-2], propagated)
+            torch.testing.assert_close(context[:, -2:-1], keep * ratio)
+            torch.testing.assert_close(context[:, -1:], keep)
+            accepted, unmeasured = keep > 0, keep == 0
+            torch.testing.assert_close(actual[accepted], ratio[accepted])
+            expected = propagated * torch.exp(torch.tanh(record['update']))
+            torch.testing.assert_close(actual[unmeasured], expected[unmeasured])
+            self.assertTrue((actual[unmeasured] > propagated[unmeasured]).all())
+        self.assertEqual(int(observations[1]['keep'].sum()), 0)
+        torch.testing.assert_close(outputs['depth'][sparse > 0], sparse[sparse > 0])
+
+    def test_post_propagation_correction_trains_only_where_anchors_are_not_restored(self):
+        block = PropagationDecoderBlock(8, 1., False, max_predict_depth=100.)
+        updates = []
+        def observe(module, inputs, output):
+            output.retain_grad()
+            updates.append(output)
+        block.scale_update.register_forward_hook(observe)
+        sparse = torch.zeros(1, 1, 5, 7)
+        sparse[0, 0, 2, 3] = 5.
+        output = block(torch.rand(1, 8, 3, 4), torch.rand(1, 8, 5, 7),
+                       torch.ones(1, 1, 3, 4), torch.full((1, 1, 3, 4), 2.), sparse)
+        output[2].sum().backward()
+        gradient = updates[0].grad
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertTrue((gradient[sparse > 0] == 0).all())
+        self.assertTrue((gradient[sparse == 0] > 0).all())
+        self.assertGreater(float(block.scale_update.conv.weight.grad.abs().sum()), 0.)
 
     def test_metric_losses_do_not_train_geometry_heads(self):
         model = self.make_wrapper().model_depth

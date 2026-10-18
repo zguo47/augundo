@@ -397,12 +397,13 @@ class PropagationDecoderBlock(nn.Module):
             stride=1,
             activation_func=None)
         self.scale_update = Conv2d(
-            n_channels,
+            n_channels + 3,
             1,
             kernel_size=3,
             stride=1,
             activation_func=None)
-        # Start by retaining the inherited scale rather than changing it.
+        # Features, propagated scale, accepted scale observations, and keep mask
+        # predict a correction after diffusion. Start with no correction.
         nn.init.zeros_(self.scale_update.conv.weight)
         self.scale_propagation = ScalePropagation(n_propagation_iterations)
 
@@ -455,7 +456,6 @@ class PropagationDecoderBlock(nn.Module):
         # SI objectives directly train this prediction and its preceding maps.
         scaleless_depth = normalize_scaleless_depth(
             scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
-        scale = scale * torch.exp(torch.tanh(self.scale_update(feature)))
         # Metric heads see current metric context without a gradient into Z.
         depth = scaleless_depth.detach() * scale
 
@@ -484,8 +484,17 @@ class PropagationDecoderBlock(nn.Module):
             scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
 
-        # No exact measurement restoration: the next decoder receives learned,
-        # propagated scale, and makes its own fresh rejection decisions.
+        # Correct the actual propagation result; no further diffusion at this
+        # level can average away this update. Rejected ratios are not supplied
+        # as trusted observations, and geometry remains detached in sparse_scale.
+        refinement_input = torch.cat([
+            feature, scale, keep_mask * sparse_scale, keep_mask
+        ], dim=1)
+        scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
+        # Restore accepted scale observations once, after refinement. At full
+        # resolution Z * scale then matches sparse depth before the final clamp.
+        # Coarser observations retain the existing original-coordinate ratios.
+        scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
 
@@ -524,11 +533,12 @@ class ScalePropagationDepthModel(nn.Module):
             stride=1,
             activation_func=None)
         self.scale_update = Conv2d(
-            n_channels,
+            n_channels + 3,
             1,
             kernel_size=3,
             stride=1,
             activation_func=None)
+        # Use the same post-propagation correction inputs as the decoder levels.
         nn.init.zeros_(self.scale_update.conv.weight)
         self.scale_propagation = ScalePropagation(n_propagation_iterations[0])
         self.propagation_map = Conv2d(
@@ -602,13 +612,18 @@ class ScalePropagationDepthModel(nn.Module):
             fallback_scale.detach()) / (
                 torch.sum(keep_mask, dim=[2, 3], keepdim=True) + 1.0)
         # Initialize a dense constant scale from the existing global estimate,
-        # then allow the head and sparse-guided propagation to refine it.
+        # then propagate before predicting a correction from the resulting map.
         scale = scale.expand_as(scaleless_depth)
-        scale = scale * torch.exp(torch.tanh(self.scale_update(coarse_feature)))
         propagation_logits = self.propagation_map(propagation_input)
         scale = self.scale_propagation(
             scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
+        refinement_input = torch.cat([
+            coarse_feature, scale, keep_mask * sparse_scale, keep_mask
+        ], dim=1)
+        scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
+        # Preserve accepted scale observations before the next decoder level.
+        scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
 
         feature = coarse_feature
         scaleless_depths = [scaleless_depth]

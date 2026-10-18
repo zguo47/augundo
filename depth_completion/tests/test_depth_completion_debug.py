@@ -126,6 +126,14 @@ class DepthDebugTest(unittest.TestCase):
             scales = [r for r in records if r['event'] == 'scale_propagation']
             self.assertEqual(len(scales), 5)
             self.assertTrue(all(not r['restores_anchors'] for r in scales))
+            self.assertTrue(all(r['output_stage'] == 'before_refinement_and_anchor_restoration'
+                                for r in scales))
+            refinements = [r for r in records if r['event'] == 'scale_refinement']
+            self.assertEqual(len(refinements), 5)
+            self.assertTrue(all(r['restores_anchors'] for r in refinements))
+            self.assertTrue(all(r['accepted_scale_residual']['min'] == 0. and
+                                r['accepted_scale_residual']['max'] == 0.
+                                for r in refinements))
             self.assertTrue(all(r['propagation_activation'] == 'sigmoid' for r in scales))
             for record, inputs in zip(scales, propagation_inputs):
                 weights = torch.sigmoid(inputs[4])

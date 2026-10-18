@@ -233,6 +233,20 @@ class DepthCompletionDebug(object):
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
                         self.emit('activation', name=name, values=statistics(value))
+                        if name == 'scale_update' or name.endswith('.scale_update'):
+                            scale = inputs[0][:, -3:-2]
+                            accepted_scale = inputs[0][:, -2:-1]
+                            keep = inputs[0][:, -1:]
+                            refined = scale * torch.exp(torch.tanh(value))
+                            restored = accepted_scale + (1.0 - keep) * refined
+                            level = 'bottom' if name == 'scale_update' else name.rsplit('.', 1)[0]
+                            self.emit('scale_refinement', level=level,
+                                      scale_before_refinement=statistics(scale),
+                                      scale_after_refinement=statistics(refined),
+                                      scale_after_anchor_restoration=statistics(restored),
+                                      accepted_scale_residual=statistics(
+                                          (restored - accepted_scale)[keep > 0.0]),
+                                      restores_anchors=True)
                         if name == 'model_output':
                             if value.requires_grad:
                                 value.register_hook(self.output_gradient)
@@ -267,6 +281,7 @@ class DepthCompletionDebug(object):
                 weights = torch.sigmoid(logits)
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
+                          output_stage='before_refinement_and_anchor_restoration',
                           scale_before_injection=statistics(scale),
                           scale_after_injection=statistics(seeded),
                           scale_after_propagation=statistics(output),
