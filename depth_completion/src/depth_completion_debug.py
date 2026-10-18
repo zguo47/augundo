@@ -143,8 +143,8 @@ class DepthCompletionDebug(object):
                   loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
                                 ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..4'),
                   propagation_activation='sigmoid',
-                  sparse_scale_coordinates='original_selected_pixel_align_corners_true',
-                  sparse_injection='once_per_level_without_anchor_restoration')
+                  sparse_scale_coordinates='all_original_sparse_points',
+                  sparse_injection='learned_point_to_pixel_once_per_level_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
                 continue
@@ -213,7 +213,7 @@ class DepthCompletionDebug(object):
                         feature, geometry, scale, logits, rejection, keep = output
                         depth = geometry * scale
                         weights = torch.sigmoid(logits.detach())
-                        sparse = self.sparse_at_resolution(inputs[4], depth.shape[-2:])
+                        n_point = inputs[4]['depth'].numel()
                         self.emit('decoder', level=name, device=str(depth.device),
                                   propagation_iterations=module.n_propagation_iterations,
                                   metric_depth=statistics(depth),
@@ -227,9 +227,9 @@ class DepthCompletionDebug(object):
                                   center_outgoing_weight=float(weights[:, 4].mean()),
                                   max_outgoing_weight=float(weights.max(1)[0].mean()),
                                   rejection_logits=statistics(rejection),
-                                  keep_fraction=float(keep.float().mean()),
+                                  keep_fraction=float(keep.sum() / max(1, n_point)),
                                   keep_fraction_at_sparse=float(
-                                      keep.sum() / (sparse > 0).sum().clamp_min(1)))
+                                      keep.sum() / max(1, n_point)))
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
                         self.emit('activation', name=name, values=statistics(value))
@@ -248,6 +248,9 @@ class DepthCompletionDebug(object):
             if name == 'scale_propagation' or name.endswith('.scale_propagation'):
                 level = 'bottom' if name == 'scale_propagation' else name.rsplit('.', 1)[0]
                 self.handles.append(module.register_forward_hook(self.scale_hook(level)))
+            if name == 'sparse_injection' or name.endswith('.sparse_injection'):
+                level = 'bottom' if name == 'sparse_injection' else name.rsplit('.', 1)[0]
+                self.handles.append(module.register_forward_hook(self.injection_hook(level)))
             if name.endswith('.scale_update'):
                 self.handles.append(module.register_forward_hook(hook(name)))
             if name == 'rejection_map' or name.endswith('.rejection_map'):
@@ -255,31 +258,52 @@ class DepthCompletionDebug(object):
                 parent = self.model if level == 'bottom' else self.model.decoder[int(level.split('.')[1])]
                 self.handles.append(module.register_forward_hook(self.rejection_hook(level, parent)))
 
-    def scale_hook(self, level):
-        '''Compare inherited/learned scale, one-time sparse injection, and diffusion.'''
+    def injection_hook(self, level):
+        '''Report individual sources and their weighted contributions to the prior.'''
         def observe(module, inputs, output):
             if not self.active:
                 return
             with torch.no_grad():
-                scale, geometry, sparse, keep, logits, target = inputs
-                seeded = keep * target + (1.0 - keep) * scale
+                scale, feature, source_feature, geometry, points, target, keep = inputs
+                injected, incoming_weight = output
+                self.emit('sparse_scale_injection', level=level,
+                          source_count=target.numel(),
+                          source_counts_per_image=torch.bincount(
+                              points['batch'], minlength=scale.shape[0]).cpu().tolist(),
+                          accepted_source_count=int((keep > 0.0).sum()),
+                          source_support='nine_nearby_pixels_per_original_point',
+                          sparse_scale_target=statistics(target[keep > 0.0]),
+                          scale_before_injection=statistics(scale),
+                          scale_after_injection=statistics(injected),
+                          incoming_source_weight=statistics(incoming_weight),
+                          pixels_receiving_sources=int((incoming_weight > 0.0).sum()))
+        return observe
+
+    def scale_hook(self, level):
+        '''Compare individual-point constraints with the relayed dense scale.'''
+        def observe(module, inputs, output):
+            if not self.active:
+                return
+            with torch.no_grad():
+                scale, geometry, points, keep, logits, target = inputs
+                sample = getattr(sys.modules[type(self.model).__module__], 'features_at_points')
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
+                point_scale = sample(output, points)[:, 0]
+                point_depth = sample(geometry * output, points)[:, 0]
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
-                          scale_before_injection=statistics(scale),
-                          scale_after_injection=statistics(seeded),
+                          source_count=target.numel(),
+                          scale_before_propagation=statistics(scale),
                           scale_after_propagation=statistics(output),
                           sparse_scale_target=statistics(target[accepted]),
-                          accepted_scale_residual=statistics((output - target)[accepted]),
-                          # This native-cell product is not geometry sampled
-                          # at the original selected measurement coordinates.
+                          accepted_scale_residual=statistics((point_scale - target)[accepted]),
                           accepted_metric_residual=statistics(
-                              (geometry * output - sparse)[accepted]),
-                          accepted_metric_residual_scope='native_cell_geometry',
-                          sparse_scale_coordinates='original_selected_pixel_align_corners_true',
+                              (point_depth - points['depth'])[accepted]),
+                          accepted_metric_residual_scope='interpolated_metric_at_original_points',
+                          sparse_scale_coordinates='all_original_sparse_points',
                           scaleless_depth=statistics(geometry),
-                          propagation_change=statistics(output - seeded),
+                          propagation_change=statistics(output - scale),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),
                           center_outgoing_weight=statistics(weights[:, 4]),
                           propagation_activation='sigmoid',
@@ -295,8 +319,8 @@ class DepthCompletionDebug(object):
                 logits = output + parent.rejection_bias.to(output.device)
                 margin = logits[:, 0:1] - logits[:, 1:2]
                 probability = functional.softmax(logits, dim=1)[:, 0:1]
-                # Rejection input ends in scaled sparse depth; positivity still
-                # identifies the same selected measurements as the metric map.
+                # Packed rejection entries correspond one-to-one to original
+                # points; positivity identifies measurements, never grid cells.
                 measured = inputs[0][:, -1:] > 0.0
                 self.emit('rejection', level=level,
                           measurement_count=int(measured.sum()),
@@ -311,28 +335,24 @@ class DepthCompletionDebug(object):
                 # using untransformed ground truth from the training batch.
                 if self.context['phase'] == 'validation':
                     self.rejection_observations[level] = dict(
-                        size=tuple(margin.shape[-2:]),
-                        keep=(margin >= 0.0).detach())
+                        keep=(margin >= 0.0).reshape(-1).detach())
         return observe
 
     def rejection_quality(self, sparse, target):
-        '''Compare selected measurements with GT at their original coordinates.
+        '''Compare every original measurement with GT at its own coordinates.
 
         These categories describe disagreement with the supplied ground truth;
         they are diagnostics, not outlier labels or additional training losses.
         Missing GT is excluded. No depth/validity averaging is used.
         '''
-        sampler = getattr(sys.modules[type(self.model).__module__],
-                          'sparse_depth_at_resolution', None)
-        if sampler is None:
-            return
         with torch.no_grad():
+            locations = torch.nonzero(sparse[:, 0] > 0.0, as_tuple=False)
+            batch, y, x = locations.unbind(dim=1)
+            sampled = sparse[batch, 0, y, x]
+            selected_target = target[batch, 0, y, x]
+            known = (selected_target > 0.0) & torch.isfinite(selected_target)
+            difference = torch.abs(sampled - selected_target)
             for level, observation in self.rejection_observations.items():
-                sampled, indices = sampler(sparse, observation['size'], return_indices=True)
-                selected_target = torch.gather(
-                    target.flatten(2), 2, indices.flatten(2)).reshape_as(sampled)
-                known = (sampled > 0.0) & (selected_target > 0.0) & torch.isfinite(selected_target)
-                difference = torch.abs(sampled - selected_target)
                 keep = observation['keep'].to(sparse.device)
                 categories = {
                     'all_with_ground_truth': known,
@@ -349,7 +369,7 @@ class DepthCompletionDebug(object):
                         count=count, kept=count - rejected, rejected=rejected,
                         rejection_fraction=None if count == 0 else rejected / count)
                 self.emit('rejection_quality', level=level,
-                          ground_truth_scope='original_selected_pixel',
+                          ground_truth_scope='all_original_sparse_points',
                           sparse_vs_target=errors(sampled, selected_target, array(known)),
                           categories=reports)
 
@@ -380,19 +400,26 @@ class DepthCompletionDebug(object):
         return functional.interpolate(sparse, size=output_size, mode='nearest')
 
     def sparse_levels(self, sparse):
-        '''Report sparse coverage using the same selection as the model.'''
+        '''Report all retained sources separately from occupied coarse cells.'''
         with torch.no_grad():
+            source = getattr(sys.modules[type(self.model).__module__], 'sparse_depth_to_points')(sparse)
+            coordinates = getattr(sys.modules[type(self.model).__module__], 'point_coordinates')
             h, w = sparse.shape[-2:]
+            empty_images = int(((sparse > 0).flatten(1).sum(1) == 0).sum())
             for level in range(5):
                 size = ((h + 2 ** level - 1) // 2 ** level,
                         (w + 2 ** level - 1) // 2 ** level)
-                sampled = self.sparse_at_resolution(sparse, size)
+                y, x = coordinates(source, size, sparse.dtype)
+                cell = source['batch'] * (size[0] * size[1]) + \
+                    y.round().long() * size[1] + x.round().long()
+                occupied = int(torch.unique(cell).numel())
                 self.emit('sparse_sampling', level=level, size=size,
-                          occupied_fraction=float((sampled > 0).float().mean()),
-                          measurement_count=int((sampled > 0).sum()),
-                          images_without_measurements=int(
-                              ((sampled > 0).flatten(1).sum(1) == 0).sum()),
-                          depth=statistics(sampled[sampled > 0]))
+                          occupied_fraction=occupied / (sparse.shape[0] * size[0] * size[1]),
+                          occupied_cell_count=occupied,
+                          measurement_count=source['depth'].numel(),
+                          representation='individual_original_points',
+                          images_without_measurements=empty_images,
+                          depth=statistics(source['depth']))
 
     def training_prediction(self, prediction, target, sparse, loss_info):
         if target is None:
@@ -453,7 +480,7 @@ class DepthCompletionDebug(object):
         prediction_heads = {}
         for name, parameter in self.model.named_parameters():
             if not any(part in ['coarse_scaleless_depth', 'depth_update',
-                                'scale_update', 'propagation_map']
+                                'scale_update', 'propagation_map', 'sparse_injection']
                        for part in name.split('.')):
                 continue
             key = name.split('.conv.')[0]

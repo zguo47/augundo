@@ -12,6 +12,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from scale_propagation_model import (
     ScalePropagationDepthModel,
+    SparseScaleInjection,
+    sparse_depth_to_points,
+    features_at_points,
+    point_scale_observations,
     geometry_at_sparse_points,
     normalize_rejection_input,
     propagate_scale,
@@ -51,185 +55,176 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         expected = torch.tensor([[[[3., 0., 0.], [0., 0., 7.]]]])
         self.assertTrue(torch.equal(sparse_depth_at_resolution(sparse, (2, 3)), expected))
 
-    def test_one_source_sends_absolute_scale_to_the_right(self):
-        scale = torch.full((1, 1, 5, 5), 2.)
-        geometry = torch.ones_like(scale) * 0.5
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 2, 2] = 3.
-        logits = torch.full((1, 9, 5, 5), -100.)
-        logits[0, 5, 2, 2] = 100.
-        result = propagate_scale(scale, sparse / geometry, (sparse > 0).float(), logits)
-        expected = scale.clone()
-        # Sparse scale is 3 / 0.5 = 6; the right pixel combines scales 2 and 6.
-        expected[0, 0, 2, 2] = 6.
-        expected[0, 0, 2, 3] = 4.
-        torch.testing.assert_close(result, expected)
-
-    def test_geometry_sampling_matches_upsampling_and_gathering_original_pixels(self):
-        sparse = torch.zeros(2, 1, 5, 7)
-        sparse[0, 0, 1, 1] = 6.
-        sparse[0, 0, 4, 5] = 10.
-        sparse[1, 0, 0, 2] = 12.
-        sparse[1, 0, 3, 4] = 15.
-        geometry = torch.arange(1., 13.).reshape(2, 1, 2, 3).requires_grad_()
-        _, indices = sparse_depth_at_resolution(sparse, (2, 3), return_indices=True)
-        sampled = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
-        full_geometry = functional.interpolate(
-            geometry.detach(), size=sparse.shape[-2:], mode='bilinear', align_corners=True)
-        expected = torch.gather(full_geometry.flatten(2), 2, indices.flatten(2)).reshape_as(sampled)
+    def test_all_original_points_survive_coarse_cells_and_unequal_batch_counts(self):
+        sparse = torch.zeros(3, 1, 5, 7)
+        sparse[0, 0, 1, 1] = 10.
+        sparse[0, 0, 1, 2] = 60.
+        sparse[2, 0, 4, 6] = 7.
+        points = sparse_depth_to_points(sparse)
+        self.assertEqual(points['depth'].tolist(), [10., 60., 7.])
+        self.assertEqual(points['batch'].tolist(), [0, 0, 2])
+        self.assertEqual(points['x'].tolist(), [1, 2, 6])
+        self.assertEqual(points['y'].tolist(), [1, 1, 4])
+        geometry = torch.arange(1., 19.).reshape(3, 1, 2, 3)
+        sampled = features_at_points(geometry, points)[:, 0]
+        full = functional.interpolate(geometry, size=(5, 7), mode='bilinear', align_corners=True)
+        expected = full[points['batch'], 0, points['y'], points['x']]
         torch.testing.assert_close(sampled, expected)
-        self.assertFalse(sampled.requires_grad)
 
-    def test_geometry_sampling_handles_full_resolution_and_single_pixel_axes(self):
-        for input_size, level_size in [((3, 5), (3, 5)), ((1, 7), (1, 3)),
-                                       ((7, 1), (3, 1)), ((1, 1), (1, 1))]:
-            sparse = torch.ones(2, 1, *input_size)
-            geometry = torch.rand(2, 1, *level_size) + 0.5
-            _, indices = sparse_depth_at_resolution(sparse, level_size, return_indices=True)
-            sampled = geometry_at_sparse_points(geometry, indices, input_size)
-            full_geometry = functional.interpolate(
-                geometry, size=input_size, mode='bilinear', align_corners=True)
-            expected = torch.gather(full_geometry.flatten(2), 2, indices.flatten(2)).reshape_as(sampled)
-            torch.testing.assert_close(sampled, expected)
-
-    def test_aligned_scale_ratio_is_injected_directly_without_redivision(self):
+    def test_per_point_rejection_distinguishes_two_measurements_in_one_coarse_cell(self):
+        model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
+        with torch.no_grad():
+            model.rejection_map.conv.weight.zero_()
+            model.rejection_map.conv.weight[0, -1, 0, 0] = -4.
+            model.rejection_bias.copy_(torch.tensor([1., 0.]).reshape(1, 2, 1, 1))
         sparse = torch.zeros(1, 1, 4, 4)
-        sparse[0, 0, 1, 1] = 6.
-        geometry = torch.tensor([[[[1., 3.], [2., 4.]]]])
-        selected, indices = sparse_depth_at_resolution(sparse, (2, 2), return_indices=True)
-        sampled = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
-        # At original pixel (1, 1), interpolated Z is 2, not coarse-cell Z = 1.
-        self.assertAlmostEqual(float(sampled[0, 0, 0, 0]), 2., places=6)
-        target = selected / sampled.clamp_min(1e-7)
-        scale = torch.full_like(geometry, 2.)
-        logits = torch.full((1, 9, 2, 2), -100.)
-        propagated = propagate_scale(scale, target, (selected > 0).float(), logits)
-        expected = scale.clone()
-        expected[0, 0, 0, 0] = 3.
-        torch.testing.assert_close(propagated, expected)
-        self.assertNotEqual(float(target[0, 0, 0, 0]), float((selected / geometry)[0, 0, 0, 0]))
+        sparse[0, 0, 1, 1], sparse[0, 0, 1, 2] = 10., 60.
+        points = sparse_depth_to_points(sparse)
+        ratio, keep, logits = point_scale_observations(
+            torch.zeros(1, 8, 1, 1), torch.ones(1, 1, 1, 1), None, points,
+            model.rejection_map, model.rejection_bias, True, 1., False, 100.)
+        self.assertEqual(keep.tolist(), [1., 0.])
+        self.assertEqual(ratio.tolist(), [10., 60.])
+        self.assertEqual(logits.shape, (1, 2, 1, 2))
 
-    def test_every_level_uses_aligned_ratios_and_bottom_reuses_them_for_initialization(self):
+    def test_fine_pixels_can_choose_different_sources_from_the_same_coarse_region(self):
+        injection = SparseScaleInjection(n_channels=4)
+        with torch.no_grad():
+            injection.query_projection.conv.weight.zero_()
+            injection.source_projection.conv.weight.zero_()
+            injection.query_projection.conv.weight[0, 0, 0, 0] = 10.
+            injection.source_projection.conv.weight[0, 0, 0, 0] = 10.
+        sparse = torch.zeros(1, 1, 4, 4)
+        sparse[0, 0, 1, 1], sparse[0, 0, 1, 2] = 10., 60.
+        points = sparse_depth_to_points(sparse)
+        feature = torch.zeros(1, 4, 4, 4)
+        feature[:, 0, :, :2], feature[:, 1, :, :2] = 1., -1.
+        feature[:, 0, :, 2:], feature[:, 1, :, 2:] = -1., 1.
+        geometry = torch.ones(1, 1, 4, 4)
+        geometry[:, :, :, 2:] = 2.
+        targets = points['depth'] / features_at_points(geometry, points)[:, 0]
+        self.assertEqual(targets.tolist(), [10., 30.])
+        # Both points remain present even when the preceding map is one cell.
+        coarse, _ = injection(torch.full((1, 1, 1, 1), 2.), feature[:, :, :1, :1],
+                              feature, torch.ones(1, 1, 1, 1), points, targets,
+                              torch.ones_like(targets))
+        result, weights = injection(torch.full_like(geometry, 2.), feature, feature,
+                                    geometry, points, targets, torch.ones_like(targets))
+        self.assertEqual(points['depth'].numel(), 2)
+        self.assertEqual(coarse.shape, (1, 1, 1, 1))
+        self.assertAlmostEqual(float(result[0, 0, 1, 1]), 6., places=5)
+        self.assertAlmostEqual(float(result[0, 0, 1, 2]), 16., places=5)
+        self.assertGreater(float(weights.sum()), 0.)
+
+    def test_point_injection_is_local_batch_isolated_and_excludes_rejected_sources(self):
+        injection = SparseScaleInjection(n_channels=4)
+        sparse = torch.zeros(2, 1, 5, 7)
+        sparse[0, 0, 0, 0] = 6.
+        points = sparse_depth_to_points(sparse)
+        feature, geometry = torch.zeros(2, 4, 5, 7), torch.ones(2, 1, 5, 7)
+        scale = torch.full_like(geometry, 2.)
+        result, weights = injection(scale, feature, feature, geometry, points,
+                                    points['depth'], torch.ones(1))
+        self.assertGreater(float(result[0, 0, 0, 0]), 2.)
+        torch.testing.assert_close(result[1], scale[1])
+        torch.testing.assert_close(result[0, :, 2:], scale[0, :, 2:])
+        torch.testing.assert_close(result[0, :, :, 2:], scale[0, :, :, 2:])
+        rejected, _ = injection(scale, feature, feature, geometry, points,
+                                points['depth'], torch.zeros(1))
+        torch.testing.assert_close(rejected, scale)
+
+    def test_injection_and_observations_train_sources_queries_and_keep_not_geometry(self):
+        torch.manual_seed(8)
+        injection = SparseScaleInjection(n_channels=8)
+        source = torch.randn(2, 8, 5, 7, requires_grad=True)
+        feature = torch.randn(2, 8, 3, 4, requires_grad=True)
+        geometry = (torch.rand(2, 1, 3, 4) + 0.5).requires_grad_()
+        scale = (torch.rand_like(geometry) + 1.).requires_grad_()
+        sparse = torch.zeros(2, 1, 5, 7)
+        sparse[0, 0, 1, 2], sparse[1, 0, 3, 4] = 6., 8.
+        points = sparse_depth_to_points(sparse)
+        targets = points['depth'] / features_at_points(geometry.detach(), points)[:, 0]
+        keep = torch.ones_like(targets, requires_grad=True)
+        result, _ = injection(scale, feature, source, geometry, points, targets, keep)
+        result.square().mean().backward()
+        self.assertIsNone(geometry.grad)
+        for value in (feature, source, scale, keep):
+            self.assertTrue(torch.isfinite(value.grad).all())
+            self.assertGreater(float(value.grad.abs().sum()), 0.)
+        for parameter in injection.parameters():
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.)
+
+    def test_every_level_reuses_all_points_and_global_initialization_counts_them_once(self):
         model = ScalePropagationDepthModel(n_channels=8, use_outlier_rejection=False).eval()
-        observed, raw_bottom = [], []
+        observed, raw_bottom, relays = [], [], []
         handles = [model.coarse_scaleless_depth.register_forward_hook(
             lambda module, inputs, output: raw_bottom.append(output))]
         for stage in [model] + list(model.decoder):
+            handles.append(stage.sparse_injection.register_forward_pre_hook(
+                lambda module, inputs: observed.append(inputs)))
             handles.append(stage.scale_propagation.register_forward_pre_hook(
-                lambda module, inputs: observed.append((module.n_propagation_iterations, inputs))))
+                lambda module, inputs: relays.append(module.n_propagation_iterations)))
         sparse = torch.zeros(2, 1, 17, 25)
-        sparse[0, 0, 7, 11] = 5.
-        sparse[1, 0, 16, 24] = 7.
-        with torch.no_grad():
-            model(torch.rand(2, 3, 17, 25), sparse)
+        sparse[0, 0, 1, 1], sparse[0, 0, 1, 2], sparse[1, 0, 16, 24] = 5., 9., 7.
+        # No model constraint path may reduce the source list with grid pooling.
+        with mock.patch('scale_propagation_model.sparse_depth_at_resolution', side_effect=AssertionError):
+            with torch.no_grad():
+                model(torch.rand(2, 3, 17, 25), sparse)
         for handle in handles:
             handle.remove()
-        self.assertEqual([iteration for iteration, _ in observed], [1, 2, 3, 4, 6])
-        for level, (_, inputs) in enumerate(observed):
-            scale, geometry, selected, keep, logits, ratio = inputs
-            expected_sparse, indices = sparse_depth_at_resolution(
-                sparse, geometry.shape[-2:], return_indices=True)
-            full_geometry = functional.interpolate(
-                geometry.detach(), size=sparse.shape[-2:], mode='bilinear', align_corners=True)
-            matched = torch.gather(full_geometry.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
-            torch.testing.assert_close(selected, expected_sparse)
-            epsilon = 1e-3 if level == 0 else 1e-7
-            torch.testing.assert_close(ratio, selected / matched.clamp_min(epsilon))
-            self.assertEqual(ratio.shape, scale.shape)
-        scale, _, _, keep, _, ratio = observed[0][1]
+        self.assertEqual(relays, [1, 2, 3, 4, 6])
+        self.assertEqual(len(observed), 5)
+        for level, inputs in enumerate(observed):
+            scale, feature, source, geometry, points, ratio, keep = inputs
+            self.assertIs(points, observed[0][4])
+            self.assertEqual(ratio.numel(), 3)
+            self.assertEqual(keep.tolist(), [1., 1., 1.])
+            full = functional.interpolate(geometry.detach(), size=(17, 25),
+                                          mode='bilinear', align_corners=True)
+            matched = full[points['batch'], 0, points['y'], points['x']]
+            torch.testing.assert_close(ratio, points['depth'] / matched.clamp_min(
+                1e-3 if level == 0 else 1e-7))
+        scale, _, _, _, points, ratio, keep = observed[0]
         fallback = (functional.softplus(raw_bottom[0]) + 1e-3).mean(dim=[2, 3], keepdim=True)
-        expected = ((keep * ratio).sum(dim=[2, 3], keepdim=True) + fallback) / (
-            keep.sum(dim=[2, 3], keepdim=True) + 1.)
-        torch.testing.assert_close(scale, expected.expand_as(scale))
-        self.assertFalse(any('surface_compatibility' in name for name in model.state_dict()))
+        expected = []
+        for batch in range(2):
+            selected = points['batch'] == batch
+            expected.append((ratio[selected].sum() + fallback[batch, 0, 0, 0]) / (selected.sum() + 1.))
+        torch.testing.assert_close(scale, torch.stack(expected)[:, None, None, None].expand_as(scale))
 
-    def test_scales_relay_beyond_the_original_source_neighborhood(self):
+    def test_dense_relay_sends_scale_without_reinjecting_sources(self):
         scale = torch.full((1, 1, 5, 7), 2.)
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 2, 2] = 6.
-        keep = (sparse > 0).float()
+        scale[0, 0, 2, 2] = 6.
         logits = torch.full((1, 9, 5, 7), -100.)
         logits[0, 5, 2, 2] = 100.
         logits[0, 5, 2, 3] = 100.
-        first = propagate_scale(scale, sparse, keep, logits, 1)
-        second = propagate_scale(scale, sparse, keep, logits, 2)
+        first = propagate_scale(scale, logits, 1)
+        second = propagate_scale(scale, logits, 2)
+        self.assertEqual(float(first[0, 0, 2, 3]), 4.)
         self.assertEqual(float(first[0, 0, 2, 4]), 2.)
         self.assertEqual(float(second[0, 0, 2, 4]), 3.)
-        # A rejected source can relay scale, but cannot inject its measurement.
-        sparse[0, 0, 2, 3] = 100.
-        torch.testing.assert_close(
-            propagate_scale(scale, sparse, keep, logits, 2), second)
 
-    def test_measurements_are_not_restored_during_or_after_propagation(self):
-        scale = torch.full((1, 1, 5, 5), 2.)
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 2, 2] = 6.
-        logits = torch.zeros(1, 9, 5, 5)
-        # Sigmoid(0) = 0.5. The center receives eight scales 2 and its own 6.
-        # Its new scale is (6 + 0.5 * (8 * 2 + 6)) / (1 + 9 * 0.5).
-        first = propagate_scale(
-            scale, sparse, (sparse > 0).float(), logits, 1)
-        self.assertAlmostEqual(float(first[0, 0, 2, 2]), 17. / 5.5, places=6)
-        second = propagate_scale(
-            scale, sparse, (sparse > 0).float(), logits, 2)
-        incoming = functional.fold(
-            (torch.sigmoid(logits) * first).reshape(1, 9, 25),
-            (5, 5), kernel_size=3, padding=1)
-        weight = functional.fold(torch.sigmoid(logits).reshape(1, 9, 25),
-                                 (5, 5), kernel_size=3, padding=1)
-        torch.testing.assert_close(second, (first + incoming) / (1 + weight))
-        self.assertNotEqual(float(second[0, 0, 2, 2]), 6.)
-
-    def test_no_messages_preserve_inherited_scale_except_once_injected_sources(self):
-        scale = torch.rand(1, 1, 5, 7) + 1.
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 2, 2] = 6.
-        logits = torch.full((1, 9, 5, 7), -100.)
-        expected = scale.clone()
-        expected[0, 0, 2, 2] = 6.
-        torch.testing.assert_close(
-            propagate_scale(scale, sparse,
-                            (sparse > 0).float(), logits, 6), expected)
-
-    def test_constant_scale_stays_constant_with_empty_or_rejected_sources(self):
-        scale = torch.full((2, 1, 5, 7), 3.)
-        geometry = torch.rand_like(scale) + 0.1
-        sparse = torch.full_like(scale, 50.)
-        logits = torch.randn(2, 9, 5, 7)
-        keep = torch.zeros_like(scale, requires_grad=True)
-        result = propagate_scale(scale, sparse / geometry, keep, logits, 6)
-        torch.testing.assert_close(result, scale)
-        result.sum().backward()
-        self.assertTrue(torch.isfinite(keep.grad).all())
-        self.assertGreater(float(keep.grad.abs().sum()), 0.)
-
-    def test_outgoing_boundary_messages_do_not_wrap(self):
-        scale = torch.full((1, 1, 3, 3), 2.)
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 0, 0] = 6.
-        logits = torch.full((1, 9, 3, 3), -100.)
+    def test_dense_relay_preserves_constants_and_does_not_wrap(self):
+        scale = torch.full((2, 1, 3, 5), 2.)
+        torch.testing.assert_close(propagate_scale(scale, torch.randn(2, 9, 3, 5), 6), scale)
+        scale[0, 0, 0, 0] = 6.
+        logits = torch.full((2, 9, 3, 5), -100.)
         logits[0, 0, 0, 0] = 100.
-        expected = scale.clone()
-        expected[0, 0, 0, 0] = 6.
-        torch.testing.assert_close(
-            propagate_scale(scale, sparse,
-                            (sparse > 0).float(), logits, 4), expected)
+        torch.testing.assert_close(propagate_scale(scale, logits, 4), scale)
 
-    def test_propagation_trains_scale_weights_and_keep_but_not_geometry(self):
-        scale = torch.full((1, 1, 5, 7), 2., requires_grad=True)
-        geometry = torch.ones_like(scale, requires_grad=True)
-        sparse = torch.zeros_like(scale)
-        sparse[0, 0, 2, 2] = 6.
-        keep = (sparse > 0).float().requires_grad_()
-        logits = torch.zeros(1, 9, 5, 7, requires_grad=True)
-        _, indices = sparse_depth_at_resolution(sparse, scale.shape[-2:], return_indices=True)
-        matched = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
-        result = propagate_scale(scale, sparse / matched.clamp_min(1e-7), keep, logits, 4)
-        result.sum().backward()
-        self.assertIsNone(geometry.grad)
-        for value in (scale, keep, logits):
+    def test_dense_relay_trains_weights_and_scale_and_does_not_restore_anchors(self):
+        scale = torch.full((1, 1, 5, 5), 2.)
+        scale[0, 0, 2, 2] = 6.
+        scale.requires_grad_()
+        logits = torch.zeros(1, 9, 5, 5, requires_grad=True)
+        result = propagate_scale(scale, logits, 1)
+        self.assertAlmostEqual(float(result[0, 0, 2, 2]), 17. / 5.5, places=6)
+        result.square().mean().backward()
+        for value in (scale, logits):
             self.assertTrue(torch.isfinite(value.grad).all())
             self.assertGreater(float(value.grad.abs().sum()), 0.)
+
 
     def test_rejection_input_normalizes_features_without_mutating_them(self):
         feature = torch.arange(8.).reshape(1, 8, 1, 1).expand(1, 8, 3, 4).clone()
@@ -245,7 +240,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         result[:, 0].sum().backward()
         self.assertTrue(torch.isfinite(feature.grad).all())
 
-    def test_only_rejection_receives_scaled_depth_at_every_level(self):
+    def test_rejection_uses_each_points_own_measurement_and_normalized_context(self):
         model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
         captured = []
         for stage in [model] + list(model.decoder):
@@ -256,16 +251,18 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                 lambda module, inputs, pair=pair: pair['propagation'].append(inputs[0].clone()))
             captured.append(pair)
         sparse = torch.zeros(1, 1, 17, 25)
-        sparse[0, 0, 7, 11] = 55.
+        sparse[0, 0, 7, 11], sparse[0, 0, 7, 12] = 55., 25.
+        points = sparse_depth_to_points(sparse)
         with torch.no_grad():
             model(torch.rand(1, 3, 17, 25), sparse)
         for level, pair in enumerate(captured):
             rejection, propagation = pair['rejection'][0], pair['propagation'][0]
             torch.testing.assert_close(rejection[:, :8].mean(dim=1),
                                        torch.zeros_like(rejection[:, 0]), atol=1e-5, rtol=0.)
-            torch.testing.assert_close(rejection[:, -1:], propagation[:, -1:] / 100.)
-            torch.testing.assert_close(
-                rejection[:, -2:-1], propagation[:, -2:-1] / (1. if level == 0 else 100.))
+            torch.testing.assert_close(rejection[:, -1:].reshape(-1), points['depth'] / 100.)
+            context = features_at_points(propagation[:, -1:], points)[:, 0]
+            torch.testing.assert_close(rejection[:, -2:-1].reshape(-1),
+                                       context / (1. if level == 0 else 100.))
 
     def test_rejection_masks_missing_points_and_has_finite_gradients(self):
         sparse = torch.tensor([[[[0., 3.], [4., 0.]]]])
@@ -374,7 +371,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             for value in outputs['scaleless_depths'])
         loss.backward()
         for stage in [model] + list(model.decoder):
-            for name in ['scale_update', 'propagation_map', 'rejection_map']:
+            for name in ['scale_update', 'propagation_map', 'rejection_map', 'sparse_injection']:
                 self.assertTrue(all(parameter.grad is None
                                     for parameter in getattr(stage, name).parameters()))
         self.assertGreater(float(model.coarse_scaleless_depth.conv.weight.grad.abs().sum()), 0.)
