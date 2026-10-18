@@ -384,14 +384,15 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertEqual(model.n_propagation_iterations, (1, 2, 3, 4, 6))
         self.assertEqual([block.n_propagation_iterations for block in model.decoder], [2, 3, 4, 6])
         for stage in [model] + list(model.decoder):
-            self.assertEqual(int(torch.count_nonzero(stage.scale_update.conv.weight)), 0)
+            self.assertEqual(int(torch.count_nonzero(
+                stage.scale_update.convolutions[-1].conv.weight)), 0)
 
     def test_scale_head_can_change_scale_without_sparse_measurements(self):
         model = ScalePropagationDepthModel(n_channels=8, use_outlier_rejection=False).eval()
         image, sparse = torch.rand(1, 3, 17, 25), torch.zeros(1, 1, 17, 25)
         with torch.no_grad():
             before = model(image, sparse, True)['scale_maps'][0]
-            model.decoder[-1].scale_update.conv.weight.fill_(0.1)
+            model.decoder[-1].scale_update.convolutions[-1].conv.weight.fill_(0.1)
             after = model(image, sparse, True)['scale_maps'][0]
         self.assertFalse(torch.equal(before, after))
 
@@ -399,19 +400,25 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
         observations, order = [], []
         for level, stage in enumerate([model] + list(model.decoder)):
-            record = {}
+            record = {'refinements': []}
             observations.append(record)
             with torch.no_grad():
                 stage.rejection_map.conv.weight.zero_()
                 bias = [-100., 100.] if level == 1 else [100., -100.]
                 stage.rejection_bias.copy_(torch.tensor(bias).reshape(1, 2, 1, 1))
-                stage.scale_update.conv.weight[0, -3, 1, 1] = 0.05
+                # Route the current scale through the nonlinear block so the
+                # second pass must see a different scale and discrepancy.
+                for convolution in stage.scale_update.convolutions:
+                    convolution.conv.weight.zero_()
+                stage.scale_update.convolutions[0].conv.weight[0, -4, 1, 1] = 1.
+                stage.scale_update.convolutions[1].conv.weight[0, 0, 1, 1] = 1.
+                stage.scale_update.convolutions[2].conv.weight[0, 0, 1, 1] = 0.05
             def propagated(module, inputs, output, record=record, level=level):
                 order.append(('propagate', level))
                 record.update(propagated=output, keep=inputs[3], ratio=inputs[5])
             def refined(module, inputs, output, record=record, level=level):
                 order.append(('refine', level))
-                record.update(refinement_input=inputs[0], update=output)
+                record['refinements'].append((inputs[0], output))
             stage.scale_propagation.register_forward_hook(propagated)
             stage.scale_update.register_forward_hook(refined)
         sparse = torch.zeros(1, 1, 33, 49)
@@ -419,14 +426,17 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         with torch.no_grad():
             outputs = model(torch.rand(1, 3, 33, 49), sparse, True)
         self.assertEqual(order, [(operation, level) for level in range(5)
-                                 for operation in ['propagate', 'refine']])
+                                 for operation in ['propagate', 'refine', 'refine']])
         for record, actual in zip(observations, reversed(outputs['scale_maps'])):
-            context, propagated = record['refinement_input'], record['propagated']
+            propagated = record['propagated']
             keep, ratio = record['keep'], record['ratio']
-            torch.testing.assert_close(context[:, -3:-2], propagated)
-            torch.testing.assert_close(context[:, -2:-1], keep * ratio)
-            torch.testing.assert_close(context[:, -1:], keep)
-            expected = propagated * torch.exp(torch.tanh(record['update']))
+            expected = propagated
+            for context, update in record['refinements']:
+                torch.testing.assert_close(context[:, -4:-3], expected)
+                torch.testing.assert_close(context[:, -3:-2], keep * ratio)
+                torch.testing.assert_close(context[:, -2:-1], keep)
+                torch.testing.assert_close(context[:, -1:], keep * (ratio - expected))
+                expected = expected * torch.exp(torch.tanh(update))
             torch.testing.assert_close(actual, expected)
             self.assertTrue((actual > propagated).all())
         self.assertEqual(int(observations[1]['keep'].sum()), 0)
@@ -443,11 +453,14 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         output = block(torch.rand(1, 8, 3, 4), torch.rand(1, 8, 5, 7),
                        torch.ones(1, 1, 3, 4), torch.full((1, 1, 3, 4), 2.), sparse)
         output[2].sum().backward()
-        gradient = updates[0].grad
-        self.assertTrue(torch.isfinite(gradient).all())
-        self.assertTrue((gradient[sparse > 0] > 0).all())
-        self.assertTrue((gradient[sparse == 0] > 0).all())
-        self.assertGreater(float(block.scale_update.conv.weight.grad.abs().sum()), 0.)
+        self.assertEqual(len(updates), 2)
+        for update in updates:
+            gradient = update.grad
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertTrue((gradient[sparse > 0] > 0).all())
+            self.assertTrue((gradient[sparse == 0] > 0).all())
+        self.assertGreater(float(
+            block.scale_update.convolutions[-1].conv.weight.grad.abs().sum()), 0.)
 
     def test_metric_losses_do_not_train_geometry_heads(self):
         model = self.make_wrapper().model_depth
@@ -459,7 +472,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         for stage, name in [(model, 'coarse_scaleless_depth')] + [
                 (block, 'depth_update') for block in model.decoder]:
             self.assertIsNone(getattr(stage, name).conv.weight.grad)
-        self.assertTrue(any(stage.scale_update.conv.weight.grad.abs().sum() > 0
+        self.assertTrue(any(stage.scale_update.convolutions[-1].conv.weight.grad.abs().sum() > 0
                             for stage in [model] + list(model.decoder)))
         self.assertTrue(all(
             block.scale_upsampling.weight_prediction.conv.weight.grad.abs().sum() > 0

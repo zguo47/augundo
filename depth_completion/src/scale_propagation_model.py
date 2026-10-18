@@ -367,6 +367,59 @@ class FeatureGuidedScaleUpsampling(nn.Module):
         return torch.sum(weights * neighbors, dim=1, keepdim=True)
 
 
+class ScaleUpdateBlock(nn.Module):
+    '''Predict a nonlinear log-scale correction from the current refinement state.'''
+
+    def __init__(self, n_channels):
+        super(ScaleUpdateBlock, self).__init__()
+
+        # C feature channels plus geometry, current scale, accepted ratios,
+        # keep mask, and the current discrepancy at accepted measurements.
+        self.convolutions = nn.Sequential(
+            Conv2d(
+                n_channels + 5,
+                n_channels,
+                kernel_size=3,
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
+            Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=3,
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)),
+            Conv2d(
+                n_channels,
+                1,
+                kernel_size=3,
+                stride=1,
+                activation_func=None))
+        # Both passes initially preserve the propagated scale exactly.
+        nn.init.zeros_(self.convolutions[-1].conv.weight)
+
+    def forward(self, feature):
+        return self.convolutions(feature)
+
+
+def refine_scale(feature, scaleless_depth, scale, sparse_scale, keep_mask, scale_update):
+    '''Apply two weight-shared corrections after propagation, without restoration.'''
+    for _ in range(2):
+        # Recompute feedback from the latest scale, not the original propagated
+        # map. Missing/rejected measurements contribute neither ratios nor error.
+        refinement_input = torch.cat([
+            feature,
+            scaleless_depth.detach(),
+            scale,
+            keep_mask * sparse_scale,
+            keep_mask,
+            keep_mask * (sparse_scale - scale)
+        ], dim=1)
+        # Do not detach scale: the second pass trains through the first pass.
+        # Geometry remains detached to preserve the existing SI/metric split.
+        scale = scale * torch.exp(torch.tanh(scale_update(refinement_input)))
+    return scale
+
+
 class PropagationDecoderBlock(nn.Module):
     '''Refine scaleless geometry and the inherited scale map at a finer level.'''
 
@@ -396,15 +449,7 @@ class PropagationDecoderBlock(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
-        self.scale_update = Conv2d(
-            n_channels + 3,
-            1,
-            kernel_size=3,
-            stride=1,
-            activation_func=None)
-        # Features, propagated scale, accepted scale observations, and keep mask
-        # predict a correction after diffusion. Start with no correction.
-        nn.init.zeros_(self.scale_update.conv.weight)
+        self.scale_update = ScaleUpdateBlock(n_channels)
         self.scale_propagation = ScalePropagation(n_propagation_iterations)
 
         # Heads see features, current metric depth, and current sparse depth.
@@ -487,10 +532,8 @@ class PropagationDecoderBlock(nn.Module):
         # Correct the actual propagation result; no further diffusion at this
         # level can average away this update. Rejected ratios are not supplied
         # as trusted observations, and geometry remains detached in sparse_scale.
-        refinement_input = torch.cat([
-            feature, scale, keep_mask * sparse_scale, keep_mask
-        ], dim=1)
-        scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
+        scale = refine_scale(
+            feature, scaleless_depth, scale, sparse_scale, keep_mask, self.scale_update)
         # Keep the learned correction at all pixels, including accepted sources.
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
@@ -529,14 +572,7 @@ class ScalePropagationDepthModel(nn.Module):
             kernel_size=3,
             stride=1,
             activation_func=None)
-        self.scale_update = Conv2d(
-            n_channels + 3,
-            1,
-            kernel_size=3,
-            stride=1,
-            activation_func=None)
-        # Use the same post-propagation correction inputs as the decoder levels.
-        nn.init.zeros_(self.scale_update.conv.weight)
+        self.scale_update = ScaleUpdateBlock(n_channels)
         self.scale_propagation = ScalePropagation(n_propagation_iterations[0])
         self.propagation_map = Conv2d(
             n_channels + 2,
@@ -615,10 +651,8 @@ class ScalePropagationDepthModel(nn.Module):
         scale = self.scale_propagation(
             scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
-        refinement_input = torch.cat([
-            coarse_feature, scale, keep_mask * sparse_scale, keep_mask
-        ], dim=1)
-        scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
+        scale = refine_scale(
+            coarse_feature, scaleless_depth, scale, sparse_scale, keep_mask, self.scale_update)
         # Pass the learned scale onward without restoring measurement values.
 
         feature = coarse_feature

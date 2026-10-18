@@ -129,7 +129,11 @@ class DepthDebugTest(unittest.TestCase):
             self.assertTrue(all(r['output_stage'] == 'before_refinement'
                                 for r in scales))
             refinements = [r for r in records if r['event'] == 'scale_refinement']
-            self.assertEqual(len(refinements), 5)
+            self.assertEqual(len(refinements), 10)
+            self.assertEqual([r['refinement_iteration'] for r in refinements], [1, 2] * 5)
+            for first, second in zip(refinements[::2], refinements[1::2]):
+                self.assertEqual(first['level'], second['level'])
+                self.assertEqual(first['scale_after_refinement'], second['scale_before_refinement'])
             self.assertTrue(all(not r['restores_anchors'] for r in refinements))
             self.assertTrue(all('scale_after_anchor_restoration' not in r
                                 for r in refinements))
@@ -145,7 +149,7 @@ class DepthDebugTest(unittest.TestCase):
                 self.assertAlmostEqual(record['sparse_scale_target']['mean'],
                                        float(inputs[5][accepted].double().mean()), places=6)
                 self.assertAlmostEqual(record['outgoing_weight_sum']['mean'],
-                                       float(weights.sum(dim=1).mean()), places=6)
+                                       float(weights.sum(dim=1).double().mean()), places=6)
             for record, inputs in zip(blocks, propagation_inputs[1:]):
                 weights = torch.sigmoid(inputs[4])
                 self.assertAlmostEqual(record['outgoing_weight_mean'],

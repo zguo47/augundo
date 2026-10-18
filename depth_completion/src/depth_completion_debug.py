@@ -109,6 +109,7 @@ class DepthCompletionDebug(object):
         self.buckets = {}
         self.inverse_failures = 0
         self.rejection_observations = {}
+        self.refinement_counts = {}
         self.register_hooks()
 
     def emit(self, event, **values):
@@ -200,6 +201,7 @@ class DepthCompletionDebug(object):
         self.active = active
         self.context = dict(phase=phase, step=int(step), sample=sample)
         self.rejection_observations = {}
+        self.refinement_counts = {}
 
     def register_hooks(self):
         def hook(name):
@@ -234,14 +236,20 @@ class DepthCompletionDebug(object):
                         value = output['depth'] if isinstance(output, dict) else output
                         self.emit('activation', name=name, values=statistics(value))
                         if name == 'scale_update' or name.endswith('.scale_update'):
-                            scale = inputs[0][:, -3:-2]
-                            accepted_scale = inputs[0][:, -2:-1]
-                            keep = inputs[0][:, -1:]
+                            scale = inputs[0][:, -4:-3]
+                            accepted_scale = inputs[0][:, -3:-2]
+                            keep = inputs[0][:, -2:-1]
                             refined = scale * torch.exp(torch.tanh(value))
                             level = 'bottom' if name == 'scale_update' else name.rsplit('.', 1)[0]
+                            key = (name, str(value.device))
+                            iteration = self.refinement_counts.get(key, 0) % 2 + 1
+                            self.refinement_counts[key] = iteration
                             self.emit('scale_refinement', level=level,
+                                      refinement_iteration=iteration,
                                       scale_before_refinement=statistics(scale),
                                       scale_after_refinement=statistics(refined),
+                                      accepted_scale_residual_before=statistics(
+                                          (scale - accepted_scale)[keep > 0.0]),
                                       accepted_scale_residual=statistics(
                                           (refined - accepted_scale)[keep > 0.0]),
                                       restores_anchors=False)
