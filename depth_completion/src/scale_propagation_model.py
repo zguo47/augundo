@@ -491,10 +491,7 @@ class PropagationDecoderBlock(nn.Module):
             feature, scale, keep_mask * sparse_scale, keep_mask
         ], dim=1)
         scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
-        # Restore accepted scale observations once, after refinement. At full
-        # resolution Z * scale then matches sparse depth before the final clamp.
-        # Coarser observations retain the existing original-coordinate ratios.
-        scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
+        # Keep the learned correction at all pixels, including accepted sources.
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
 
@@ -622,8 +619,7 @@ class ScalePropagationDepthModel(nn.Module):
             coarse_feature, scale, keep_mask * sparse_scale, keep_mask
         ], dim=1)
         scale = scale * torch.exp(torch.tanh(self.scale_update(refinement_input)))
-        # Preserve accepted scale observations before the next decoder level.
-        scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
+        # Pass the learned scale onward without restoring measurement values.
 
         feature = coarse_feature
         scaleless_depths = [scaleless_depth]

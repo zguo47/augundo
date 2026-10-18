@@ -395,7 +395,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             after = model(image, sparse, True)['scale_maps'][0]
         self.assertFalse(torch.equal(before, after))
 
-    def test_every_level_refines_after_propagation_and_restores_only_accepted_scales(self):
+    def test_every_level_refines_after_propagation_without_restoring_accepted_scales(self):
         model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
         observations, order = [], []
         for level, stage in enumerate([model] + list(model.decoder)):
@@ -426,15 +426,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             torch.testing.assert_close(context[:, -3:-2], propagated)
             torch.testing.assert_close(context[:, -2:-1], keep * ratio)
             torch.testing.assert_close(context[:, -1:], keep)
-            accepted, unmeasured = keep > 0, keep == 0
-            torch.testing.assert_close(actual[accepted], ratio[accepted])
             expected = propagated * torch.exp(torch.tanh(record['update']))
-            torch.testing.assert_close(actual[unmeasured], expected[unmeasured])
-            self.assertTrue((actual[unmeasured] > propagated[unmeasured]).all())
+            torch.testing.assert_close(actual, expected)
+            self.assertTrue((actual > propagated).all())
         self.assertEqual(int(observations[1]['keep'].sum()), 0)
-        torch.testing.assert_close(outputs['depth'][sparse > 0], sparse[sparse > 0])
 
-    def test_post_propagation_correction_trains_only_where_anchors_are_not_restored(self):
+    def test_post_propagation_correction_trains_at_accepted_and_unmeasured_pixels(self):
         block = PropagationDecoderBlock(8, 1., False, max_predict_depth=100.)
         updates = []
         def observe(module, inputs, output):
@@ -448,7 +445,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         output[2].sum().backward()
         gradient = updates[0].grad
         self.assertTrue(torch.isfinite(gradient).all())
-        self.assertTrue((gradient[sparse > 0] == 0).all())
+        self.assertTrue((gradient[sparse > 0] > 0).all())
         self.assertTrue((gradient[sparse == 0] > 0).all())
         self.assertGreater(float(block.scale_update.conv.weight.grad.abs().sum()), 0.)
 
