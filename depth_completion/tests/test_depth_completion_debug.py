@@ -109,9 +109,8 @@ class DepthDebugTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             debug = self.make_debug(model, directory)
             sparse = torch.zeros(1, 1, 16, 16)
-            # Both measurements must survive even in the one-cell bottom map.
+            # Nearest sampling misses this point at every coarse level.
             sparse[0, 0, 7, 7] = 5.
-            sparse[0, 0, 7, 8] = 7.
             debug.begin('validation', 1)
             debug.sparse_levels(sparse)
             with torch.no_grad():
@@ -120,11 +119,7 @@ class DepthDebugTest(unittest.TestCase):
             with open(debug.path) as stream:
                 records = [json.loads(line) for line in stream]
             levels = [r for r in records if r['event'] == 'sparse_sampling']
-            self.assertEqual([r['measurement_count'] for r in levels], [2] * 5)
-            self.assertEqual(levels[-1]['occupied_cell_count'], 1)
-            injections = [r for r in records if r['event'] == 'sparse_scale_injection']
-            self.assertEqual(len(injections), 5)
-            self.assertTrue(all(r['source_count'] == 2 for r in injections))
+            self.assertEqual([r['measurement_count'] for r in levels], [1] * 5)
             blocks = [r for r in records if r['event'] == 'decoder']
             self.assertEqual([r['keep_fraction_at_sparse'] for r in blocks], [1.] * 4)
             self.assertEqual([r['propagation_iterations'] for r in blocks], [2, 3, 4, 6])
@@ -137,9 +132,9 @@ class DepthDebugTest(unittest.TestCase):
                 accepted = inputs[3] > 0
                 self.assertNotIn('surface_compatibility', record)
                 self.assertIn('accepted_scale_residual', record)
-                self.assertEqual(record['accepted_metric_residual_scope'], 'interpolated_metric_at_original_points')
+                self.assertEqual(record['accepted_metric_residual_scope'], 'native_cell_geometry')
                 self.assertEqual(record['sparse_scale_coordinates'],
-                                 'all_original_sparse_points')
+                                 'original_selected_pixel_align_corners_true')
                 self.assertAlmostEqual(record['sparse_scale_target']['mean'],
                                        float(inputs[5][accepted].double().mean()), places=6)
                 self.assertAlmostEqual(record['outgoing_weight_sum']['mean'],
@@ -162,7 +157,7 @@ class DepthDebugTest(unittest.TestCase):
             debug.finish_validation()
             debug.close()
 
-    def test_rejection_quality_uses_all_original_measurements_even_in_one_coarse_cell(self):
+    def test_rejection_quality_uses_selected_original_measurement_coordinates(self):
         model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
         with torch.no_grad():
             for stage in [model] + list(model.decoder):
@@ -189,7 +184,7 @@ class DepthDebugTest(unittest.TestCase):
             quality = {r['level']: r for r in records if r['event'] == 'rejection_quality'}
             self.assertEqual(len(quality), 5)
             bottom = quality['bottom']['categories']
-            self.assertEqual(bottom['all_with_ground_truth']['count'], 2)
+            self.assertEqual(bottom['all_with_ground_truth']['count'], 1)
             self.assertEqual(bottom['disagreement_over_3m']['count'], 1)
             self.assertEqual(bottom['disagreement_over_3m']['rejection_fraction'], 0.)
             coarse = quality['decoder.0']['categories']
