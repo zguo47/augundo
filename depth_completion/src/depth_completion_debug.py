@@ -142,10 +142,10 @@ class DepthCompletionDebug(object):
                   propagation_iterations=getattr(self.model, 'n_propagation_iterations', None),
                   model=str(self.model),
                   loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
-                                ' + log1p_abs_error(Z_r * M_r, target))), r=0..4'),
+                                ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..4'),
                   propagation_activation='sigmoid',
                   sparse_scale_coordinates='original_selected_pixel_align_corners_true',
-                  sparse_injection='once_per_level_without_anchor_restoration')
+                  sparse_injection='anchor_messages_only_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
                 continue
@@ -236,9 +236,9 @@ class DepthCompletionDebug(object):
                         value = output['depth'] if isinstance(output, dict) else output
                         self.emit('activation', name=name, values=statistics(value))
                         if name == 'scale_update' or name.endswith('.scale_update'):
-                            scale = inputs[0][:, -4:-3]
-                            accepted_scale = inputs[0][:, -3:-2]
-                            keep = inputs[0][:, -2:-1]
+                            scale = inputs[0][:, -6:-5]
+                            accepted_scale = inputs[0][:, -5:-4]
+                            keep = inputs[0][:, -4:-3]
                             refined = scale * torch.exp(torch.tanh(value))
                             level = 'bottom' if name == 'scale_update' else name.rsplit('.', 1)[0]
                             key = (name, str(value.device))
@@ -276,31 +276,27 @@ class DepthCompletionDebug(object):
                 self.handles.append(module.register_forward_hook(self.rejection_hook(level, parent)))
 
     def scale_hook(self, level):
-        '''Compare inherited/learned scale, one-time sparse injection, and diffusion.'''
+        '''Report anchor-message diffusion separately from the inherited scale.'''
         def observe(module, inputs, output):
             if not self.active:
                 return
             with torch.no_grad():
                 scale, geometry, sparse, keep, logits, target = inputs
-                seeded = keep * target + (1.0 - keep) * scale
+                anchor_scale, support = output
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
                           output_stage='before_refinement',
-                          scale_before_injection=statistics(scale),
-                          scale_after_injection=statistics(seeded),
-                          scale_after_propagation=statistics(output),
+                          inherited_scale=statistics(scale),
+                          anchor_scale=statistics(anchor_scale[support > 1e-7]),
+                          anchor_support=statistics(support),
+                          supported_fraction=float((support > 1e-7).float().mean()),
                           sparse_scale_target=statistics(target[accepted]),
-                          accepted_scale_residual=statistics((output - target)[accepted]),
-                          # This native-cell product is not geometry sampled
-                          # at the original selected measurement coordinates.
-                          accepted_metric_residual=statistics(
-                              (geometry * output - sparse)[accepted]),
-                          accepted_metric_residual_scope='native_cell_geometry',
+                          accepted_scale_residual=statistics((anchor_scale - target)[accepted]),
+                          accepted_scale_residual_scope='anchor_message_before_refinement',
                           sparse_scale_coordinates='original_selected_pixel_align_corners_true',
                           scaleless_depth=statistics(geometry),
-                          propagation_change=statistics(output - seeded),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),
                           center_outgoing_weight=statistics(weights[:, 4]),
                           propagation_activation='sigmoid',

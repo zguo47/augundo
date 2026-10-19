@@ -122,7 +122,7 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual([r['measurement_count'] for r in levels], [1] * 5)
             blocks = [r for r in records if r['event'] == 'decoder']
             self.assertEqual([r['keep_fraction_at_sparse'] for r in blocks], [1.] * 4)
-            self.assertEqual([r['propagation_iterations'] for r in blocks], [2, 3, 4, 6])
+            self.assertEqual([r['propagation_iterations'] for r in blocks], [4, 6, 8, 12])
             scales = [r for r in records if r['event'] == 'scale_propagation']
             self.assertEqual(len(scales), 5)
             self.assertTrue(all(not r['restores_anchors'] for r in scales))
@@ -143,7 +143,10 @@ class DepthDebugTest(unittest.TestCase):
                 accepted = inputs[3] > 0
                 self.assertNotIn('surface_compatibility', record)
                 self.assertIn('accepted_scale_residual', record)
-                self.assertEqual(record['accepted_metric_residual_scope'], 'native_cell_geometry')
+                self.assertEqual(record['accepted_scale_residual_scope'], 'anchor_message_before_refinement')
+                self.assertIn('anchor_support', record)
+                self.assertGreaterEqual(record['supported_fraction'], 0.)
+                self.assertLessEqual(record['supported_fraction'], 1.)
                 self.assertEqual(record['sparse_scale_coordinates'],
                                  'original_selected_pixel_align_corners_true')
                 self.assertAlmostEqual(record['sparse_scale_target']['mean'],
