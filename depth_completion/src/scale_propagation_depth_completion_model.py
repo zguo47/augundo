@@ -76,8 +76,8 @@ class ScalePropagationDepthCompletionModel(object):
         loss_info = {}
         for resolution, (geometry, metric) in enumerate(zip(
                 output_depth[1:6], output_depth[11:16])):
-            # The model already detached geometry in these metric products;
-            # SI receives the undetached, geometrically aligned prediction.
+            # Metric products train both geometry and scale; SI also supervises
+            # the geometrically aligned scaleless prediction directly.
             scale_invariant = loss_utils.scale_invariant_loss_func(
                 src=geometry, tgt=target_depth, w=validity)
             metric_loss = loss_utils.log_l1_loss_func(

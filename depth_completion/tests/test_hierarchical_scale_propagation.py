@@ -462,7 +462,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertGreater(float(
             block.scale_update.convolutions[-1].conv.weight.grad.abs().sum()), 0.)
 
-    def test_metric_losses_do_not_train_geometry_heads(self):
+    def test_metric_losses_train_geometry_and_scale_heads(self):
         model = self.make_wrapper().model_depth
         sparse = torch.zeros(1, 1, 17, 25)
         sparse[:, :, 7, 11] = 5.
@@ -471,7 +471,10 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             for value in outputs['metric_depths_for_loss']).backward()
         for stage, name in [(model, 'coarse_scaleless_depth')] + [
                 (block, 'depth_update') for block in model.decoder]:
-            self.assertIsNone(getattr(stage, name).conv.weight.grad)
+            gradient = getattr(stage, name).conv.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(float(gradient.abs().sum()), 0.)
         self.assertTrue(any(stage.scale_update.convolutions[-1].conv.weight.grad.abs().sum() > 0
                             for stage in [model] + list(model.decoder)))
         self.assertTrue(all(

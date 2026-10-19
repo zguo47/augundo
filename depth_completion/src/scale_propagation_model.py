@@ -415,7 +415,7 @@ def refine_scale(feature, scaleless_depth, scale, sparse_scale, keep_mask, scale
             keep_mask * (sparse_scale - scale)
         ], dim=1)
         # Do not detach scale: the second pass trains through the first pass.
-        # Geometry remains detached to preserve the existing SI/metric split.
+        # Geometry is context only here; metric losses train it through Z * M.
         scale = scale * torch.exp(torch.tanh(scale_update(refinement_input)))
     return scale
 
@@ -497,8 +497,8 @@ class PropagationDecoderBlock(nn.Module):
             scale.detach(),
             sparse_depth
         ], dim=1))
-        # Geometry stays positive and mean-one at every resolution. Only the
-        # SI objectives directly train this prediction and its preceding maps.
+        # Geometry stays positive and mean-one at every resolution. Both SI
+        # and metric objectives directly train this prediction through outputs.
         scaleless_depth = normalize_scaleless_depth(
             scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
         # Metric heads see current metric context without a gradient into Z.
@@ -684,6 +684,6 @@ class ScalePropagationDepthModel(nn.Module):
             scaleless_depths=scaleless_depths,
             scale_maps=scale_maps,
             metric_depths_for_loss=[
-                geometry.detach() * metric_scale
+                geometry * metric_scale
                 for geometry, metric_scale in zip(
                     scaleless_depths, scale_maps)])

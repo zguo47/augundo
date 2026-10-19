@@ -142,7 +142,7 @@ class DepthCompletionDebug(object):
                   propagation_iterations=getattr(self.model, 'n_propagation_iterations', None),
                   model=str(self.model),
                   loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
-                                ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..4'),
+                                ' + log1p_abs_error(Z_r * M_r, target))), r=0..4'),
                   propagation_activation='sigmoid',
                   sparse_scale_coordinates='original_selected_pixel_align_corners_true',
                   sparse_injection='once_per_level_without_anchor_restoration')
