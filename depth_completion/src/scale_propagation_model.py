@@ -323,7 +323,8 @@ def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
 
 
 class FeatureGuidedScaleUpsampling(nn.Module):
-    '''Use finer encoder features to choose among four neighboring coarse scales.'''
+    '''Use finer encoder features to choose among four neighboring coarse scales
+    for scale map upsampling.'''
 
     def __init__(self, n_channels):
         super(FeatureGuidedScaleUpsampling, self).__init__()
@@ -343,7 +344,7 @@ class FeatureGuidedScaleUpsampling(nn.Module):
         _, _, fine_height, fine_width = skip.shape
 
         # Keep the existing align_corners=True coordinate convention. Only the
-        # scale map changes its interpolation rule; features and geometry do not.
+        # scale map changes its interpolation rule; features and scaleless d do not.
         y = torch.arange(fine_height, dtype=scale.dtype, device=scale.device)
         x = torch.arange(fine_width, dtype=scale.dtype, device=scale.device)
         y = y * (coarse_height - 1) / max(fine_height - 1, 1)
@@ -385,7 +386,7 @@ class ScaleUpdateBlock(nn.Module):
     def __init__(self, n_channels):
         super(ScaleUpdateBlock, self).__init__()
 
-        # C feature channels plus geometry, current scale, accepted ratios,
+        # C feature channels plus scaleless, current scale, accepted ratios,
         # keep mask, and the current discrepancy at accepted measurements;
         # two more channels contain propagated anchor scale and support.
         self.convolutions = nn.Sequential(
@@ -432,7 +433,7 @@ def refine_scale(
             anchor_support
         ], dim=1)
         # Do not detach scale: the second pass trains through the first pass.
-        # Geometry is context only; metric products use detached geometry.
+        # Scaleless is context only; metric products use detached scaleless.
         scale = scale * torch.exp(torch.tanh(scale_update(refinement_input)))
     return scale
 
@@ -514,8 +515,8 @@ class PropagationDecoderBlock(nn.Module):
             scale.detach(),
             sparse_depth
         ], dim=1))
-        # Geometry stays positive and mean-one at every resolution. SI directly
-        # trains geometry; metric products detach it for this ablation.
+        # Scaleless stays positive and mean-one at every resolution. SI directly
+        # trains scaleless; metric products detach it.
         scaleless_depth = normalize_scaleless_depth(
             scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
         # Metric heads see current metric context without a gradient into Z.
@@ -652,8 +653,8 @@ class ScalePropagationDepthModel(nn.Module):
             keep_mask = (coarse_sparse_depth > 0.0).to(sparse_depth.dtype)
 
         # Each accepted measurement proposes a metric scale d_sparse / scaleless.
-        # Pair that depth with geometry at its original location, not merely
-        # the geometry value at the coarse cell that contains the measurement.
+        # Pair that depth with scaleless depth at its original location, not merely
+        # the value at the coarse cell that contains the measurement.
         sparse_geometry = geometry_at_sparse_points(
             metric_geometry, measurement_indices, sparse_depth.shape[-2:])
         sparse_scale = coarse_sparse_depth / sparse_geometry.clamp_min(1e-3)
@@ -693,8 +694,7 @@ class ScalePropagationDepthModel(nn.Module):
             max=self.max_predict_depth)
         if not return_all_outputs:
             return depth
-        # Full resolution first. Explicit outputs also work with DataParallel;
-        # no retained per-forward graph or replica-local cache is needed.
+
         scaleless_depths = scaleless_depths[::-1]
         scale_maps = scale_maps[::-1]
         return dict(
