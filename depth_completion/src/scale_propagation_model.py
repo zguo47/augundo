@@ -112,28 +112,8 @@ class SharedEncoder(nn.Module):
         self.level0 = ConvolutionBlock(4, n_channels, stride=1)
         self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2)
         self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2)
-
-        # For the last two levels, there is one downsampling conv + 2 attention blocks.
-        self.level3_downsample = Conv2d(
-            n_channels,
-            n_channels,
-            kernel_size=3,
-            stride=2,
-            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
-        self.level4_downsample = Conv2d(
-            n_channels,
-            n_channels,
-            kernel_size=3,
-            stride=2,
-            activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True))
-        self.level3_attention = nn.ModuleList([
-            SelfAttentionBlock(n_channels, n_head)
-            for _ in range(2)
-        ])
-        self.level4_attention = nn.ModuleList([
-            SelfAttentionBlock(n_channels, n_head)
-            for _ in range(2)
-        ])
+        self.level3 = ConvolutionBlock(n_channels, n_channels, stride=2)
+        self.level4 = ConvolutionBlock(n_channels, n_channels, stride=2)
 
     def attention_level(self, feature, attention_blocks):
         n_batch, n_channel, n_height, n_width = feature.shape
@@ -156,12 +136,8 @@ class SharedEncoder(nn.Module):
         level0 = self.level0(feature)
         level1 = self.level1(level0)
         level2 = self.level2(level1)
-        level3 = self.attention_level(
-            self.level3_downsample(level2),
-            self.level3_attention)
-        level4 = self.attention_level(
-            self.level4_downsample(level3),
-            self.level4_attention)
+        level3 = self.level3(level2)
+        level4 = self.level4(level3)
 
         return [level0, level1, level2, level3, level4]
 

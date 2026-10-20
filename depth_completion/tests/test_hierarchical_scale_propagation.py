@@ -14,6 +14,7 @@ from scale_propagation_model import (
     FeatureGuidedScaleUpsampling,
     PropagationDecoderBlock,
     ScalePropagationDepthModel,
+    SharedEncoder,
     geometry_at_sparse_points,
     normalize_rejection_input,
     propagate_scale,
@@ -25,6 +26,25 @@ from utils.src.transforms import Transforms
 
 
 class HierarchicalScalePropagationTest(unittest.TestCase):
+
+    def test_encoder_uses_three_convolutions_per_level_without_attention_or_position(self):
+        encoder = SharedEncoder(n_channels=8, n_head=4)
+        with mock.patch('scale_propagation_model.add_position_encoding') as position, \
+                mock.patch('scale_propagation_model.SelfAttentionBlock.forward') as attention:
+            features = encoder(torch.rand(1, 3, 17, 25), torch.rand(1, 1, 17, 25))
+        position.assert_not_called()
+        attention.assert_not_called()
+        self.assertEqual([tuple(feature.shape) for feature in features], [
+            (1, 8, 17, 25), (1, 8, 9, 13), (1, 8, 5, 7),
+            (1, 8, 3, 4), (1, 8, 2, 2)])
+        for level in range(5):
+            convolutions = getattr(encoder, 'level{}'.format(level)).convolutions
+            self.assertEqual(len(convolutions), 3)
+            self.assertEqual([block.conv.stride for block in convolutions],
+                             [(1, 1) if level == 0 else (2, 2), (1, 1), (1, 1)])
+        sum(feature.square().mean() for feature in features).backward()
+        self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                            for parameter in encoder.parameters()))
 
     def test_guided_scale_initialization_matches_bilinear_for_arbitrary_shapes(self):
         upsampling = FeatureGuidedScaleUpsampling(n_channels=3)
