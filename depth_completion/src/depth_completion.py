@@ -90,7 +90,8 @@ def train(train_images_path,
           n_thread=8,
           debug_depth=False,
           debug_interval=500,
-          debug_max_samples=3):
+          debug_max_samples=3,
+          detach_scaleless_depth=True):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -272,7 +273,8 @@ def train(train_images_path,
         n_self_attention=n_self_attention,
         n_shift=n_shift,
         use_outlier_rejection=use_outlier_rejection,
-        device=device)
+        device=device,
+        detach_scaleless_depth=detach_scaleless_depth)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
 
@@ -294,6 +296,7 @@ def train(train_images_path,
         depth_debug.provenance(
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
+                detach_scaleless_depth=detach_scaleless_depth,
                 w_losses=dict(w_losses), learning_rates=learning_rates,
                 learning_schedule=learning_schedule, restore_paths=restore_paths,
                 accumulation=n_step_per_gradient_accumulation,
@@ -358,6 +361,9 @@ def train(train_images_path,
         # Weight settings
         parameters_depth_model=parameters_depth_model,
         parameters_pose_model=parameters_pose_model)
+
+    if 'scale_propagation' in model_name:
+        log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
 
     log_training_settings(
         log_path,

@@ -77,6 +77,8 @@ parser.add_argument('--n_shift',
     type=int, default=4, help='Number of regular/shifted attention pairs')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
+parser.add_argument('--detach_scaleless_depth',
+    type=parse_boolean, default=True, help='Detach scaleless depth in scale-propagation metric losses')
 
 # Training settings
 parser.add_argument('--learning_rates',
@@ -293,4 +295,5 @@ if __name__ == '__main__':
           n_thread=args.n_thread,
           debug_depth=args.debug_depth,
           debug_interval=args.debug_interval,
-          debug_max_samples=args.debug_max_samples)
+          debug_max_samples=args.debug_max_samples,
+          detach_scaleless_depth=args.detach_scaleless_depth)

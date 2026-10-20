@@ -539,6 +539,38 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             block.scale_upsampling.weight_prediction.conv.weight.grad.abs().sum() > 0
             for block in model.decoder))
 
+    def test_detach_flag_through_repo_wrapper_controls_only_metric_geometry_gradients(self):
+        from depth_completion_model import DepthCompletionModel
+        detached = DepthCompletionModel(
+            model_name='scale_propagation_kitti', network_modules=[],
+            min_predict_depth=1.5, max_predict_depth=100., device=torch.device('cpu'),
+            use_outlier_rejection=False, detach_scaleless_depth=True)
+        attached = DepthCompletionModel(
+            model_name='scale_propagation_kitti', network_modules=[],
+            min_predict_depth=1.5, max_predict_depth=100., device=torch.device('cpu'),
+            use_outlier_rejection=False, detach_scaleless_depth=False)
+        attached.model.model_depth.load_state_dict(detached.model.model_depth.state_dict())
+        image = torch.rand(1, 3, 17, 25)
+        sparse = torch.ones(1, 1, 17, 25) * 5.
+        outputs = []
+        for wrapper, detach in [(detached, True), (attached, False)]:
+            model = wrapper.model.model_depth
+            self.assertEqual(model.detach_scaleless_depth, detach)
+            result = wrapper.forward_depth(image, sparse, torch.ones_like(sparse), return_all_outputs=True)
+            outputs.append(result)
+            sum(torch.log1p((value - 3.).abs()).mean() for value in result[11:16]).backward()
+            for stage, name in [(model, 'coarse_scaleless_depth')] + [
+                    (block, 'depth_update') for block in model.decoder]:
+                gradient = getattr(stage, name).conv.weight.grad
+                if detach:
+                    self.assertIsNone(gradient)
+                else:
+                    self.assertIsNotNone(gradient)
+                    self.assertTrue(torch.isfinite(gradient).all())
+                    self.assertGreater(float(gradient.abs().sum()), 0.)
+        for a, b in zip(*outputs):
+            torch.testing.assert_close(a, b)
+
     def test_si_losses_do_not_train_scale_propagation_or_rejection_heads(self):
         model = self.make_wrapper(True).model_depth
         sparse = torch.zeros(1, 1, 17, 25)

@@ -29,7 +29,8 @@ class DepthCompletionModel(object):
                  n_self_attention=2,
                  n_shift=4,
                  use_outlier_rejection=True,
-                 device=torch.device('cuda')):
+                 device=torch.device('cuda'),
+                 detach_scaleless_depth=True):
 
         self.model_name = model_name
         self.network_modules = network_modules
@@ -61,7 +62,8 @@ class DepthCompletionModel(object):
                 min_predict_depth=min_predict_depth,
                 max_predict_depth=max_predict_depth,
                 use_outlier_rejection=use_outlier_rejection,
-                device=device)
+                device=device,
+                detach_scaleless_depth=detach_scaleless_depth)
         elif 'partition_attention_patch_token_ablation' in model_name:
             from partition_attention_patch_token_ablation_depth_completion_model import \
                 PartitionAttentionPatchTokenAblationDepthCompletionModel

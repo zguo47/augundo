@@ -104,7 +104,8 @@ class StageDiagnostics(object):
         self.emit('experiment_manifest', source_directory=destination, source_files=manifest,
                   rng_state_file='rng_start.pt',
                   dataset_order_sha256=identities, detach_sites=detach_sites,
-                  metric_geometry_detached='geometry.detach() * metric_scale' in model_source,
+                  metric_geometry_detached=getattr(
+                      self.model, 'detach_scaleless_depth', 'geometry.detach() * metric_scale' in model_source),
                   torch_initial_seed=torch.initial_seed(),
                   torch_rng_sha256=hashlib.sha256(torch.get_rng_state().numpy().tobytes()).hexdigest(),
                   numpy_rng_sha256=hashlib.sha256(repr(np.random.get_state()).encode()).hexdigest(),

@@ -409,7 +409,7 @@ def refine_scale(
             anchor_support
         ], dim=1)
         # Do not detach scale: the second pass trains through the first pass.
-        # Scaleless is context only; metric products use detached scaleless.
+        # Scaleless is context only; metric products follow detach_scaleless_depth.
         scale = scale * torch.exp(torch.tanh(scale_update(refinement_input)))
     return scale
 
@@ -492,7 +492,7 @@ class PropagationDecoderBlock(nn.Module):
             sparse_depth
         ], dim=1))
         # Scaleless stays positive and mean-one at every resolution. SI directly
-        # trains scaleless; metric products detach it.
+        # trains scaleless; metric products follow detach_scaleless_depth.
         scaleless_depth = normalize_scaleless_depth(
             scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
         # Metric heads see current metric context without a gradient into Z.
@@ -543,13 +543,15 @@ class ScalePropagationDepthModel(nn.Module):
                  n_head=4,
                  gumbel_temperature=1.0,
                  use_outlier_rejection=True,
-                 n_propagation_iterations=(2, 4, 6, 8, 12)):
+                 n_propagation_iterations=(2, 4, 6, 8, 12),
+                 detach_scaleless_depth=True):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
+        self.detach_scaleless_depth = detach_scaleless_depth
         # Iteration counts are ordered from the bottom to full resolution.
         # Coarse scales are denser; finer scales receive more exchanges.
         self.n_propagation_iterations = n_propagation_iterations
@@ -678,6 +680,6 @@ class ScalePropagationDepthModel(nn.Module):
             scaleless_depths=scaleless_depths,
             scale_maps=scale_maps,
             metric_depths_for_loss=[
-                geometry.detach() * metric_scale
+                (geometry.detach() if self.detach_scaleless_depth else geometry) * metric_scale
                 for geometry, metric_scale in zip(
                     scaleless_depths, scale_maps)])

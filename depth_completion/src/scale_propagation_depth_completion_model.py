@@ -15,13 +15,15 @@ class ScalePropagationDepthCompletionModel(object):
                  min_predict_depth=1.5,
                  max_predict_depth=100.0,
                  use_outlier_rejection=True,
-                 device=torch.device('cuda')):
+                 device=torch.device('cuda'),
+                 detach_scaleless_depth=True):
         del dataset_name, network_modules
 
         self.model_depth = ScalePropagationDepthModel(
             min_predict_depth=min_predict_depth,
             max_predict_depth=max_predict_depth,
-            use_outlier_rejection=use_outlier_rejection)
+            use_outlier_rejection=use_outlier_rejection,
+            detach_scaleless_depth=detach_scaleless_depth)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
@@ -76,7 +78,7 @@ class ScalePropagationDepthCompletionModel(object):
         loss_info = {}
         for resolution, (geometry, metric) in enumerate(zip(
                 output_depth[1:6], output_depth[11:16])):
-            # Metric products detach geometry and train scale; SI supervises
+            # Metric products optionally detach geometry; SI supervises
             # the geometrically aligned scaleless prediction directly.
             scale_invariant = loss_utils.scale_invariant_loss_func(
                 src=geometry, tgt=target_depth, w=validity)
