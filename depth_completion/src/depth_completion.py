@@ -628,6 +628,8 @@ def train(train_images_path,
 
             # Forward through the network
             # Inputs: augmented image, augmented sparse depth map, original (but aligned) validity map
+            if depth_debug is not None:
+                depth_debug.record_training_batch(input_image0.shape[0], epoch, micro_step)
             if is_debug_step:
                 depth_debug.inputs('network_input', input_image0, input_sparse_depth0)
                 depth_debug.sparse_levels(input_sparse_depth0)
@@ -677,6 +679,7 @@ def train(train_images_path,
             if is_debug_step:
                 depth_debug.training_prediction(
                     output_depth0[0], ground_truth0, sparse_depth0, loss_info)
+                depth_debug.gradient_objectives(loss_info)
 
             # Compute gradient and backpropagate
 
@@ -876,7 +879,7 @@ def validate(depth_model,
 
         if depth_debug is not None:
             depth_debug.begin('validation', step, sample=idx,
-                              active=idx < depth_debug.max_samples)
+                              active=idx in depth_debug.fixed_indices)
 
         # Move inputs to device
         inputs = [

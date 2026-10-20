@@ -15,10 +15,101 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from depth_completion_debug import DepthCompletionDebug
+from depth_completion_debug_analysis import anchor_distance, boundary_mask
 from scale_propagation_model import ScalePropagationDepthModel
 
 
 class DepthDebugTest(unittest.TestCase):
+    def test_distance_and_boundary_masks_ignore_missing_targets(self):
+        mask = np.zeros((5, 7), dtype=bool)
+        self.assertTrue(np.isinf(anchor_distance(mask)).all())
+        mask[2, 3] = True
+        self.assertEqual(anchor_distance(mask)[2, 5], 2.)
+        target = np.ones((5, 7))
+        target[:, :2] = 0
+        self.assertFalse(boundary_mask(target, target > 0).any())
+        target[:, 4:] = 3
+        self.assertTrue(boundary_mask(target, target > 0).any())
+
+    def test_stages_snapshots_probes_and_fixed_history(self):
+        model = ScalePropagationDepthModel(n_channels=8, use_outlier_rejection=False).eval()
+        image = torch.rand(1, 3, 17, 25)
+        sparse = torch.zeros(1, 1, 17, 25)
+        sparse[:, :, 7, 9] = 5.
+        target = torch.ones_like(sparse) * 6.
+        dataset = SimpleNamespace(image_paths=['fixed.png'])
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            rng = torch.get_rng_state().clone()
+            for step in (1000, 2000):
+                debug.start_validation(step)
+                debug.begin('validation', step, sample=0)
+                with torch.no_grad():
+                    output = model(image, sparse)
+                debug.validation_sample(0, image, sparse, target, output, 0., 100., dataset)
+                debug.finish_validation()
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            self.assertFalse(debug.trace)
+            snapshot = np.load(os.path.join(directory, 'debug', 'fixed_0.npz'))
+            self.assertIn('decoder.3__refinement_2__scale', snapshot.files)
+            self.assertIn('bottom__after_anchor_messages__outgoing_weights', snapshot.files)
+            self.assertIn('bottom__selected_indices', snapshot.files)
+            self.assertTrue(os.path.isfile(os.path.join(directory, 'debug', 'worst_0_stages.npz')))
+            with open(debug.path) as stream:
+                records = [json.loads(line) for line in stream]
+            stages = [r for r in records if r['event'] == 'stage_accuracy']
+            self.assertTrue(any(r['stage'] == 'before_upsampling' for r in stages))
+            self.assertTrue(any(r['stage'] == 'after_geometry_update' for r in stages))
+            self.assertTrue(any('accepted_anchor_distance_errors' in r for r in stages))
+            self.assertTrue(any('multiplier' in r for r in stages))
+            self.assertTrue(any(r['event'] == 'fixed_error_tracks' for r in records))
+            self.assertTrue(any(r['event'] == 'anchor_message_ablation' for r in records))
+            self.assertEqual(len([r for r in stages if r['step'] == 1000]), 56)
+            debug.close()
+
+    def test_objective_probe_preserves_backward_and_existing_accumulated_gradients(self):
+        from utils.src import loss_utils
+        model = ScalePropagationDepthModel(n_channels=8, use_outlier_rejection=False)
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            debug.begin('train', 1)
+            outputs = model(torch.rand(1, 3, 17, 25), torch.ones(1, 1, 17, 25) * 5, True)
+            z = outputs['scaleless_depths'][0]
+            metric = outputs['metric_depths_for_loss'][0]
+            si = loss_utils.scale_invariant_loss_func(z, torch.ones_like(z) * 6, torch.ones_like(z))
+            terms = dict(loss_si=si, loss_log_l1=torch.log1p((metric - 6).abs()).mean())
+            parameters = list(model.parameters())
+            for p in parameters:
+                p.grad = torch.ones_like(p)
+            state = torch.get_rng_state().clone()
+            expected = torch.autograd.grad(sum(terms.values()), parameters, allow_unused=True, retain_graph=True)
+            debug.gradient_objectives(terms)
+            self.assertTrue(all(torch.equal(p.grad, torch.ones_like(p)) for p in parameters))
+            sum(terms.values()).backward()
+            for p, g in zip(parameters, expected):
+                torch.testing.assert_close(p.grad, torch.ones_like(p) if g is None else 1 + g)
+            self.assertTrue(torch.equal(state, torch.get_rng_state()))
+            debug.close()
+
+    def test_stage_accuracy_uses_common_target_and_reports_real_improvement(self):
+        model = ScalePropagationDepthModel(n_channels=8)
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            debug.begin('validation', 1000, sample=0)
+            z = torch.ones(1, 1, 2, 3)
+            debug.capture_stage('bottom', 'initial_global_scale', z, z * 2)
+            debug.capture_stage('bottom', 'refinement_1', z, z * 4, multiplier=z * 2)
+            target = np.full((5, 7), 4., dtype=np.float32)
+            debug.analyze_stages(np.zeros((1, 3, 5, 7)), np.zeros_like(target),
+                                 target, target, np.ones_like(target, dtype=bool), {}, 'fixed_0')
+            before, after = debug.stage_reports
+            self.assertAlmostEqual(before['metric']['mae_mm'], 2000., places=4)
+            self.assertAlmostEqual(before['aligned_geometry']['mae_mm'], 0., places=4)
+            self.assertAlmostEqual(after['metric']['mae_mm'], 0., places=4)
+            self.assertEqual(after['change']['improved_fraction'], 1.)
+            self.assertAlmostEqual(after['change']['mean_absolute_error_change_m'], -2., places=6)
+            debug.close()
+
     def make_debug(self, model, directory):
         wrapper = SimpleNamespace(
             min_predict_depth=1.5, max_predict_depth=100.,
@@ -271,6 +362,13 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(sum(r['event'] == 'gradients_before_optimizer' for r in records), 1)
             self.assertEqual(sum(r['event'] == 'validation_sample' for r in records), 2)
             self.assertFalse((root / 'false/debug').exists())
+            manifest = next(r for r in records if r['event'] == 'experiment_manifest')
+            self.assertTrue(manifest['metric_geometry_detached'])
+            self.assertEqual(manifest['fixed_sample_indices'], [0])
+            self.assertTrue(Path(manifest['source_directory'], 'rng_start.pt').exists())
+            self.assertTrue(any(r['event'] == 'gradient_objectives' for r in records))
+            self.assertTrue(any(r['event'] == 'stage_accuracy' for r in records))
+            self.assertTrue(any(r['images_seen_since_start'] == 2 for r in records))
             from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
             for enabled in ['false', 'true']:
                 for phase in ['train', 'val']:

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 from PIL import Image
+from depth_completion_debug_analysis import StageDiagnostics, boundary_mask
 
 
 def array(value):
@@ -61,6 +62,9 @@ def errors(prediction, target, mask):
         squared_sum_m2=float(squared.sum()), mae_mm=float(1000 * absolute.mean()),
         rmse_mm=float(1000 * np.sqrt(squared.mean())), bias_m=float(delta.mean()),
         error_p50_p90_p99_m=np.percentile(absolute, [50, 90, 99]).tolist(),
+        error_p999_m=float(np.percentile(absolute, 99.9)),
+        fraction_over_0_1m=float(np.mean(absolute > 0.1)),
+        fraction_over_0_5m=float(np.mean(absolute > 0.5)),
         fraction_over_1m=float(np.mean(absolute > 1)),
         fraction_over_3m=float(np.mean(absolute > 3)),
         top_1pct_squared_error_share=float(tail.sum() / (squared.sum() + 1e-30)),
@@ -85,7 +89,7 @@ def serializable(value):
     return value
 
 
-class DepthCompletionDebug(object):
+class DepthCompletionDebug(StageDiagnostics):
     '''Write sampled internals and exhaustive validation error diagnostics.'''
 
     def __init__(self, wrapper, checkpoint_path, interval=500, max_samples=3):
@@ -110,11 +114,18 @@ class DepthCompletionDebug(object):
         self.inverse_failures = 0
         self.rejection_observations = {}
         self.refinement_counts = {}
+        self.initialize_analysis()
         self.register_hooks()
+        self.register_stage_hooks()
 
     def emit(self, event, **values):
+        if self.probing or event in ['activation', 'encoder']:
+            return
         with self.lock:
-            record = dict(time=time.time(), event=event, **self.context)
+            record = dict(time=time.time(), event=event, schema_version=2,
+                          run_id=self.run_id, elapsed_seconds=time.monotonic() - self.started_at,
+                          images_seen_since_start=self.images_seen,
+                          micro_batches_since_start=self.micro_batches_seen, **self.context)
             record.update(values)
             with open(self.path, 'a') as stream:
                 stream.write(json.dumps(serializable(record), allow_nan=False) + '\n')
@@ -124,6 +135,7 @@ class DepthCompletionDebug(object):
         sources = {}
         root = os.path.dirname(__file__)
         for path in [inspect.getfile(type(self.model)), __file__,
+                     inspect.getfile(StageDiagnostics),
                      os.path.join(root, 'depth_completion.py'),
                      os.path.join(root, 'scale_propagation_depth_completion_model.py'),
                      os.path.join(root, 'datasets.py'),
@@ -134,6 +146,7 @@ class DepthCompletionDebug(object):
             with open(path, 'rb') as stream:
                 sources[os.path.abspath(path)] = hashlib.sha256(stream.read()).hexdigest()
         git = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)
+        self.save_provenance(sources, settings, datasets)
         self.emit('configuration', argv=sys.argv, cwd=os.getcwd(),
                   git_head=git.stdout.strip(), torch_version=torch.__version__,
                   cuda_version=torch.version.cuda, source_sha256=sources,
@@ -141,8 +154,7 @@ class DepthCompletionDebug(object):
                   rejection_enabled=getattr(self.model, 'use_outlier_rejection', None),
                   propagation_iterations=getattr(self.model, 'n_propagation_iterations', None),
                   model=str(self.model),
-                  loss_formula=('sum_r(4**(-r) * (centered_log_error_variance(Z_r, target)'
-                                ' + log1p_abs_error(stopgrad(Z_r) * M_r, target))), r=0..4'),
+                  loss_definition='See captured loss_utils.py and model wrapper sources; detach sites in experiment_manifest',
                   propagation_activation='sigmoid',
                   sparse_scale_coordinates='original_selected_pixel_align_corners_true',
                   sparse_injection='anchor_messages_only_without_anchor_restoration')
@@ -202,6 +214,8 @@ class DepthCompletionDebug(object):
         self.context = dict(phase=phase, step=int(step), sample=sample)
         self.rejection_observations = {}
         self.refinement_counts = {}
+        self.trace = {}
+        self.anchor_context = {}
 
     def register_hooks(self):
         def hook(name):
@@ -210,7 +224,7 @@ class DepthCompletionDebug(object):
                     return
                 with torch.no_grad():
                     if name == 'encoder':
-                        self.emit('encoder', levels=[statistics(x) for x in output])
+                        return
                     elif name.startswith('decoder.') and name.count('.') == 1:
                         feature, geometry, scale, logits, rejection, keep = output
                         depth = geometry * scale
@@ -222,7 +236,6 @@ class DepthCompletionDebug(object):
                                   scaleless_depth=statistics(geometry),
                                   scale_map=statistics(scale),
                                   scaleless_mean_per_image=geometry.mean(dim=[1, 2, 3]).cpu().tolist(),
-                                  feature=statistics(feature),
                                   preclamp_below_min=float((depth < self.minimum).float().mean()),
                                   preclamp_above_max=float((depth > self.maximum).float().mean()),
                                   outgoing_weight_mean=float(weights.mean()),
@@ -234,7 +247,6 @@ class DepthCompletionDebug(object):
                                       keep.sum() / (sparse > 0).sum().clamp_min(1)))
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
-                        self.emit('activation', name=name, values=statistics(value))
                         if name == 'scale_update' or name.endswith('.scale_update'):
                             scale = inputs[0][:, -6:-5]
                             accepted_scale = inputs[0][:, -5:-4]
@@ -242,8 +254,12 @@ class DepthCompletionDebug(object):
                             refined = scale * torch.exp(torch.tanh(value))
                             level = 'bottom' if name == 'scale_update' else name.rsplit('.', 1)[0]
                             key = (name, str(value.device))
-                            iteration = self.refinement_counts.get(key, 0) % 2 + 1
+                            iteration = self.refinement_counts.get(key, 0) + 1
                             self.refinement_counts[key] = iteration
+                            self.capture_stage(level, 'refinement_{}'.format(iteration),
+                                               inputs[0][:, -7:-6], refined,
+                                               multiplier=torch.exp(torch.tanh(value)),
+                                               **self.anchor_context.get(level, {}))
                             self.emit('scale_refinement', level=level,
                                       refinement_iteration=iteration,
                                       scale_before_refinement=statistics(scale),
@@ -285,6 +301,14 @@ class DepthCompletionDebug(object):
                 anchor_scale, support = output
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
+                if self.context.get('phase') == 'validation':
+                    self.anchor_context[level] = dict(
+                        support=support, keep=keep)
+                    self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else 'after_geometry_update',
+                                       geometry, scale)
+                    self.capture_stage(level, 'after_anchor_messages', geometry, scale,
+                                       anchor_scale=anchor_scale, sparse_ratio=target,
+                                       outgoing_weights=weights, **self.anchor_context[level])
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
                           output_stage='before_refinement',
@@ -371,7 +395,8 @@ class DepthCompletionDebug(object):
                           categories=reports)
 
     def output_gradient(self, gradient):
-        self.emit('output_gradient', values=statistics(gradient))
+        if not self.probing:
+            self.emit('output_gradient', values=statistics(gradient))
 
     def inputs(self, name, image, sparse, target=None):
         self.emit('inputs', name=name, image=statistics(image), sparse=statistics(sparse),
@@ -486,6 +511,9 @@ class DepthCompletionDebug(object):
             item['grad_norm'] = float(np.sqrt(item['grad_squared']))
         self.emit('gradients_before_optimizer', groups=groups, rejection_heads=rejection_heads,
                   prediction_heads=prediction_heads,
+                  optimizer=type(optimizer).__name__,
+                  optimizer_settings=[{k: v for k, v in group.items() if k != 'params'}
+                                      for group in optimizer.param_groups],
                   learning_rates=[g['lr'] for g in optimizer.param_groups],
                   global_grad_norm=float(np.sqrt(sum(g['grad_squared'] for g in groups.values()))))
 
@@ -504,7 +532,9 @@ class DepthCompletionDebug(object):
         for item in groups.values():
             item['relative_update'] = float(np.sqrt(item['update_squared']) /
                                             (np.sqrt(item['weight_squared']) + 1e-30))
-        self.emit('optimizer_updates', groups=groups)
+        self.emit('optimizer_updates', groups=groups, optimizer_step_invoked=True,
+                  no_parameter_change=not any(g['update_squared'] > 0 for g in groups.values()),
+                  scope='observed invoked optimizer step; unchanged parameters are not automatically a skipped step')
         self.before = {}
 
     def start_validation(self, step):
@@ -513,6 +543,8 @@ class DepthCompletionDebug(object):
         self.buckets = {}
         self.inverse_failures = 0
         self.dump_count = 0
+        self.validation_number += 1
+        self.stage_reports = []
 
     def validation_sample(self, index, image, sparse, target, prediction,
                           minimum, maximum, dataset):
@@ -520,6 +552,9 @@ class DepthCompletionDebug(object):
         valid = (t > 0) & (t > minimum) & (t < maximum)
         groups = {'all': valid, 'at_sparse': valid & (s > 0),
                   'away_from_sparse': valid & (s <= 0)}
+        edge = boundary_mask(t, valid)
+        groups['near_gt_boundary'] = valid & edge
+        groups['away_from_gt_boundary'] = valid & ~edge
         for low, high in [(0, 10), (10, 20), (20, 40), (40, 60), (60, 80), (80, float('inf'))]:
             groups['depth_{}_{}m'.format(low, high)] = valid & (t >= low) & (t < high)
         with torch.no_grad():
@@ -554,15 +589,22 @@ class DepthCompletionDebug(object):
         self.context = dict(phase='validation', step=self.context['step'], sample=int(index))
         paths = self.paths(dataset, index)
         report = reports['all']
-        self.emit('validation_sample', paths=paths, prediction=statistics(p),
-                  valid_target=statistics(t[valid]), prediction_on_eval_mask=statistics(p[valid]),
-                  buckets=reports, sparse_vs_target=errors(s, t, valid & (s > 0)),
-                  prediction_vs_sparse=errors(p, s, s > 0),
+        # All images contribute to aggregate buckets. Detailed distributions
+        # are retained for fixed samples only, replacing repetitive large logs.
+        self.emit('validation_sample', paths=paths,
+                  buckets=reports if self.active else {'all': report},
                   native_imae=native_imae, native_irmse=native_irmse,
                   prediction_below_configured_min=int(np.sum(p < self.minimum)),
                   prediction_above_configured_max=int(np.sum(p > self.maximum)),
                   clamp_min_fraction=float(np.mean(p <= self.minimum)),
                   clamp_max_fraction=float(np.mean(p >= self.maximum)))
+        if self.active and self.trace:
+            self.analyze_stages(array(image), s, t, p, valid, paths, 'fixed_{}'.format(index))
+            self.track_fixed_errors(index, p, t, valid, paths)
+            if self.validation_number == 1 or self.context['step'] % self.probe_interval == 0:
+                self.probe_anchor_messages(image, sparse, t, p, valid)
+        self.trace = {}
+        self.anchor_context = {}
         if not np.isfinite(native_imae) or not np.isfinite(native_irmse):
             self.inverse_failures += 1
             coords = np.argwhere(valid)[bad][:20]
@@ -577,7 +619,7 @@ class DepthCompletionDebug(object):
                 self.dump_count += 1
         error_map = np.where(valid & np.isfinite(p) & np.isfinite(t), np.abs(p - t), -1)
         n_worst = min(10, int(valid.sum()))
-        if n_worst:
+        if n_worst and self.active:
             flat = np.argpartition(error_map.ravel(), error_map.size - n_worst)[-n_worst:]
             coords = np.column_stack(np.unravel_index(flat, p.shape))
             self.emit('worst_pixels', paths=paths, coordinates_yx=coords.tolist(),
@@ -610,16 +652,31 @@ class DepthCompletionDebug(object):
         for rank, (score, index, data) in enumerate(self.worst):
             self.save_arrays('worst_{}'.format(rank), **data)
             worst.append(dict(index=index, rmse_mm=score, paths=data['paths']))
+            # A small eval replay provides internal maps for the actual worst
+            # samples without retaining internal maps for the whole dataset.
+            if not self.model.training:
+                self.begin('validation', self.context['step'], sample=index)
+                device = next(self.model.parameters()).device
+                with torch.random.fork_rng(), torch.no_grad():
+                    self.model(torch.as_tensor(data['image'], device=device),
+                               torch.as_tensor(data['sparse'], device=device).reshape(1, 1, *data['sparse'].shape))
+                self.analyze_stages(data['image'], data['sparse'], data['target'], data['prediction'],
+                                    data['mask'], data['paths'], 'worst_{}_stages'.format(rank))
         summary = dict(step=self.context['step'], pixel_weighted_buckets=self.buckets,
                        inverse_failure_samples=self.inverse_failures, worst_samples=worst)
         self.emit('validation_summary', **summary)
         with open(os.path.join(self.directory, 'validation_latest.json'), 'w') as stream:
             json.dump(serializable(summary), stream, indent=2, allow_nan=False)
+        with open(os.path.join(self.directory, 'stages_latest.json'), 'w') as stream:
+            json.dump(serializable(dict(step=self.context['step'], run_id=self.run_id,
+                                        records=self.stage_reports)), stream, indent=2, allow_nan=False)
         print('[depth-debug] step={} inverse failures={} worst indices={} (see {})'.format(
             self.context['step'], self.inverse_failures,
             [entry['index'] for entry in worst], self.directory))
         self.worst = []
         self.active = False
+        self.trace = {}
+        self.anchor_context = {}
 
     def close(self):
         for handle in self.handles:
