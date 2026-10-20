@@ -114,6 +114,7 @@ class DepthCompletionDebug(StageDiagnostics):
         self.inverse_failures = 0
         self.rejection_observations = {}
         self.refinement_counts = {}
+        self.rejection_reports = {}
         self.initialize_analysis()
         self.register_hooks()
         self.register_stage_hooks()
@@ -353,6 +354,7 @@ class DepthCompletionDebug(StageDiagnostics):
                 if self.context['phase'] == 'validation':
                     self.rejection_observations[level] = dict(
                         size=tuple(margin.shape[-2:]),
+                        logits=logits.detach(),
                         keep=(margin >= 0.0).detach())
         return observe
 
@@ -393,6 +395,7 @@ class DepthCompletionDebug(StageDiagnostics):
                           ground_truth_scope='original_selected_pixel',
                           sparse_vs_target=errors(sampled, selected_target, array(known)),
                           categories=reports)
+                self.supervised_rejection_report(level, observation['logits'], sampled, selected_target)
 
     def output_gradient(self, gradient):
         if not self.probing:
@@ -545,6 +548,7 @@ class DepthCompletionDebug(StageDiagnostics):
         self.dump_count = 0
         self.validation_number += 1
         self.stage_reports = []
+        self.rejection_reports = {}
 
     def validation_sample(self, index, image, sparse, target, prediction,
                           minimum, maximum, dataset):
@@ -660,10 +664,15 @@ class DepthCompletionDebug(StageDiagnostics):
                 with torch.random.fork_rng(), torch.no_grad():
                     self.model(torch.as_tensor(data['image'], device=device),
                                torch.as_tensor(data['sparse'], device=device).reshape(1, 1, *data['sparse'].shape))
+                self.rejection_quality(
+                    torch.as_tensor(data['sparse'], device=device).reshape(1, 1, *data['sparse'].shape),
+                    torch.as_tensor(data['target'], device=device).reshape(1, 1, *data['target'].shape))
                 self.analyze_stages(data['image'], data['sparse'], data['target'], data['prediction'],
                                     data['mask'], data['paths'], 'worst_{}_stages'.format(rank))
         summary = dict(step=self.context['step'], pixel_weighted_buckets=self.buckets,
-                       inverse_failure_samples=self.inverse_failures, worst_samples=worst)
+                       inverse_failure_samples=self.inverse_failures, worst_samples=worst,
+                       rejection_supervision=self.rejection_summary(),
+                       rejection_summary_scope='fixed and worst samples, deduplicated per image/level')
         self.emit('validation_summary', **summary)
         with open(os.path.join(self.directory, 'validation_latest.json'), 'w') as stream:
             json.dump(serializable(summary), stream, indent=2, allow_nan=False)

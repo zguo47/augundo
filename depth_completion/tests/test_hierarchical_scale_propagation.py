@@ -27,6 +27,74 @@ from utils.src.transforms import Transforms
 
 class HierarchicalScalePropagationTest(unittest.TestCase):
 
+    def test_rejection_targets_ignore_unknown_and_ambiguous_raw_ground_truth(self):
+        sparse = torch.tensor([[[[10.05, 10.3, 14., 5., 0., 120.]]]])
+        target = torch.tensor([[[[10., 10., 10., 0., 10., 120.]]]])
+        labels = loss_utils.rejection_supervision_targets(sparse, target)
+        self.assertEqual(labels.tolist(), [[[[0, -1, 1, -1, -1, 0]]]])
+
+    def test_balanced_rejection_loss_corrects_saturated_bad_points(self):
+        logits = torch.zeros(1, 2, 1, 101)
+        logits[:, 0] = 15.
+        logits.requires_grad_()
+        labels = torch.zeros(1, 1, 1, 101, dtype=torch.long)
+        labels[:, :, :, -1] = 1
+        loss = loss_utils.balanced_rejection_loss_func(logits, labels)
+        expected = 0.5 * functional.cross_entropy(logits[:, :, :, :100], labels[:, 0, :, :100]) + \
+            0.5 * functional.cross_entropy(logits[:, :, :, 100:], labels[:, 0, :, 100:])
+        torch.testing.assert_close(loss, expected)
+        loss.backward()
+        self.assertGreater(float(logits.grad[0, 0, 0, -1]), 0.49)
+        self.assertLess(float(logits.grad[0, 1, 0, -1]), -0.49)
+        for label in [-1, 0, 1]:
+            scores = torch.zeros(1, 2, 2, 3, requires_grad=True)
+            value = loss_utils.balanced_rejection_loss_func(
+                scores, torch.full((1, 1, 2, 3), label, dtype=torch.long))
+            self.assertTrue(torch.isfinite(value))
+            if label == -1:
+                self.assertEqual(float(value), 0.)
+            value.backward()
+            self.assertTrue(torch.isfinite(scores.grad).all())
+
+    def test_rejection_supervision_uses_native_logits_and_original_selected_gt(self):
+        wrapper = self.make_wrapper(True)
+        image = torch.rand(1, 3, 17, 25)
+        sparse = torch.zeros(1, 1, 17, 25)
+        sparse[:, :, 7, 11] = 20.
+        target = torch.ones_like(sparse) * 20.
+        target[:, :, 7, 11] = 5.
+        normal = wrapper.forward_depth(image, sparse, return_all_outputs=True)
+        # Reset RNG around the comparison: hard rejection samples Gumbel noise.
+        rng = torch.get_rng_state()
+        maps, logits = wrapper.forward_depth(image, sparse, return_all_outputs=True,
+                                              return_rejection_outputs=True)
+        torch.set_rng_state(rng)
+        without_aux = wrapper.forward_depth(image, sparse, return_all_outputs=True)
+        self.assertEqual(len(normal), 16)
+        for a, b in zip(maps, without_aux):
+            torch.testing.assert_close(a, b)
+        value, info = wrapper.compute_loss_rejection(target, sparse, logits)
+        torch.testing.assert_close(value, torch.stack([
+            info['loss_rejection_r{}'.format(r)] for r in range(5)]).mean())
+        for r in range(5):
+            n_selected = int((sparse_depth_at_resolution(sparse, logits[r].shape[-2:]) > 0).sum())
+            self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
+            self.assertEqual(int(info['rejection_keep_count_r{}'.format(r)]), 0)
+        value.backward()
+        for stage in [wrapper.model_depth] + list(wrapper.model_depth.decoder):
+            gradient = stage.rejection_map.conv.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(float(gradient.abs().sum()), 0.)
+        # The same flip is applied to measurements and raw GT before selecting
+        # labels. Selected original pixels still agree after augmentation.
+        flipped_sparse, flipped_target = sparse.flip(-1), target.flip(-1)
+        flipped = wrapper.forward_depth(image.flip(-1), flipped_sparse, return_all_outputs=True,
+                                        return_rejection_outputs=True)[1]
+        _, info = wrapper.compute_loss_rejection(flipped_target, flipped_sparse, flipped)
+        for r, scores in enumerate(flipped):
+            n_selected = int((sparse_depth_at_resolution(flipped_sparse, scores.shape[-2:]) > 0).sum())
+            self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
+
     def test_encoder_uses_three_convolutions_per_level_without_attention_or_position(self):
         encoder = SharedEncoder(n_channels=8, n_head=4)
         with mock.patch('scale_propagation_model.add_position_encoding') as position, \

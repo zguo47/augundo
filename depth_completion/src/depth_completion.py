@@ -91,7 +91,10 @@ def train(train_images_path,
           debug_depth=False,
           debug_interval=500,
           debug_max_samples=3,
-          detach_scaleless_depth=True):
+          detach_scaleless_depth=True,
+          supervise_outlier_rejection=False,
+          rejection_keep_tolerance=(0.1, 0.02),
+          rejection_reject_tolerance=(0.3, 0.05)):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -100,6 +103,9 @@ def train(train_images_path,
         device = torch.device('cpu')
     else:
         raise ValueError('Unsupported device: {}'.format(device))
+
+    rejection_supervision_active = supervise_outlier_rejection and use_outlier_rejection and \
+        'scale_propagation' in model_name and supervision_type == 'supervised'
 
     # Set up checkpoint and event paths
     if not os.path.exists(checkpoint_path):
@@ -297,6 +303,11 @@ def train(train_images_path,
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
                 detach_scaleless_depth=detach_scaleless_depth,
+                supervise_outlier_rejection=supervise_outlier_rejection,
+                rejection_supervision_active=rejection_supervision_active,
+                rejection_keep_tolerance=rejection_keep_tolerance,
+                rejection_reject_tolerance=rejection_reject_tolerance,
+                w_rejection=w_losses.get('w_rejection', 0.1),
                 w_losses=dict(w_losses), learning_rates=learning_rates,
                 learning_schedule=learning_schedule, restore_paths=restore_paths,
                 accumulation=n_step_per_gradient_accumulation,
@@ -364,6 +375,12 @@ def train(train_images_path,
 
     if 'scale_propagation' in model_name:
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
+        log('supervise_outlier_rejection={}  effective={}  w_rejection={}'.format(
+            supervise_outlier_rejection, rejection_supervision_active,
+            w_losses.get('w_rejection', 0.1)), log_path)
+        if rejection_supervision_active:
+            log('rejection_keep_tolerance={}  rejection_reject_tolerance={}'.format(
+                rejection_keep_tolerance, rejection_reject_tolerance), log_path)
 
     log_training_settings(
         log_path,
@@ -569,19 +586,31 @@ def train(train_images_path,
                 sparse_depth0)
 
             # Perform geometric augmentation i.e. crop, flip, etc. on the input image
-            [image0, image1, image2, sparse_depth0, validity_map0], [intrinsics], _ = train_transforms_crop_to_shape.transform(
-                images_arr=[image0, image1, image2, sparse_depth0, validity_map0],
+            crop_inputs = [image0, image1, image2, sparse_depth0, validity_map0]
+            if rejection_supervision_active:
+                crop_inputs.append(ground_truth0)
+            cropped, [intrinsics], _ = train_transforms_crop_to_shape.transform(
+                images_arr=crop_inputs,
                 intrinsics_arr=[intrinsics],
                 interpolation_modes=interpolation_modes,
                 random_transform_probability=augmentation_probability)
 
-            [input_image0, input_sparse_depth0, input_validity_map0], \
+            image0, image1, image2, sparse_depth0, validity_map0 = cropped[:5]
+            if rejection_supervision_active:
+                ground_truth0 = cropped[5]
+            geometric_inputs = [image0, sparse_depth0, validity_map0]
+            if rejection_supervision_active:
+                # GT follows the exact sampled transform with nearest sampling
+                # and zero padding. It is used only for labels, never inference.
+                geometric_inputs.append(ground_truth0)
+            geometric_outputs, \
                 [input_intrinsics], \
                 transform_performed_geometric = train_transforms_geometric.transform(
-                    images_arr=[image0, sparse_depth0, validity_map0],
+                    images_arr=geometric_inputs,
                     intrinsics_arr=[intrinsics],
                     padding_modes=padding_modes,
                     random_transform_probability=augmentation_probability)
+            input_image0, input_sparse_depth0, input_validity_map0 = geometric_outputs[:3]
 
             do_erode = 'random_resize_to_shape' in transform_performed_geometric or \
                 'random_resize_and_crop' in transform_performed_geometric
@@ -648,7 +677,19 @@ def train(train_images_path,
                 sparse_depth=input_sparse_depth0,
                 validity_map=input_validity_map0,
                 intrinsics=input_intrinsics,
-                return_all_outputs=True)
+                return_all_outputs=True,
+                return_rejection_outputs=rejection_supervision_active)
+            if rejection_supervision_active:
+                output_depth0, rejection_logits = output_depth0
+                # Match selected sparse pixels to GT in network coordinates,
+                # before reverse_transform changes the depth-map coordinates.
+                rejection_target = geometric_outputs[3]
+                rejection_loss, rejection_info = depth_completion_model.compute_loss_rejection(
+                    rejection_target, input_sparse_depth0, rejection_logits,
+                    rejection_keep_tolerance, rejection_reject_tolerance)
+                if is_debug_step:
+                    depth_debug.rejection_training(
+                        rejection_logits, input_sparse_depth0, rejection_target)
 
             if is_summary_step:
                 output_depth0_initial = output_depth0[0].detach().clone()
@@ -681,6 +722,13 @@ def train(train_images_path,
                 pose0to2=pose0to2,
                 supervision_type=supervision_type,
                 w_losses=w_losses)
+
+            if rejection_supervision_active:
+                weighted_rejection = w_losses.get('w_rejection', 0.1) * rejection_loss
+                loss = loss + weighted_rejection
+                loss_info.update(rejection_info)
+                loss_info['loss_rejection_weighted'] = weighted_rejection
+                loss_info['loss'] = loss
 
             if is_debug_step:
                 depth_debug.training_prediction(

@@ -594,7 +594,8 @@ class ScalePropagationDepthModel(nn.Module):
             for n_iteration in n_propagation_iterations[1:]
         ])
 
-    def forward(self, image, sparse_depth, return_all_outputs=False):
+    def forward(self, image, sparse_depth, return_all_outputs=False,
+                return_rejection_outputs=False):
         features = self.encoder(image, sparse_depth)
         coarse_feature = features[-1]
         coarse_sparse_depth, measurement_indices = sparse_depth_at_resolution(
@@ -629,6 +630,7 @@ class ScalePropagationDepthModel(nn.Module):
                 training=self.training)
         else:
             keep_mask = (coarse_sparse_depth > 0.0).to(sparse_depth.dtype)
+            rejection_logits = torch.zeros_like(coarse_sparse_depth).repeat(1, 2, 1, 1)
 
         # Each accepted measurement proposes a metric scale d_sparse / scaleless.
         # Pair that depth with scaleless depth at its original location, not merely
@@ -655,8 +657,11 @@ class ScalePropagationDepthModel(nn.Module):
         feature = coarse_feature
         scaleless_depths = [scaleless_depth]
         scale_maps = [scale]
+        # Native biased logits are auxiliary training outputs only. Ground
+        # truth is never passed into this prediction network.
+        rejection_levels = [rejection_logits] if return_rejection_outputs else []
         for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
-            feature, scaleless_depth, scale, _, _, _ = decoder_block(
+            feature, scaleless_depth, scale, _, rejection_logits, _ = decoder_block(
                 feature,
                 features[level],
                 scaleless_depth,
@@ -664,18 +669,20 @@ class ScalePropagationDepthModel(nn.Module):
                 sparse_depth)
             scaleless_depths.append(scaleless_depth)
             scale_maps.append(scale)
+            if return_rejection_outputs:
+                rejection_levels.append(rejection_logits)
 
         # Clamp before output.
         depth = torch.clamp(
             scaleless_depth * scale,
             min=self.min_predict_depth,
             max=self.max_predict_depth)
-        if not return_all_outputs:
+        if not return_all_outputs and not return_rejection_outputs:
             return depth
 
         scaleless_depths = scaleless_depths[::-1]
         scale_maps = scale_maps[::-1]
-        return dict(
+        outputs = dict(
             depth=depth,
             scaleless_depths=scaleless_depths,
             scale_maps=scale_maps,
@@ -683,3 +690,6 @@ class ScalePropagationDepthModel(nn.Module):
                 (geometry.detach() if self.detach_scaleless_depth else geometry) * metric_scale
                 for geometry, metric_scale in zip(
                     scaleless_depths, scale_maps)])
+        if return_rejection_outputs:
+            outputs['rejection_logits'] = rejection_levels[::-1]
+        return outputs

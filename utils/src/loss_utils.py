@@ -4,6 +4,49 @@ import torch
 EPSILON = 1e-8
 
 
+def rejection_supervision_targets(sparse_depth, target_depth,
+                                 keep_tolerance=(0.1, 0.02),
+                                 reject_tolerance=(0.3, 0.05)):
+    '''Label selected measurements using raw, coordinate-matched ground truth.
+
+    Class 0 means keep, class 1 means reject, and -1 means ignore. Each
+    tolerance is (absolute meters, relative fraction of GT). The gap between
+    tolerances is deliberately unsupervised. Missing/nonfinite measurements or
+    GT never become rejection targets. GT is neither pooled nor depth-clamped.
+    '''
+    with torch.no_grad():
+        known = (sparse_depth > 0) & torch.isfinite(sparse_depth) & \
+            (target_depth > 0) & torch.isfinite(target_depth)
+        difference = torch.abs(sparse_depth - target_depth)
+        good = torch.maximum(torch.full_like(target_depth, keep_tolerance[0]),
+                             keep_tolerance[1] * target_depth)
+        bad = torch.maximum(torch.full_like(target_depth, reject_tolerance[0]),
+                            reject_tolerance[1] * target_depth)
+        labels = torch.full_like(sparse_depth, -1, dtype=torch.long)
+        labels[known & (difference <= good)] = 0
+        labels[known & (difference > bad)] = 1
+    return labels
+
+
+def balanced_rejection_loss_func(logits, labels):
+    '''Average keep/reject cross-entropies separately, then average present classes.
+
+    Balancing is over the minibatch at one native resolution. A missing class
+    contributes no term; an entirely ignored level returns graph-connected zero.
+    Cross-entropy acts on raw logits, before hard Gumbel sampling, and therefore
+    retains a corrective gradient for confidently incorrect decisions.
+    '''
+    labels = labels[:, 0]
+    losses = torch.nn.functional.cross_entropy(
+        logits, labels, ignore_index=-1, reduction='none')
+    keep, reject = labels == 0, labels == 1
+    n_keep, n_reject = keep.sum(), reject.sum()
+    loss_keep = (losses * keep).sum() / n_keep.clamp_min(1)
+    loss_reject = (losses * reject).sum() / n_reject.clamp_min(1)
+    n_class = (n_keep > 0).to(logits.dtype) + (n_reject > 0).to(logits.dtype)
+    return (loss_keep + loss_reject) / n_class.clamp_min(1)
+
+
 def color_consistency_loss_func(src, tgt, w):
     '''
     Computes the color consistency loss

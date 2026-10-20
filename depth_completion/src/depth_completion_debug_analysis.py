@@ -152,6 +152,11 @@ class StageDiagnostics(object):
         if not all(torch.is_tensor(term) and term.requires_grad for term in terms):
             self.emit('gradient_objectives', unavailable='SI/metric graph terms not exposed')
             return
+        names = ['si', 'metric']
+        rejection_term = loss_info.get('loss_rejection_weighted')
+        if torch.is_tensor(rejection_term) and rejection_term.requires_grad:
+            names.append('rejection')
+            terms.append(rejection_term)
         named = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
         self.probing = True
         try:
@@ -160,25 +165,102 @@ class StageDiagnostics(object):
         finally:
             self.probing = False
         groups = {}
-        for (name, _), si, metric in zip(named, *vectors):
+        for index, (name, _) in enumerate(named):
             group = '.'.join(name.split('.')[:2])
-            item = groups.setdefault(group, dict(si_squared=0., metric_squared=0., dot=0.,
-                                                 si_unused=0, metric_unused=0))
-            item['si_unused'] += int(si is None)
-            item['metric_unused'] += int(metric is None)
-            if si is not None:
-                item['si_squared'] += float(si.detach().double().square().sum())
-            if metric is not None:
-                item['metric_squared'] += float(metric.detach().double().square().sum())
-            if si is not None and metric is not None:
-                item['dot'] += float((si.detach().double() * metric.detach().double()).sum())
+            item = groups.setdefault(group, {})
+            gradients = [vector[index] for vector in vectors]
+            for objective, gradient in zip(names, gradients):
+                key = objective + '_squared'
+                item[key] = item.get(key, 0.) + (0. if gradient is None else
+                    float(gradient.detach().double().square().sum()))
+                key = objective + '_unused'
+                item[key] = item.get(key, 0) + int(gradient is None)
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    key = names[i] + '_' + names[j] + '_dot'
+                    item[key] = item.get(key, 0.) + (0. if gradients[i] is None or gradients[j] is None else
+                        float((gradients[i].detach().double() * gradients[j].detach().double()).sum()))
         for item in groups.values():
-            item['si_norm'] = item.pop('si_squared') ** 0.5
-            item['metric_norm'] = item.pop('metric_squared') ** 0.5
-            denominator = item['si_norm'] * item['metric_norm']
-            item['cosine'] = item.pop('dot') / denominator if denominator else None
+            for objective in names:
+                item[objective + '_norm'] = item.pop(objective + '_squared') ** 0.5
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    denominator = item[names[i] + '_norm'] * item[names[j] + '_norm']
+                    key = 'cosine' if (i, j) == (0, 1) else 'cosine_' + names[i] + '_' + names[j]
+                    dot = item.pop(names[i] + '_' + names[j] + '_dot')
+                    item[key] = dot / denominator if denominator else None
         self.emit('gradient_objectives', groups=groups,
-                  scope='current microbatch; resolution-weighted objectives before accumulation division')
+                  scope='current microbatch before accumulation division; rejection includes w_rejection')
+
+    def supervised_rejection_report(self, level, logits, selected, matched):
+        '''Report the actual label policy separately from generic GT disagreements.'''
+        from utils.src import loss_utils
+        from depth_completion_debug import statistics
+        keep_tolerance = self.settings.get('rejection_keep_tolerance', (0.1, 0.02))
+        reject_tolerance = self.settings.get('rejection_reject_tolerance', (0.3, 0.05))
+        with torch.no_grad():
+            labels = loss_utils.rejection_supervision_targets(
+                selected, matched, keep_tolerance, reject_tolerance)
+            prediction = logits.argmax(1, keepdim=True)
+            probability = logits.softmax(1)[:, 0:1]
+            measured = (selected > 0) & torch.isfinite(selected)
+            known = measured & (matched > 0) & torch.isfinite(matched)
+            keep, reject = labels == 0, labels == 1
+            counts = dict(true_keep=int((keep & (prediction == 0)).sum()),
+                          false_reject=int((keep & (prediction == 1)).sum()),
+                          true_reject=int((reject & (prediction == 1)).sum()),
+                          false_keep=int((reject & (prediction == 0)).sum()))
+            n_keep, n_reject = int(keep.sum()), int(reject.sum())
+            n_predicted_reject = counts['true_reject'] + counts['false_reject']
+            report = dict(level=level, keep_target_count=n_keep, reject_target_count=n_reject,
+                          ambiguous_count=int((known & (labels == -1)).sum()),
+                          missing_gt_count=int((measured & ~known).sum()),
+                          confusion=counts,
+                          reject_recall=counts['true_reject'] / n_reject if n_reject else None,
+                          reject_precision=counts['true_reject'] / n_predicted_reject if n_predicted_reject else None,
+                          keep_recall=counts['true_keep'] / n_keep if n_keep else None,
+                          keep_probability_on_good=statistics(probability[keep]),
+                          keep_probability_on_bad=statistics(probability[reject]),
+                          keep_tolerance=keep_tolerance, reject_tolerance=reject_tolerance,
+                          supervision_enabled=self.settings.get('rejection_supervision_active', False),
+                          balanced_ce=float(loss_utils.balanced_rejection_loss_func(logits, labels)),
+                          label_scope='selected original pixel in aligned input coordinates; raw unclamped GT')
+            self.emit('rejection_supervision', **report)
+            if self.context.get('phase') == 'validation':
+                self.rejection_reports[(self.context.get('sample'), level)] = report
+                for entry in self.trace.get(level, []):
+                    if entry['stage'] == 'after_anchor_messages':
+                        entry['rejection_logits'] = logits.detach().cpu().numpy()[0].copy()
+                        entry['rejection_labels'] = labels.cpu().numpy()[0].copy()
+
+    def rejection_training(self, logits, sparse, target):
+        '''The supplied target already underwent the input's geometric transform.'''
+        import sys
+        sampler = getattr(sys.modules[type(self.model).__module__], 'sparse_depth_at_resolution')
+        for resolution, scores in enumerate(logits):
+            selected, indices = sampler(sparse, scores.shape[-2:], return_indices=True)
+            matched = torch.gather(target.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
+            level = 'bottom' if resolution == 4 else 'decoder.{}'.format(3 - resolution)
+            self.supervised_rejection_report(level, scores, selected, matched)
+
+    def rejection_summary(self):
+        result = {}
+        for (_, level), report in self.rejection_reports.items():
+            bucket = result.setdefault(level, dict(samples=0, keep_target_count=0, reject_target_count=0,
+                ambiguous_count=0, missing_gt_count=0,
+                confusion=dict(true_keep=0, false_reject=0, true_reject=0, false_keep=0)))
+            bucket['samples'] += 1
+            for key in ['keep_target_count', 'reject_target_count', 'ambiguous_count', 'missing_gt_count']:
+                bucket[key] += report[key]
+            for key, value in report['confusion'].items():
+                bucket['confusion'][key] += value
+        for bucket in result.values():
+            counts = bucket['confusion']
+            predicted = counts['true_reject'] + counts['false_reject']
+            bucket['reject_recall'] = counts['true_reject'] / bucket['reject_target_count'] if bucket['reject_target_count'] else None
+            bucket['reject_precision'] = counts['true_reject'] / predicted if predicted else None
+            bucket['keep_recall'] = counts['true_keep'] / bucket['keep_target_count'] if bucket['keep_target_count'] else None
+        return result
 
     def analyze_stages(self, image, sparse, target, prediction, valid, paths, name):
         from depth_completion_debug import errors, statistics

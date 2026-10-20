@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from scale_propagation_model import ScalePropagationDepthModel
+from scale_propagation_model import ScalePropagationDepthModel, sparse_depth_at_resolution
 from utils.src import loss_utils
 
 
@@ -35,7 +35,8 @@ class ScalePropagationDepthCompletionModel(object):
                       sparse_depth=None,
                       validity_map=None,
                       intrinsics=None,
-                      return_all_outputs=False):
+                      return_all_outputs=False,
+                      return_rejection_outputs=False):
         # Keep the shared repository call signature; this model derives sparse
         # measurement locations directly from positive depths at each level.
         del validity_map, intrinsics
@@ -43,18 +44,45 @@ class ScalePropagationDepthCompletionModel(object):
         output_depth = self.model_depth(
             image=image,
             sparse_depth=sparse_depth,
-            return_all_outputs=return_all_outputs)
-        if not return_all_outputs:
+            return_all_outputs=return_all_outputs,
+            return_rejection_outputs=return_rejection_outputs)
+        if not return_all_outputs and not return_rejection_outputs:
             return output_depth
         # Flat, full-resolution tensors follow the repository's transform API.
         # Reverse geometric augmentation on every map before computing losses.
         # Layout: final depth, five Z maps, five M maps, five metric-loss maps.
         maps = output_depth['scaleless_depths'] + output_depth['scale_maps'] + \
             output_depth['metric_depths_for_loss']
-        return [output_depth['depth']] + [
+        outputs = [output_depth['depth']] + [
             functional.interpolate(
                 value, size=image.shape[-2:], mode='bilinear', align_corners=True)
             for value in maps]
+        if return_rejection_outputs:
+            # Keep native logits separate from the image/map transform API:
+            # their labels are computed in the augmented input coordinates.
+            return outputs, output_depth['rejection_logits']
+        return outputs
+
+    def compute_loss_rejection(self, target_depth, sparse_depth, logits,
+                               keep_tolerance=(0.1, 0.02),
+                               reject_tolerance=(0.3, 0.05)):
+        '''Supervise each fresh rejection head equally at its native resolution.'''
+        losses, loss_info = [], {}
+        for resolution, scores in enumerate(logits):
+            selected, indices = sparse_depth_at_resolution(
+                sparse_depth, scores.shape[-2:], return_indices=True)
+            matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
+            labels = loss_utils.rejection_supervision_targets(
+                selected, matched, keep_tolerance, reject_tolerance)
+            value = loss_utils.balanced_rejection_loss_func(scores, labels)
+            losses.append(value)
+            loss_info['loss_rejection_r{}'.format(resolution)] = value
+            for name, label in [('keep', 0), ('reject', 1), ('ignored', -1)]:
+                loss_info['rejection_{}_count_r{}'.format(name, resolution)] = (labels == label).sum()
+        # No 4**(-r) factor: coarse rejection must not lose its direct signal.
+        loss = torch.stack(losses).mean()
+        loss_info['loss_rejection'] = loss
+        return loss, loss_info
 
     @staticmethod
     def scale_outputs(outputs):

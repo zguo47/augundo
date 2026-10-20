@@ -344,11 +344,13 @@ class DepthDebugTest(unittest.TestCase):
                 arguments.extend(['--' + flag, str(root / (name + '.txt'))])
             script = os.path.join(os.path.dirname(__file__), '..', 'src', 'train_depth_completion.py')
             sys.path.insert(0, os.path.dirname(script))
-            for enabled in ['false', 'true']:
+            for enabled in ['false', 'true', 'rejection_false', 'rejection_true']:
                 torch.manual_seed(3)
                 np.random.seed(3)
-                argv = [script] + arguments + ['--debug_depth', enabled,
+                argv = [script] + arguments + ['--debug_depth', enabled.split('_')[-1],
                                                '--checkpoint_path', str(root / enabled)]
+                if enabled.startswith('rejection_'):
+                    argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true']
                 # The repository targets older Pillow; adapt only this test's environment.
                 lanczos = getattr(Image, 'Resampling', Image).LANCZOS
                 get_cmap = getattr(
@@ -391,6 +393,29 @@ class DepthDebugTest(unittest.TestCase):
                 checkpoints.append(torch.load(str(path), map_location='cpu')['model_state_dict'])
             for name in checkpoints[0]:
                 self.assertTrue(torch.equal(checkpoints[0][name], checkpoints[1][name]), name)
+            supervised = [json.loads(line) for line in
+                          (root / 'rejection_true/debug/diagnostics.jsonl').read_text().splitlines()]
+            reports = [r for r in supervised if r['event'] == 'rejection_supervision']
+            self.assertTrue(any(r['phase'] == 'train' and r['reject_target_count'] > 0 for r in reports))
+            self.assertTrue(any(r['phase'] == 'validation' for r in reports))
+            self.assertTrue(all(r['supervision_enabled'] for r in reports))
+            train = next(r for r in supervised if r['event'] == 'training_prediction')
+            self.assertIn('loss_rejection_weighted', train['loss_info'])
+            gradients = next(r for r in supervised if r['event'] == 'gradient_objectives')
+            self.assertTrue(any(v['rejection_norm'] > 0 for v in gradients['groups'].values()))
+            summary = json.loads((root / 'rejection_true/debug/validation_latest.json').read_text())
+            self.assertEqual(len(summary['rejection_supervision']), 5)
+            snapshot = np.load(root / 'rejection_true/debug/fixed_0.npz')
+            self.assertIn('bottom__after_anchor_messages__rejection_logits', snapshot.files)
+            self.assertTrue((snapshot['bottom__after_anchor_messages__rejection_labels'] == 1).any())
+            extra = []
+            for enabled in ['rejection_false', 'rejection_true']:
+                path = next((root / enabled).glob('checkpoints-1*'))
+                if path.is_dir():
+                    path = next(path.glob('scale-propagation-*.pth'))
+                extra.append(torch.load(str(path), map_location='cpu')['model_state_dict'])
+            for name in extra[0]:
+                self.assertTrue(torch.equal(extra[0][name], extra[1][name]), name)
 
 
 if __name__ == '__main__':

@@ -79,6 +79,14 @@ parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 parser.add_argument('--detach_scaleless_depth',
     type=parse_boolean, default=True, help='Detach scaleless depth in scale-propagation metric losses')
+parser.add_argument('--supervise_outlier_rejection',
+    type=parse_boolean, default=False, help='Supervise scale-propagation rejection using sparse/GT agreement')
+parser.add_argument('--rejection_keep_tolerance',
+    nargs=2, type=float, default=[0.1, 0.02], metavar=('METERS', 'FRACTION'),
+    help='Label keep when error <= max(METERS, FRACTION * GT)')
+parser.add_argument('--rejection_reject_tolerance',
+    nargs=2, type=float, default=[0.3, 0.05], metavar=('METERS', 'FRACTION'),
+    help='Label reject when error > max(METERS, FRACTION * GT); ignore the gap')
 
 # Training settings
 parser.add_argument('--learning_rates',
@@ -200,6 +208,8 @@ if __name__ == '__main__':
     # Training settings
     assert len(args.learning_rates) == len(args.learning_schedule)
     assert args.n_step_per_gradient_accumulation > 0
+    assert all(0 <= keep <= reject for keep, reject in zip(
+        args.rejection_keep_tolerance, args.rejection_reject_tolerance))
 
     args.augmentation_random_crop_type = [
         crop_type.lower() for crop_type in args.augmentation_random_crop_type
@@ -296,4 +306,7 @@ if __name__ == '__main__':
           debug_depth=args.debug_depth,
           debug_interval=args.debug_interval,
           debug_max_samples=args.debug_max_samples,
-          detach_scaleless_depth=args.detach_scaleless_depth)
+          detach_scaleless_depth=args.detach_scaleless_depth,
+          supervise_outlier_rejection=args.supervise_outlier_rejection,
+          rejection_keep_tolerance=args.rejection_keep_tolerance,
+          rejection_reject_tolerance=args.rejection_reject_tolerance)

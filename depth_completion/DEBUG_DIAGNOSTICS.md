@@ -77,3 +77,43 @@ position and optimizer state still require the normal checkpoint pipeline.
 Recorded image counts are since this process started, not inferred lifetime
 counts after resume. An invoked optimizer step with no parameter changes is
 reported explicitly; it is not automatically labeled a skipped AMP step.
+
+## Optional supervised rejection
+
+The scale-propagation training CLI accepts `--supervise_outlier_rejection true`
+(default false). It also requires supervised training and `--use_outlier_rejection
+true`; startup logs record the requested and effective settings. Inference
+never receives GT. No model parameters or checkpoint tensor shapes are added.
+
+Keep labels use error <= max(0.1 meters, 2% GT); reject labels use error >
+max(0.3 meters, 5% GT). Missing/nonfinite values and the ambiguous gap are ignored.
+Override with `--rejection_keep_tolerance 0.1 0.02` and
+`--rejection_reject_tolerance 0.3 0.05` (absolute meters, relative fraction).
+Keep tolerances must be no larger than reject tolerances.
+
+GT follows the input's exact crop/flip/resize using nearest interpolation and
+zero padding. Each native-level logit is labeled using GT gathered at the
+selected measurement's coordinate in this augmented input. Logits are not
+upsampled or reverse-transformed for classification; only the existing depth
+maps follow the existing reverse-transform path. Depth prediction never takes
+GT as an input. Labels compare raw GT, not the depth-loss clamped target.
+
+At each level, CE is averaged separately over keep and reject classes; available
+class means are averaged. Levels have equal weight. The total objective adds
+`w_rejection * mean(level CE)` to the existing depth loss, with default
+`w_rejection=0.1`. Override using the existing argument
+`--w_losses w_supervised=1.0 w_rejection=0.1`.
+
+TensorBoard logs `train_loss_rejection`, `train_loss_rejection_weighted`, five
+`train_loss_rejection_r*` terms and class counts. In diagnostics, the new
+`rejection_supervision` records include class counts, confusion, reject
+precision/recall, keep recall, and keep probabilities on good/bad points. Null
+precision/recall means the corresponding denominator is empty, not perfect or
+zero performance. Reports use the same tolerance helper as training. They are
+also available as baseline diagnostics when classification supervision is off.
+Fixed/worst stage snapshots also store native rejection logits and target labels
+(0 keep, 1 reject, -1 ignore) beside selected measurement indices.
+Validation summary aggregates the fixed/worst subset, deduplicating each image
+and level; this is not a dataset-wide rejection score. Separate-objective
+gradient probes include weighted rejection gradients and their alignment with
+SI/metric gradients when the extra loss is active.
