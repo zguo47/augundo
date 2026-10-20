@@ -81,6 +81,15 @@ parser.add_argument('--detach_scaleless_depth',
     type=parse_boolean, default=True, help='Detach scaleless depth in scale-propagation metric losses')
 parser.add_argument('--supervise_outlier_rejection',
     type=parse_boolean, default=False, help='Supervise scale-propagation rejection using sparse/GT agreement')
+parser.add_argument('--rejection_supervision_levels',
+    nargs='+', type=int, choices=range(5), default=[0, 1],
+    help='Rejection-supervised resolutions: 0=full, 1=half, ..., 4=bottom')
+parser.add_argument('--n_propagation_iterations',
+    nargs=5, type=int, default=[2, 4, 6, 8, 12],
+    help='Scale propagation exchanges at bottom, 1/8, 1/4, 1/2, full resolution; 0 disables exchanges')
+parser.add_argument('--n_scale_refinement',
+    type=int, choices=range(3), default=2,
+    help='Scale refinement passes per level: 0=bypass, 1=single, 2=current two passes')
 parser.add_argument('--rejection_keep_tolerance',
     nargs=2, type=float, default=[0.1, 0.02], metavar=('METERS', 'FRACTION'),
     help='Label keep when error <= max(METERS, FRACTION * GT)')
@@ -308,5 +317,8 @@ if __name__ == '__main__':
           debug_max_samples=args.debug_max_samples,
           detach_scaleless_depth=args.detach_scaleless_depth,
           supervise_outlier_rejection=args.supervise_outlier_rejection,
+          rejection_supervision_levels=args.rejection_supervision_levels,
+          n_propagation_iterations=args.n_propagation_iterations,
+          n_scale_refinement=args.n_scale_refinement,
           rejection_keep_tolerance=args.rejection_keep_tolerance,
           rejection_reject_tolerance=args.rejection_reject_tolerance)

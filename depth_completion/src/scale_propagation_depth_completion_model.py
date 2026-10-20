@@ -16,14 +16,18 @@ class ScalePropagationDepthCompletionModel(object):
                  max_predict_depth=100.0,
                  use_outlier_rejection=True,
                  device=torch.device('cuda'),
-                 detach_scaleless_depth=True):
+                 detach_scaleless_depth=True,
+                 n_propagation_iterations=(2, 4, 6, 8, 12),
+                 n_scale_refinement=2):
         del dataset_name, network_modules
 
         self.model_depth = ScalePropagationDepthModel(
             min_predict_depth=min_predict_depth,
             max_predict_depth=max_predict_depth,
             use_outlier_rejection=use_outlier_rejection,
-            detach_scaleless_depth=detach_scaleless_depth)
+            detach_scaleless_depth=detach_scaleless_depth,
+            n_propagation_iterations=n_propagation_iterations,
+            n_scale_refinement=n_scale_refinement)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
@@ -65,10 +69,15 @@ class ScalePropagationDepthCompletionModel(object):
 
     def compute_loss_rejection(self, target_depth, sparse_depth, logits,
                                keep_tolerance=(0.1, 0.02),
-                               reject_tolerance=(0.3, 0.05)):
+                               reject_tolerance=(0.3, 0.05),
+                               supervision_levels=(0, 1)):
         '''Supervise each fresh rejection head equally at its native resolution.'''
         losses, loss_info = [], {}
         for resolution, scores in enumerate(logits):
+            # Keep coarse rejection and metric gradients unchanged; only the
+            # selected fine heads receive the auxiliary classification loss.
+            if resolution not in supervision_levels:
+                continue
             selected, indices = sparse_depth_at_resolution(
                 sparse_depth, scores.shape[-2:], return_indices=True)
             matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
@@ -80,6 +89,7 @@ class ScalePropagationDepthCompletionModel(object):
             for name, label in [('keep', 0), ('reject', 1), ('ignored', -1)]:
                 loss_info['rejection_{}_count_r{}'.format(name, resolution)] = (labels == label).sum()
         # No 4**(-r) factor: coarse rejection must not lose its direct signal.
+        # Average only the requested resolutions (default: full and half).
         loss = torch.stack(losses).mean()
         loss_info['loss_rejection'] = loss
         return loss, loss_info

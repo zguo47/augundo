@@ -393,9 +393,9 @@ class ScaleUpdateBlock(nn.Module):
 
 def refine_scale(
         feature, scaleless_depth, scale, sparse_scale, keep_mask,
-        anchor_scale, anchor_support, scale_update):
+        anchor_scale, anchor_support, scale_update, n_scale_refinement=2):
     '''Apply two weight-shared corrections after propagation, without restoration.'''
-    for _ in range(2):
+    for _ in range(n_scale_refinement):
         # Recompute feedback from the latest scale, not the original inherited
         # map. Missing/rejected measurements contribute neither ratios nor error.
         refinement_input = torch.cat([
@@ -423,7 +423,8 @@ class PropagationDecoderBlock(nn.Module):
             gumbel_temperature,
             use_outlier_rejection,
             n_propagation_iterations=4,
-            max_predict_depth=8.0):
+            max_predict_depth=8.0,
+            n_scale_refinement=2):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry features, scaleless geometry, and scale separately. Add this
@@ -436,6 +437,7 @@ class PropagationDecoderBlock(nn.Module):
         self.use_outlier_rejection = use_outlier_rejection
         self.n_propagation_iterations = n_propagation_iterations
         self.max_predict_depth = max_predict_depth
+        self.n_scale_refinement = n_scale_refinement
         self.scale_upsampling = FeatureGuidedScaleUpsampling(n_channels)
         self.depth_update = Conv2d(
             n_channels,
@@ -527,7 +529,8 @@ class PropagationDecoderBlock(nn.Module):
         # The inherited map itself is never diffused or overwritten by anchors.
         scale = refine_scale(
             feature, scaleless_depth, scale, sparse_scale, keep_mask,
-            anchor_scale, anchor_support, self.scale_update)
+            anchor_scale, anchor_support, self.scale_update,
+            self.n_scale_refinement)
         # Keep the learned correction at all pixels, including accepted sources.
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
@@ -544,7 +547,8 @@ class ScalePropagationDepthModel(nn.Module):
                  gumbel_temperature=1.0,
                  use_outlier_rejection=True,
                  n_propagation_iterations=(2, 4, 6, 8, 12),
-                 detach_scaleless_depth=True):
+                 detach_scaleless_depth=True,
+                 n_scale_refinement=2):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -552,6 +556,7 @@ class ScalePropagationDepthModel(nn.Module):
         self.gumbel_temperature = gumbel_temperature
         self.use_outlier_rejection = use_outlier_rejection
         self.detach_scaleless_depth = detach_scaleless_depth
+        self.n_scale_refinement = n_scale_refinement
         # Iteration counts are ordered from the bottom to full resolution.
         # Coarse scales are denser; finer scales receive more exchanges.
         self.n_propagation_iterations = n_propagation_iterations
@@ -590,7 +595,8 @@ class ScalePropagationDepthModel(nn.Module):
                 gumbel_temperature=gumbel_temperature,
                 use_outlier_rejection=use_outlier_rejection,
                 n_propagation_iterations=n_iteration,
-                max_predict_depth=max_predict_depth)
+                max_predict_depth=max_predict_depth,
+                n_scale_refinement=n_scale_refinement)
             for n_iteration in n_propagation_iterations[1:]
         ])
 
@@ -651,7 +657,8 @@ class ScalePropagationDepthModel(nn.Module):
             sparse_scale)
         scale = refine_scale(
             coarse_feature, scaleless_depth, scale, sparse_scale, keep_mask,
-            anchor_scale, anchor_support, self.scale_update)
+            anchor_scale, anchor_support, self.scale_update,
+            self.n_scale_refinement)
         # Pass the learned scale onward without restoring measurement values.
 
         feature = coarse_feature

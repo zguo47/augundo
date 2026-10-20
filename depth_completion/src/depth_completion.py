@@ -94,7 +94,10 @@ def train(train_images_path,
           detach_scaleless_depth=True,
           supervise_outlier_rejection=False,
           rejection_keep_tolerance=(0.1, 0.02),
-          rejection_reject_tolerance=(0.3, 0.05)):
+          rejection_reject_tolerance=(0.3, 0.05),
+          rejection_supervision_levels=(0, 1),
+          n_propagation_iterations=(2, 4, 6, 8, 12),
+          n_scale_refinement=2):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -280,7 +283,9 @@ def train(train_images_path,
         n_shift=n_shift,
         use_outlier_rejection=use_outlier_rejection,
         device=device,
-        detach_scaleless_depth=detach_scaleless_depth)
+        detach_scaleless_depth=detach_scaleless_depth,
+        n_propagation_iterations=n_propagation_iterations,
+        n_scale_refinement=n_scale_refinement)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
 
@@ -305,6 +310,9 @@ def train(train_images_path,
                 detach_scaleless_depth=detach_scaleless_depth,
                 supervise_outlier_rejection=supervise_outlier_rejection,
                 rejection_supervision_active=rejection_supervision_active,
+                rejection_supervision_levels=list(rejection_supervision_levels),
+                n_propagation_iterations=list(n_propagation_iterations),
+                n_scale_refinement=n_scale_refinement,
                 rejection_keep_tolerance=rejection_keep_tolerance,
                 rejection_reject_tolerance=rejection_reject_tolerance,
                 w_rejection=w_losses.get('w_rejection', 0.1),
@@ -375,10 +383,14 @@ def train(train_images_path,
 
     if 'scale_propagation' in model_name:
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
+        log('n_propagation_iterations={}  n_scale_refinement={}'.format(
+            n_propagation_iterations, n_scale_refinement), log_path)
         log('supervise_outlier_rejection={}  effective={}  w_rejection={}'.format(
             supervise_outlier_rejection, rejection_supervision_active,
             w_losses.get('w_rejection', 0.1)), log_path)
         if rejection_supervision_active:
+            log('rejection_supervision_levels={} (0=full, 4=bottom)'.format(
+                rejection_supervision_levels), log_path)
             log('rejection_keep_tolerance={}  rejection_reject_tolerance={}'.format(
                 rejection_keep_tolerance, rejection_reject_tolerance), log_path)
 
@@ -686,7 +698,8 @@ def train(train_images_path,
                 rejection_target = geometric_outputs[3]
                 rejection_loss, rejection_info = depth_completion_model.compute_loss_rejection(
                     rejection_target, input_sparse_depth0, rejection_logits,
-                    rejection_keep_tolerance, rejection_reject_tolerance)
+                    rejection_keep_tolerance, rejection_reject_tolerance,
+                    rejection_supervision_levels)
                 if is_debug_step:
                     depth_debug.rejection_training(
                         rejection_logits, input_sparse_depth0, rejection_target)

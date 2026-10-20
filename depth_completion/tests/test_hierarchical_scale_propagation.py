@@ -73,7 +73,8 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertEqual(len(normal), 16)
         for a, b in zip(maps, without_aux):
             torch.testing.assert_close(a, b)
-        value, info = wrapper.compute_loss_rejection(target, sparse, logits)
+        value, info = wrapper.compute_loss_rejection(
+            target, sparse, logits, supervision_levels=range(5))
         torch.testing.assert_close(value, torch.stack([
             info['loss_rejection_r{}'.format(r)] for r in range(5)]).mean())
         for r in range(5):
@@ -90,10 +91,48 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         flipped_sparse, flipped_target = sparse.flip(-1), target.flip(-1)
         flipped = wrapper.forward_depth(image.flip(-1), flipped_sparse, return_all_outputs=True,
                                         return_rejection_outputs=True)[1]
-        _, info = wrapper.compute_loss_rejection(flipped_target, flipped_sparse, flipped)
+        _, info = wrapper.compute_loss_rejection(
+            flipped_target, flipped_sparse, flipped, supervision_levels=range(5))
         for r, scores in enumerate(flipped):
             n_selected = int((sparse_depth_at_resolution(flipped_sparse, scores.shape[-2:]) > 0).sum())
             self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
+
+    def test_rejection_supervision_defaults_to_fine_levels(self):
+        wrapper = self.make_wrapper(True)
+        sparse = torch.full((1, 1, 17, 25), 20.)
+        target = torch.full_like(sparse, 5.)
+        for levels in [(0, 1), (0,), tuple(range(5))]:
+            logits = [torch.zeros(1, 2, h, w, requires_grad=True)
+                      for h, w in [(17, 25), (9, 13), (5, 7), (3, 4), (2, 2)]]
+            if levels == (0, 1):
+                loss, info = wrapper.compute_loss_rejection(target, sparse, logits)
+            else:
+                loss, info = wrapper.compute_loss_rejection(
+                    target, sparse, logits, supervision_levels=levels)
+            torch.testing.assert_close(loss, torch.stack([
+                info['loss_rejection_r{}'.format(r)] for r in levels]).mean())
+            loss.backward()
+            for r, scores in enumerate(logits):
+                self.assertEqual(scores.grad is not None, r in levels)
+                self.assertEqual('loss_rejection_r{}'.format(r) in info, r in levels)
+
+    def test_configurable_propagation_and_refinement_counts(self):
+        image, sparse = torch.rand(1, 3, 17, 25), torch.zeros(1, 1, 17, 25)
+        sparse[:, :, 7, 11] = 5.
+        for iterations, passes in [((1, 2, 3, 4, 6), 1), ((0, 0, 0, 0, 0), 0),
+                                    ((2, 4, 6, 8, 12), 2)]:
+            model = ScalePropagationDepthModel(
+                n_channels=8, use_outlier_rejection=False,
+                n_propagation_iterations=iterations, n_scale_refinement=passes).eval()
+            stages = [model] + list(model.decoder)
+            self.assertEqual([s.scale_propagation.n_propagation_iterations for s in stages],
+                             list(iterations))
+            with mock.patch('scale_propagation_model.ScaleUpdateBlock.forward',
+                            autospec=True, side_effect=lambda module, x: module.convolutions(x)) as update:
+                output = model(image, sparse)
+            self.assertEqual(update.call_count, 5 * passes)
+            self.assertEqual(output.shape, sparse.shape)
+            self.assertTrue(torch.isfinite(output).all())
 
     def test_encoder_uses_three_convolutions_per_level_without_attention_or_position(self):
         encoder = SharedEncoder(n_channels=8, n_head=4)

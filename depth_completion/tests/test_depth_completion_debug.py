@@ -351,6 +351,8 @@ class DepthDebugTest(unittest.TestCase):
                                                '--checkpoint_path', str(root / enabled)]
                 if enabled.startswith('rejection_'):
                     argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true']
+                    argv += ['--n_propagation_iterations', '1', '2', '3', '4', '6',
+                             '--n_scale_refinement', '1']
                 # The repository targets older Pillow; adapt only this test's environment.
                 lanczos = getattr(Image, 'Resampling', Image).LANCZOS
                 get_cmap = getattr(
@@ -398,7 +400,15 @@ class DepthDebugTest(unittest.TestCase):
             reports = [r for r in supervised if r['event'] == 'rejection_supervision']
             self.assertTrue(any(r['phase'] == 'train' and r['reject_target_count'] > 0 for r in reports))
             self.assertTrue(any(r['phase'] == 'validation' for r in reports))
-            self.assertTrue(all(r['supervision_enabled'] for r in reports))
+            self.assertTrue(all(r['supervision_enabled'] ==
+                                (r['level'] in ['decoder.2', 'decoder.3']) for r in reports))
+            config = next(r for r in supervised if r['event'] == 'configuration')
+            self.assertEqual(config['settings']['rejection_supervision_levels'], [0, 1])
+            self.assertEqual(config['propagation_iterations'], [1, 2, 3, 4, 6])
+            self.assertEqual(config['settings']['n_scale_refinement'], 1)
+            refinements = [r for r in supervised if r['event'] == 'scale_refinement']
+            self.assertTrue(refinements)
+            self.assertTrue(all(r['refinement_iteration'] == 1 for r in refinements))
             train = next(r for r in supervised if r['event'] == 'training_prediction')
             self.assertIn('loss_rejection_weighted', train['loss_info'])
             gradients = next(r for r in supervised if r['event'] == 'gradient_objectives')

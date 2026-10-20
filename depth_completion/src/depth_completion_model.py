@@ -30,7 +30,9 @@ class DepthCompletionModel(object):
                  n_shift=4,
                  use_outlier_rejection=True,
                  device=torch.device('cuda'),
-                 detach_scaleless_depth=True):
+                 detach_scaleless_depth=True,
+                 n_propagation_iterations=(2, 4, 6, 8, 12),
+                 n_scale_refinement=2):
 
         self.model_name = model_name
         self.network_modules = network_modules
@@ -63,7 +65,9 @@ class DepthCompletionModel(object):
                 max_predict_depth=max_predict_depth,
                 use_outlier_rejection=use_outlier_rejection,
                 device=device,
-                detach_scaleless_depth=detach_scaleless_depth)
+                detach_scaleless_depth=detach_scaleless_depth,
+                n_propagation_iterations=n_propagation_iterations,
+                n_scale_refinement=n_scale_refinement)
         elif 'partition_attention_patch_token_ablation' in model_name:
             from partition_attention_patch_token_ablation_depth_completion_model import \
                 PartitionAttentionPatchTokenAblationDepthCompletionModel
@@ -176,9 +180,11 @@ class DepthCompletionModel(object):
             return_all_outputs)
 
     def compute_loss_rejection(self, target_depth, sparse_depth, logits,
-                               keep_tolerance, reject_tolerance):
+                               keep_tolerance, reject_tolerance,
+                               supervision_levels=(0, 1)):
         return self.model.compute_loss_rejection(
-            target_depth, sparse_depth, logits, keep_tolerance, reject_tolerance)
+            target_depth, sparse_depth, logits, keep_tolerance, reject_tolerance,
+            supervision_levels)
 
     def forward_pose(self, image0, image1):
         '''

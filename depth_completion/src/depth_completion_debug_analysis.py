@@ -212,6 +212,7 @@ class StageDiagnostics(object):
                           false_keep=int((reject & (prediction == 0)).sum()))
             n_keep, n_reject = int(keep.sum()), int(reject.sum())
             n_predicted_reject = counts['true_reject'] + counts['false_reject']
+            resolution = 4 if level == 'bottom' else 3 - int(level.split('.')[1])
             report = dict(level=level, keep_target_count=n_keep, reject_target_count=n_reject,
                           ambiguous_count=int((known & (labels == -1)).sum()),
                           missing_gt_count=int((measured & ~known).sum()),
@@ -222,7 +223,8 @@ class StageDiagnostics(object):
                           keep_probability_on_good=statistics(probability[keep]),
                           keep_probability_on_bad=statistics(probability[reject]),
                           keep_tolerance=keep_tolerance, reject_tolerance=reject_tolerance,
-                          supervision_enabled=self.settings.get('rejection_supervision_active', False),
+                          supervision_enabled=self.settings.get('rejection_supervision_active', False) and
+                          resolution in self.settings.get('rejection_supervision_levels', (0, 1)),
                           balanced_ce=float(loss_utils.balanced_rejection_loss_func(logits, labels)),
                           label_scope='selected original pixel in aligned input coordinates; raw unclamped GT')
             self.emit('rejection_supervision', **report)
