@@ -48,6 +48,9 @@ parser.add_argument('--n_self_attention',
     type=int, default=2, help='Number of consecutive self-attention blocks')
 parser.add_argument('--n_shift',
     type=int, default=4, help='Number of regular/shifted attention pairs')
+parser.add_argument('--encoder_type',
+    choices=['conv', 'conv_attention'], default='conv',
+    help='Scale encoder architecture; match the choice used during training')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 
@@ -112,4 +115,5 @@ if __name__ == '__main__':
         save_outputs=args.save_outputs,
         keep_input_filenames=args.keep_input_filenames,
         # Hardware settings
-        device=args.device)
+        device=args.device,
+        encoder_type=args.encoder_type)

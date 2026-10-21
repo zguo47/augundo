@@ -219,6 +219,68 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
                             for parameter in encoder.parameters()))
 
+    def test_optional_encoder_has_requested_convolutions_and_attention_order(self):
+        encoder = SharedEncoder(n_channels=8, n_head=4, encoder_type='conv_attention')
+        order = []
+        for level, count in enumerate([3, 6, 6, 4, 4]):
+            block = getattr(encoder, 'level{}'.format(level))
+            self.assertEqual(len(block.convolutions), count)
+            self.assertEqual([c.conv.stride for c in block.convolutions],
+                             [(1, 1) if level == 0 else (2, 2)] + [(1, 1)] * (count - 1))
+            block.register_forward_hook(
+                lambda module, inputs, output, level=level: order.append('conv{}'.format(level)))
+        for level in [3, 4]:
+            attention = getattr(encoder, 'level{}_attention'.format(level))
+            self.assertEqual(len(attention), 2)
+            for index, block in enumerate(attention):
+                block.register_forward_hook(lambda module, inputs, output, level=level, index=index:
+                                            order.append('sa{}.{}'.format(level, index)))
+        with mock.patch('scale_propagation_model.add_position_encoding',
+                        wraps=sys.modules['scale_propagation_model'].add_position_encoding) as position:
+            features = encoder(torch.rand(1, 3, 17, 25), torch.rand(1, 1, 17, 25))
+        self.assertEqual(position.call_count, 2)
+        self.assertEqual(order, ['conv0', 'conv1', 'conv2', 'conv3', 'sa3.0', 'sa3.1',
+                                 'conv4', 'sa4.0', 'sa4.1'])
+        self.assertEqual([tuple(f.shape) for f in features], [
+            (1, 8, 17, 25), (1, 8, 9, 13), (1, 8, 5, 7), (1, 8, 3, 4), (1, 8, 2, 2)])
+        sum(f.square().mean() for f in features).backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
+                            for p in encoder.parameters()))
+
+    def test_encoder_default_and_explicit_conv_have_identical_parameters(self):
+        rng = torch.get_rng_state()
+        default = SharedEncoder(n_channels=8, n_head=4)
+        torch.set_rng_state(rng)
+        explicit = SharedEncoder(n_channels=8, n_head=4, encoder_type='conv')
+        self.assertEqual(set(default.state_dict()), set(explicit.state_dict()))
+        self.assertFalse(any('attention' in key for key in default.state_dict()))
+        for key, value in default.state_dict().items():
+            torch.testing.assert_close(value, explicit.state_dict()[key], rtol=0, atol=0)
+
+    def test_optional_encoder_selection_through_repository_wrapper(self):
+        from depth_completion_model import DepthCompletionModel
+        model = DepthCompletionModel(
+            model_name='scale_propagation_kitti', network_modules=[],
+            min_predict_depth=1.5, max_predict_depth=100., device=torch.device('cpu'),
+            use_outlier_rejection=False, encoder_type='conv_attention')
+        self.assertEqual(model.model.model_depth.encoder.encoder_type, 'conv_attention')
+        sparse = torch.zeros(1, 1, 17, 25)
+        output = model.forward_depth(torch.rand(1, 3, 17, 25), sparse, torch.zeros_like(sparse))
+        self.assertEqual(output.shape, sparse.shape)
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_inference_cli_forwards_encoder_selection(self):
+        import runpy
+        script = os.path.join(os.path.dirname(__file__), '..', 'src', 'run_depth_completion.py')
+        for selected in [None, 'conv_attention']:
+            argv = [script, '--image_path', 'images.txt', '--sparse_depth_path', 'sparse.txt',
+                    '--intrinsics_path', 'intrinsics.txt', '--output_path', 'outputs', '--device', 'cpu']
+            if selected is not None:
+                argv += ['--encoder_type', selected]
+            with mock.patch.object(sys, 'argv', argv), mock.patch('depth_completion.run') as run:
+                runpy.run_path(script, run_name='__main__')
+            self.assertEqual(run.call_args.kwargs['encoder_type'], selected or 'conv')
+
     def test_guided_scale_initialization_matches_bilinear_for_arbitrary_shapes(self):
         upsampling = FeatureGuidedScaleUpsampling(n_channels=3)
         for coarse_size, fine_size in [

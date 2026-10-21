@@ -74,9 +74,9 @@ class SelfAttentionBlock(nn.Module):
 
 
 class ConvolutionBlock(nn.Module):
-    '''Three spatial convolutions; the first optionally downsamples.'''
+    '''Spatial convolutions (three by default); the first optionally downsamples.'''
 
-    def __init__(self, in_channels, out_channels, stride):
+    def __init__(self, in_channels, out_channels, stride, n_convolution=3):
         super(ConvolutionBlock, self).__init__()
 
         self.convolutions = nn.Sequential(
@@ -98,6 +98,14 @@ class ConvolutionBlock(nn.Module):
                 kernel_size=3,
                 stride=1,
                 activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
+        # Keep the existing three layers and their parameter names unchanged.
+        for index in range(3, n_convolution):
+            self.convolutions.add_module(str(index), Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                stride=1,
+                activation_func=torch.nn.LeakyReLU(negative_slope=0.10, inplace=True)))
 
     def forward(self, feature):
         return self.convolutions(feature)
@@ -106,14 +114,26 @@ class ConvolutionBlock(nn.Module):
 class SharedEncoder(nn.Module):
     '''Five-resolution encoder shared by concatenated RGB and sparse depth.'''
 
-    def __init__(self, n_channels, n_head):
+    def __init__(self, n_channels, n_head, encoder_type='conv'):
         super(SharedEncoder, self).__init__()
 
-        self.level0 = ConvolutionBlock(4, n_channels, stride=1)
-        self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2)
-        self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2)
-        self.level3 = ConvolutionBlock(n_channels, n_channels, stride=2)
-        self.level4 = ConvolutionBlock(n_channels, n_channels, stride=2)
+        self.encoder_type = encoder_type
+        n_convolution = (3, 6, 6, 4, 4) if encoder_type == 'conv_attention' else (3, 3, 3, 3, 3)
+        self.level0 = ConvolutionBlock(4, n_channels, stride=1, n_convolution=n_convolution[0])
+        self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[1])
+        self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[2])
+        self.level3 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[3])
+        self.level4 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[4])
+        if encoder_type == 'conv_attention':
+            # Reuse the existing full self-attention blocks at 1/8 and 1/16.
+            self.level3_attention = nn.ModuleList([
+                SelfAttentionBlock(n_channels=n_channels, n_head=n_head)
+                for _ in range(2)
+            ])
+            self.level4_attention = nn.ModuleList([
+                SelfAttentionBlock(n_channels=n_channels, n_head=n_head)
+                for _ in range(2)
+            ])
 
     def attention_level(self, feature, attention_blocks):
         n_batch, n_channel, n_height, n_width = feature.shape
@@ -137,7 +157,11 @@ class SharedEncoder(nn.Module):
         level1 = self.level1(level0)
         level2 = self.level2(level1)
         level3 = self.level3(level2)
+        if self.encoder_type == 'conv_attention':
+            level3 = self.attention_level(level3, self.level3_attention)
         level4 = self.level4(level3)
+        if self.encoder_type == 'conv_attention':
+            level4 = self.attention_level(level4, self.level4_attention)
 
         return [level0, level1, level2, level3, level4]
 
@@ -532,7 +556,8 @@ class ScalePropagationDepthModel(nn.Module):
                  use_outlier_rejection=True,
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  detach_scaleless_depth=True,
-                 n_scale_refinement=2):
+                 n_scale_refinement=2,
+                 encoder_type='conv'):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -548,7 +573,8 @@ class ScalePropagationDepthModel(nn.Module):
         # Takes in RGB and sparse depth together and produce 5 feature maps.
         self.encoder = SharedEncoder(
             n_channels=n_channels,
-            n_head=n_head)
+            n_head=n_head,
+            encoder_type=encoder_type)
 
         # Positive bottom prediction supplies both a normalized scaleless depth
         self.coarse_scaleless_depth = Conv2d(

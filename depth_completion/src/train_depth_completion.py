@@ -75,6 +75,9 @@ parser.add_argument('--n_self_attention',
     type=int, default=2, help='Number of consecutive self-attention blocks')
 parser.add_argument('--n_shift',
     type=int, default=4, help='Number of regular/shifted attention pairs')
+parser.add_argument('--encoder_type',
+    choices=['conv', 'conv_attention'], default='conv',
+    help='Scale encoder: current 3/3/3/3/3 conv or 3/6/6/4+2SA/4+2SA')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 parser.add_argument('--detach_scaleless_depth',
@@ -321,6 +324,7 @@ if __name__ == '__main__':
           detach_scaleless_depth=args.detach_scaleless_depth,
           supervise_outlier_rejection=args.supervise_outlier_rejection,
           rejection_loss_type=args.rejection_loss_type,
+          encoder_type=args.encoder_type,
           rejection_supervision_levels=args.rejection_supervision_levels,
           n_propagation_iterations=args.n_propagation_iterations,
           n_scale_refinement=args.n_scale_refinement,

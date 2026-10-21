@@ -345,12 +345,14 @@ class DepthDebugTest(unittest.TestCase):
             script = os.path.join(os.path.dirname(__file__), '..', 'src', 'train_depth_completion.py')
             sys.path.insert(0, os.path.dirname(script))
             for enabled in ['false', 'true', 'rejection_false', 'rejection_true',
-                            'l1_false', 'l1_true', 'none', 'none_reference']:
+                            'l1_false', 'l1_true', 'none', 'none_reference', 'encoder_true']:
                 torch.manual_seed(3)
                 np.random.seed(3)
                 debug_enabled = 'true' if enabled in ['none', 'none_reference'] else enabled.split('_')[-1]
                 argv = [script] + arguments + ['--debug_depth', debug_enabled,
                                                '--checkpoint_path', str(root / enabled)]
+                if enabled == 'encoder_true':
+                    argv += ['--encoder_type', 'conv_attention']
                 if enabled in ['none', 'none_reference']:
                     argv += ['--debug_depth', 'true', '--use_outlier_rejection', 'true',
                              '--supervise_outlier_rejection', 'true',
@@ -464,6 +466,16 @@ class DepthDebugTest(unittest.TestCase):
                     weights.append(torch.load(str(path), map_location='cpu')['model_state_dict'])
                 for name in weights[0]:
                     self.assertTrue(torch.equal(weights[0][name], weights[1][name]), (pair, name))
+            encoder_records = [json.loads(line) for line in
+                               (root / 'encoder_true/debug/diagnostics.jsonl').read_text().splitlines()]
+            encoder_config = next(r for r in encoder_records if r['event'] == 'configuration')
+            self.assertEqual(encoder_config['settings']['encoder_type'], 'conv_attention')
+            path = next((root / 'encoder_true').glob('checkpoints-1*'))
+            if path.is_dir():
+                path = next(path.glob('scale-propagation-*.pth'))
+            weights = torch.load(str(path), map_location='cpu')['model_state_dict']
+            self.assertIn('encoder.level1.convolutions.5.conv.weight', weights)
+            self.assertIn('encoder.level3_attention.1.attention.in_proj_weight', weights)
 
 
 if __name__ == '__main__':

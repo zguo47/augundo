@@ -98,7 +98,8 @@ def train(train_images_path,
           rejection_supervision_levels=None,
           n_propagation_iterations=(2, 4, 6, 8, 12),
           n_scale_refinement=2,
-          rejection_loss_type='cross_entropy'):
+          rejection_loss_type='cross_entropy',
+          encoder_type='conv'):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -291,7 +292,8 @@ def train(train_images_path,
         device=device,
         detach_scaleless_depth=detach_scaleless_depth,
         n_propagation_iterations=n_propagation_iterations,
-        n_scale_refinement=n_scale_refinement)
+        n_scale_refinement=n_scale_refinement,
+        encoder_type=encoder_type)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
 
@@ -313,6 +315,7 @@ def train(train_images_path,
         depth_debug.provenance(
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
+                encoder_type=encoder_type,
                 detach_scaleless_depth=detach_scaleless_depth,
                 supervise_outlier_rejection=supervise_outlier_rejection,
                 rejection_supervision_active=rejection_supervision_active,
@@ -391,6 +394,7 @@ def train(train_images_path,
 
     if 'scale_propagation' in model_name:
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
+        log('encoder_type={}'.format(encoder_type), log_path)
         log('n_propagation_iterations={}  n_scale_refinement={}'.format(
             n_propagation_iterations, n_scale_refinement), log_path)
         log('supervise_outlier_rejection={}  effective={}  w_rejection={}'.format(
@@ -1134,7 +1138,8 @@ def run(image_path,
         save_outputs,
         keep_input_filenames,
         # Hardware settings
-        device):
+        device,
+        encoder_type='conv'):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -1232,7 +1237,8 @@ def run(image_path,
         n_self_attention=n_self_attention,
         n_shift=n_shift,
         use_outlier_rejection=use_outlier_rejection,
-        device=device)
+        device=device,
+        encoder_type=encoder_type)
 
     # Restore model and set to evaluation mode
     depth_model.restore_model(restore_paths)
