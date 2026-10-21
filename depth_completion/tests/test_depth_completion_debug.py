@@ -344,11 +344,22 @@ class DepthDebugTest(unittest.TestCase):
                 arguments.extend(['--' + flag, str(root / (name + '.txt'))])
             script = os.path.join(os.path.dirname(__file__), '..', 'src', 'train_depth_completion.py')
             sys.path.insert(0, os.path.dirname(script))
-            for enabled in ['false', 'true', 'rejection_false', 'rejection_true']:
+            for enabled in ['false', 'true', 'rejection_false', 'rejection_true',
+                            'l1_false', 'l1_true', 'none', 'none_reference']:
                 torch.manual_seed(3)
                 np.random.seed(3)
-                argv = [script] + arguments + ['--debug_depth', enabled.split('_')[-1],
+                debug_enabled = 'true' if enabled in ['none', 'none_reference'] else enabled.split('_')[-1]
+                argv = [script] + arguments + ['--debug_depth', debug_enabled,
                                                '--checkpoint_path', str(root / enabled)]
+                if enabled in ['none', 'none_reference']:
+                    argv += ['--debug_depth', 'true', '--use_outlier_rejection', 'true',
+                             '--supervise_outlier_rejection', 'true',
+                             '--rejection_loss_type', 'none' if enabled == 'none' else 'cross_entropy']
+                    if enabled == 'none_reference':
+                        argv += ['--supervise_outlier_rejection', 'false']
+                if enabled.startswith('l1_'):
+                    argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true',
+                             '--rejection_loss_type', 'l1']
                 if enabled.startswith('rejection_'):
                     argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true']
                     argv += ['--n_propagation_iterations', '1', '2', '3', '4', '6',
@@ -426,6 +437,33 @@ class DepthDebugTest(unittest.TestCase):
                 extra.append(torch.load(str(path), map_location='cpu')['model_state_dict'])
             for name in extra[0]:
                 self.assertTrue(torch.equal(extra[0][name], extra[1][name]), name)
+            l1_records = [json.loads(line) for line in
+                          (root / 'l1_true/debug/diagnostics.jsonl').read_text().splitlines()]
+            l1_config = next(r for r in l1_records if r['event'] == 'configuration')['settings']
+            self.assertEqual(l1_config['rejection_loss_type'], 'l1')
+            self.assertTrue(l1_config['rejection_loss_active'])
+            self.assertFalse(l1_config['rejection_supervision_active'])
+            self.assertEqual(l1_config['rejection_supervision_levels'], list(range(5)))
+            l1 = next(r for r in l1_records if r['event'] == 'rejection_sparsity')
+            self.assertEqual(len(l1['fractions']), 5)
+            self.assertTrue(0. <= l1['loss'] <= 1.)
+            objectives = next(r for r in l1_records if r['event'] == 'gradient_objectives')
+            self.assertTrue(any(v['rejection_norm'] > 0. for v in objectives['groups'].values()))
+            none_records = [json.loads(line) for line in
+                            (root / 'none/debug/diagnostics.jsonl').read_text().splitlines()]
+            none_config = next(r for r in none_records if r['event'] == 'configuration')['settings']
+            self.assertFalse(none_config['rejection_loss_active'])
+            none_loss = next(r for r in none_records if r['event'] == 'training_prediction')['loss_info']
+            self.assertNotIn('loss_rejection', none_loss)
+            for pair in [('l1_false', 'l1_true'), ('none', 'none_reference')]:
+                weights = []
+                for name in pair:
+                    path = next((root / name).glob('checkpoints-1*'))
+                    if path.is_dir():
+                        path = next(path.glob('scale-propagation-*.pth'))
+                    weights.append(torch.load(str(path), map_location='cpu')['model_state_dict'])
+                for name in weights[0]:
+                    self.assertTrue(torch.equal(weights[0][name], weights[1][name]), (pair, name))
 
 
 if __name__ == '__main__':

@@ -40,7 +40,8 @@ class ScalePropagationDepthCompletionModel(object):
                       validity_map=None,
                       intrinsics=None,
                       return_all_outputs=False,
-                      return_rejection_outputs=False):
+                      return_rejection_outputs=False,
+                      return_rejection_masks=False):
         # Keep the shared repository call signature; this model derives sparse
         # measurement locations directly from positive depths at each level.
         del validity_map, intrinsics
@@ -49,8 +50,8 @@ class ScalePropagationDepthCompletionModel(object):
             image=image,
             sparse_depth=sparse_depth,
             return_all_outputs=return_all_outputs,
-            return_rejection_outputs=return_rejection_outputs)
-        if not return_all_outputs and not return_rejection_outputs:
+            return_rejection_outputs=return_rejection_outputs or return_rejection_masks)
+        if not return_all_outputs and not return_rejection_outputs and not return_rejection_masks:
             return output_depth
         # Flat, full-resolution tensors follow the repository's transform API.
         # Reverse geometric augmentation on every map before computing losses.
@@ -61,6 +62,9 @@ class ScalePropagationDepthCompletionModel(object):
             functional.interpolate(
                 value, size=image.shape[-2:], mode='bilinear', align_corners=True)
             for value in maps]
+        if return_rejection_masks:
+            # These are the exact masks used for anchor injection in this pass.
+            return outputs, output_depth['rejection_keep_masks']
         if return_rejection_outputs:
             # Keep native logits separate from the image/map transform API:
             # their labels are computed in the augmented input coordinates.
@@ -70,26 +74,36 @@ class ScalePropagationDepthCompletionModel(object):
     def compute_loss_rejection(self, target_depth, sparse_depth, logits,
                                keep_tolerance=(0.1, 0.02),
                                reject_tolerance=(0.3, 0.05),
-                               supervision_levels=(0, 1)):
-        '''Supervise each fresh rejection head equally at its native resolution.'''
+                               supervision_levels=None,
+                               loss_type='cross_entropy'):
+        '''Average selected-level classification or rejection-sparsity losses.'''
+        if supervision_levels is None:
+            supervision_levels = range(5) if loss_type == 'l1' else (0, 1)
+        if loss_type == 'none':
+            loss = logits[0].sum() * 0.0
+            return loss, {'loss_rejection': loss}
         losses, loss_info = [], {}
         for resolution, scores in enumerate(logits):
-            # Keep coarse rejection and metric gradients unchanged; only the
-            # selected fine heads receive the auxiliary classification loss.
+            # The same level selector applies to both objectives. In L1 mode,
+            # scores is a sampled keep mask rather than two-channel logits.
             if resolution not in supervision_levels:
                 continue
             selected, indices = sparse_depth_at_resolution(
                 sparse_depth, scores.shape[-2:], return_indices=True)
-            matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
-            labels = loss_utils.rejection_supervision_targets(
-                selected, matched, keep_tolerance, reject_tolerance)
-            value = loss_utils.balanced_rejection_loss_func(scores, labels)
+            if loss_type == 'l1':
+                value = loss_utils.rejection_sparsity_loss_func(scores, selected)
+                loss_info['rejection_rejected_fraction_r{}'.format(resolution)] = value.detach()
+            else:
+                matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
+                labels = loss_utils.rejection_supervision_targets(
+                    selected, matched, keep_tolerance, reject_tolerance)
+                value = loss_utils.balanced_rejection_loss_func(scores, labels)
+                for name, label in [('keep', 0), ('reject', 1), ('ignored', -1)]:
+                    loss_info['rejection_{}_count_r{}'.format(name, resolution)] = (labels == label).sum()
             losses.append(value)
             loss_info['loss_rejection_r{}'.format(resolution)] = value
-            for name, label in [('keep', 0), ('reject', 1), ('ignored', -1)]:
-                loss_info['rejection_{}_count_r{}'.format(name, resolution)] = (labels == label).sum()
         # No 4**(-r) factor: coarse rejection must not lose its direct signal.
-        # Average only the requested resolutions (default: full and half).
+        # Average only the requested resolutions; L1 defaults to all five.
         loss = torch.stack(losses).mean()
         loss_info['loss_rejection'] = loss
         return loss, loss_info

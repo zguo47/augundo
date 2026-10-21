@@ -651,8 +651,9 @@ class ScalePropagationDepthModel(nn.Module):
         # Native biased logits are auxiliary training outputs only. Ground
         # truth is never passed into this prediction network.
         rejection_levels = [rejection_logits] if return_rejection_outputs else []
+        rejection_keep_masks = [keep_mask] if return_rejection_outputs else []
         for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
-            feature, scaleless_depth, scale, _, rejection_logits, _ = decoder_block(
+            feature, scaleless_depth, scale, _, rejection_logits, keep_mask = decoder_block(
                 feature,
                 features[level],
                 scaleless_depth,
@@ -662,6 +663,7 @@ class ScalePropagationDepthModel(nn.Module):
             scale_maps.append(scale)
             if return_rejection_outputs:
                 rejection_levels.append(rejection_logits)
+                rejection_keep_masks.append(keep_mask)
 
         # Clamp before output.
         depth = torch.clamp(
@@ -683,4 +685,5 @@ class ScalePropagationDepthModel(nn.Module):
                     scaleless_depths, scale_maps)])
         if return_rejection_outputs:
             outputs['rejection_logits'] = rejection_levels[::-1]
+            outputs['rejection_keep_masks'] = rejection_keep_masks[::-1]
         return outputs

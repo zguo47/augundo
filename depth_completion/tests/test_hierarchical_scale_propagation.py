@@ -97,6 +97,72 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             n_selected = int((sparse_depth_at_resolution(flipped_sparse, scores.shape[-2:]) > 0).sum())
             self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
 
+    def test_rejection_l1_penalizes_rejected_valid_points_not_missing_pixels(self):
+        sparse = torch.tensor([[[[5., 0., 8., 0.]]]])
+        keep = torch.tensor([[[[1., 0., 0., 0.]]]], requires_grad=True)
+        value = loss_utils.rejection_sparsity_loss_func(keep, sparse)
+        self.assertEqual(float(value), 0.5)
+        value.backward()
+        torch.testing.assert_close(keep.grad, torch.tensor([[[[-0.5, 0., -0.5, 0.]]]]))
+        empty = torch.zeros_like(sparse, requires_grad=True)
+        value = loss_utils.rejection_sparsity_loss_func(empty, torch.zeros_like(sparse))
+        self.assertEqual(float(value), 0.)
+        value.backward()
+        torch.testing.assert_close(empty.grad, torch.zeros_like(empty))
+
+    def test_rejection_l1_defaults_to_all_levels_and_respects_selection(self):
+        wrapper = self.make_wrapper(True)
+        sparse = torch.ones(1, 1, 17, 25)
+        sizes = [(17, 25), (9, 13), (5, 7), (3, 4), (2, 2)]
+        for levels in [None, (0, 3)]:
+            masks = [torch.full((1, 1, h, w), float(r % 2), requires_grad=True)
+                     for r, (h, w) in enumerate(sizes)]
+            value, info = wrapper.compute_loss_rejection(
+                None, sparse, masks, supervision_levels=levels, loss_type='l1')
+            selected = range(5) if levels is None else levels
+            expected = sum(1. - float(r % 2) for r in selected) / len(selected)
+            self.assertAlmostEqual(float(value), expected, places=6)
+            value.backward()
+            for r, mask in enumerate(masks):
+                self.assertEqual(mask.grad is not None, r in selected)
+                self.assertEqual('rejection_rejected_fraction_r{}'.format(r) in info, r in selected)
+            self.assertFalse(any(k.startswith('rejection_reject_count') for k in info))
+        scores = [torch.zeros(1, 2, 1, 1, requires_grad=True)]
+        value, _ = wrapper.compute_loss_rejection(None, sparse, scores, loss_type='none')
+        self.assertEqual(float(value), 0.)
+        value.backward()
+        torch.testing.assert_close(scores[0].grad, torch.zeros_like(scores[0]))
+
+    def test_rejection_l1_uses_actual_forward_masks_without_resampling(self):
+        wrapper = self.make_wrapper(True)
+        sparse = torch.zeros(1, 1, 17, 25)
+        sparse[:, :, 7, 11] = 5.
+        image = torch.rand(1, 3, 17, 25)
+        masks_used = []
+        handles = [stage.scale_propagation.register_forward_pre_hook(
+            lambda module, inputs: masks_used.append(inputs[3]))
+            for stage in [wrapper.model_depth] + list(wrapper.model_depth.decoder)]
+        rng = torch.get_rng_state()
+        outputs, masks = wrapper.forward_depth(
+            image, sparse, return_all_outputs=True, return_rejection_masks=True)
+        after = torch.get_rng_state()
+        for returned, used in zip(masks, reversed(masks_used)):
+            self.assertIs(returned, used)
+        for handle in handles:
+            handle.remove()
+        torch.set_rng_state(rng)
+        ordinary = wrapper.forward_depth(image, sparse, return_all_outputs=True)
+        self.assertTrue(torch.equal(torch.get_rng_state(), after))
+        for a, b in zip(outputs, ordinary):
+            torch.testing.assert_close(a, b)
+        loss, _ = wrapper.compute_loss_rejection(None, sparse, masks, loss_type='l1')
+        loss.backward()
+        for stage in [wrapper.model_depth] + list(wrapper.model_depth.decoder):
+            gradient = stage.rejection_map.conv.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(float(gradient.abs().sum()), 0.)
+
     def test_rejection_supervision_defaults_to_fine_levels(self):
         wrapper = self.make_wrapper(True)
         sparse = torch.full((1, 1, 17, 25), 20.)

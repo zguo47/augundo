@@ -225,6 +225,10 @@ class StageDiagnostics(object):
                           keep_tolerance=keep_tolerance, reject_tolerance=reject_tolerance,
                           supervision_enabled=self.settings.get('rejection_supervision_active', False) and
                           resolution in self.settings.get('rejection_supervision_levels', (0, 1)),
+                          rejection_loss_type=self.settings.get('rejection_loss_type', 'cross_entropy'),
+                          rejection_loss_enabled=self.settings.get(
+                              'rejection_loss_active', self.settings.get('rejection_supervision_active', False)) and
+                          resolution in self.settings.get('rejection_supervision_levels', (0, 1)),
                           balanced_ce=float(loss_utils.balanced_rejection_loss_func(logits, labels)),
                           label_scope='selected original pixel in aligned input coordinates; raw unclamped GT')
             self.emit('rejection_supervision', **report)

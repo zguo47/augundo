@@ -149,7 +149,7 @@ class DepthCompletionModel(object):
             raise ValueError('Unsupported depth completion model: {}'.format(model_name))
 
     def forward_depth(self, image, sparse_depth, validity_map, intrinsics=None, return_all_outputs=False,
-                      return_rejection_outputs=False):
+                      return_rejection_outputs=False, return_rejection_masks=False):
         '''
         Forwards stereo pair through network
 
@@ -168,6 +168,10 @@ class DepthCompletionModel(object):
             list[torch.Tensor[float32]] : a single or list of N x 1 x H x W outputs
         '''
 
+        if return_rejection_masks:
+            return self.model.forward_depth(
+                image, sparse_depth, validity_map, intrinsics, return_all_outputs,
+                return_rejection_masks=True)
         if return_rejection_outputs:
             return self.model.forward_depth(
                 image, sparse_depth, validity_map, intrinsics, return_all_outputs,
@@ -181,10 +185,10 @@ class DepthCompletionModel(object):
 
     def compute_loss_rejection(self, target_depth, sparse_depth, logits,
                                keep_tolerance, reject_tolerance,
-                               supervision_levels=(0, 1)):
+                               supervision_levels=None, loss_type='cross_entropy'):
         return self.model.compute_loss_rejection(
             target_depth, sparse_depth, logits, keep_tolerance, reject_tolerance,
-            supervision_levels)
+            supervision_levels, loss_type)
 
     def forward_pose(self, image0, image1):
         '''

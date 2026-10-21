@@ -95,9 +95,10 @@ def train(train_images_path,
           supervise_outlier_rejection=False,
           rejection_keep_tolerance=(0.1, 0.02),
           rejection_reject_tolerance=(0.3, 0.05),
-          rejection_supervision_levels=(0, 1),
+          rejection_supervision_levels=None,
           n_propagation_iterations=(2, 4, 6, 8, 12),
-          n_scale_refinement=2):
+          n_scale_refinement=2,
+          rejection_loss_type='cross_entropy'):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -107,8 +108,13 @@ def train(train_images_path,
     else:
         raise ValueError('Unsupported device: {}'.format(device))
 
-    rejection_supervision_active = supervise_outlier_rejection and use_outlier_rejection and \
+    if rejection_supervision_levels is None:
+        rejection_supervision_levels = list(range(5)) if rejection_loss_type == 'l1' else [0, 1]
+    rejection_loss_active = supervise_outlier_rejection and use_outlier_rejection and \
         'scale_propagation' in model_name and supervision_type == 'supervised'
+    rejection_loss_active = rejection_loss_active and rejection_loss_type != 'none'
+    rejection_supervision_active = rejection_loss_active and rejection_loss_type == 'cross_entropy'
+    rejection_sparsity_active = rejection_loss_active and rejection_loss_type == 'l1'
 
     # Set up checkpoint and event paths
     if not os.path.exists(checkpoint_path):
@@ -310,6 +316,8 @@ def train(train_images_path,
                 detach_scaleless_depth=detach_scaleless_depth,
                 supervise_outlier_rejection=supervise_outlier_rejection,
                 rejection_supervision_active=rejection_supervision_active,
+                rejection_loss_active=rejection_loss_active,
+                rejection_loss_type=rejection_loss_type,
                 rejection_supervision_levels=list(rejection_supervision_levels),
                 n_propagation_iterations=list(n_propagation_iterations),
                 n_scale_refinement=n_scale_refinement,
@@ -386,9 +394,10 @@ def train(train_images_path,
         log('n_propagation_iterations={}  n_scale_refinement={}'.format(
             n_propagation_iterations, n_scale_refinement), log_path)
         log('supervise_outlier_rejection={}  effective={}  w_rejection={}'.format(
-            supervise_outlier_rejection, rejection_supervision_active,
+            supervise_outlier_rejection, rejection_loss_active,
             w_losses.get('w_rejection', 0.1)), log_path)
-        if rejection_supervision_active:
+        log('rejection_loss_type={}'.format(rejection_loss_type), log_path)
+        if rejection_loss_active:
             log('rejection_supervision_levels={} (0=full, 4=bottom)'.format(
                 rejection_supervision_levels), log_path)
             log('rejection_keep_tolerance={}  rejection_reject_tolerance={}'.format(
@@ -690,19 +699,27 @@ def train(train_images_path,
                 validity_map=input_validity_map0,
                 intrinsics=input_intrinsics,
                 return_all_outputs=True,
-                return_rejection_outputs=rejection_supervision_active)
-            if rejection_supervision_active:
-                output_depth0, rejection_logits = output_depth0
+                return_rejection_outputs=rejection_supervision_active,
+                return_rejection_masks=rejection_sparsity_active)
+            if rejection_loss_active:
+                output_depth0, rejection_outputs = output_depth0
                 # Match selected sparse pixels to GT in network coordinates,
                 # before reverse_transform changes the depth-map coordinates.
-                rejection_target = geometric_outputs[3]
+                rejection_target = geometric_outputs[3] if rejection_supervision_active else None
                 rejection_loss, rejection_info = depth_completion_model.compute_loss_rejection(
-                    rejection_target, input_sparse_depth0, rejection_logits,
+                    rejection_target, input_sparse_depth0, rejection_outputs,
                     rejection_keep_tolerance, rejection_reject_tolerance,
-                    rejection_supervision_levels)
-                if is_debug_step:
+                    rejection_supervision_levels, rejection_loss_type)
+                if is_debug_step and rejection_supervision_active:
                     depth_debug.rejection_training(
-                        rejection_logits, input_sparse_depth0, rejection_target)
+                        rejection_outputs, input_sparse_depth0, rejection_target)
+                if is_debug_step and rejection_sparsity_active:
+                    depth_debug.emit('rejection_sparsity',
+                                     levels=list(rejection_supervision_levels),
+                                     loss=float(rejection_loss.detach()),
+                                     fractions={k: float(v) for k, v in rejection_info.items()
+                                                if k.startswith('rejection_rejected_fraction_')},
+                                     mask_source='actual straight-through masks used for scale injection')
 
             if is_summary_step:
                 output_depth0_initial = output_depth0[0].detach().clone()
@@ -736,7 +753,7 @@ def train(train_images_path,
                 supervision_type=supervision_type,
                 w_losses=w_losses)
 
-            if rejection_supervision_active:
+            if rejection_loss_active:
                 weighted_rejection = w_losses.get('w_rejection', 0.1) * rejection_loss
                 loss = loss + weighted_rejection
                 loss_info.update(rejection_info)

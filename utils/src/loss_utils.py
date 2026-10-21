@@ -28,6 +28,18 @@ def rejection_supervision_targets(sparse_depth, target_depth,
     return labels
 
 
+def rejection_sparsity_loss_func(keep_mask, sparse_depth):
+    '''Penalize the fraction of valid sparse measurements rejected.
+
+    Use the actual straight-through Gumbel keep mask from propagation, not a
+    newly sampled decision or an argmax. Missing measurements contribute zero.
+    Rejection V * (1 - K) is nonnegative, so its sum is exactly its L1 norm.
+    '''
+    validity = (sparse_depth > 0.0).to(keep_mask.dtype)
+    rejection = validity * (1.0 - keep_mask)
+    return rejection.sum() / validity.sum().clamp_min(1)
+
+
 def balanced_rejection_loss_func(logits, labels):
     '''Average keep/reject cross-entropies separately, then average present classes.
 

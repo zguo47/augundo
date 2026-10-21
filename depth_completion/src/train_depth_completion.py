@@ -80,10 +80,13 @@ parser.add_argument('--use_outlier_rejection',
 parser.add_argument('--detach_scaleless_depth',
     type=parse_boolean, default=True, help='Detach scaleless depth in scale-propagation metric losses')
 parser.add_argument('--supervise_outlier_rejection',
-    type=parse_boolean, default=False, help='Supervise scale-propagation rejection using sparse/GT agreement')
+    type=parse_boolean, default=False, help='Enable the selected auxiliary rejection loss (cross_entropy or l1)')
+parser.add_argument('--rejection_loss_type',
+    choices=['cross_entropy', 'l1', 'none'], default='cross_entropy',
+    help='Auxiliary rejection objective; existing supervise_outlier_rejection flag enables it')
 parser.add_argument('--rejection_supervision_levels',
-    nargs='+', type=int, choices=range(5), default=[0, 1],
-    help='Rejection-supervised resolutions: 0=full, 1=half, ..., 4=bottom')
+    nargs='+', type=int, choices=range(5), default=None,
+    help='Rejection-loss resolutions: 0=full, ..., 4=bottom; defaults to 0 1 for cross_entropy, all for l1')
 parser.add_argument('--n_propagation_iterations',
     nargs=5, type=int, default=[2, 4, 6, 8, 12],
     help='Scale propagation exchanges at bottom, 1/8, 1/4, 1/2, full resolution; 0 disables exchanges')
@@ -317,6 +320,7 @@ if __name__ == '__main__':
           debug_max_samples=args.debug_max_samples,
           detach_scaleless_depth=args.detach_scaleless_depth,
           supervise_outlier_rejection=args.supervise_outlier_rejection,
+          rejection_loss_type=args.rejection_loss_type,
           rejection_supervision_levels=args.rejection_supervision_levels,
           n_propagation_iterations=args.n_propagation_iterations,
           n_scale_refinement=args.n_scale_refinement,
