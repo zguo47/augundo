@@ -52,7 +52,7 @@ class DepthDebugTest(unittest.TestCase):
             self.assertFalse(debug.trace)
             snapshot = np.load(os.path.join(directory, 'debug', 'fixed_0.npz'))
             self.assertIn('decoder.3__refinement_2__scale', snapshot.files)
-            self.assertIn('bottom__after_anchor_messages__outgoing_weights', snapshot.files)
+            self.assertIn('bottom__after_propagation__outgoing_weights', snapshot.files)
             self.assertIn('bottom__selected_indices', snapshot.files)
             self.assertTrue(os.path.isfile(os.path.join(directory, 'debug', 'worst_0_stages.npz')))
             with open(debug.path) as stream:
@@ -63,7 +63,7 @@ class DepthDebugTest(unittest.TestCase):
             self.assertTrue(any('accepted_anchor_distance_errors' in r for r in stages))
             self.assertTrue(any('multiplier' in r for r in stages))
             self.assertTrue(any(r['event'] == 'fixed_error_tracks' for r in records))
-            self.assertTrue(any(r['event'] == 'anchor_message_ablation' for r in records))
+            self.assertTrue(any(r['event'] == 'scale_propagation_ablation' for r in records))
             self.assertEqual(len([r for r in stages if r['step'] == 1000]), 56)
             debug.close()
 
@@ -234,10 +234,10 @@ class DepthDebugTest(unittest.TestCase):
                 accepted = inputs[3] > 0
                 self.assertNotIn('surface_compatibility', record)
                 self.assertIn('accepted_scale_residual', record)
-                self.assertEqual(record['accepted_scale_residual_scope'], 'anchor_message_before_refinement')
-                self.assertIn('anchor_support', record)
-                self.assertGreaterEqual(record['supported_fraction'], 0.)
-                self.assertLessEqual(record['supported_fraction'], 1.)
+                self.assertEqual(record['accepted_scale_residual_scope'], 'propagated_scale_before_refinement')
+                self.assertIn('propagated_scale', record)
+                self.assertIn('injected_scale', record)
+                self.assertNotIn('anchor_support', record)
                 self.assertEqual(record['sparse_scale_coordinates'],
                                  'original_selected_pixel_align_corners_true')
                 self.assertAlmostEqual(record['sparse_scale_target']['mean'],
@@ -416,8 +416,8 @@ class DepthDebugTest(unittest.TestCase):
             summary = json.loads((root / 'rejection_true/debug/validation_latest.json').read_text())
             self.assertEqual(len(summary['rejection_supervision']), 5)
             snapshot = np.load(root / 'rejection_true/debug/fixed_0.npz')
-            self.assertIn('bottom__after_anchor_messages__rejection_logits', snapshot.files)
-            self.assertTrue((snapshot['bottom__after_anchor_messages__rejection_labels'] == 1).any())
+            self.assertIn('bottom__after_propagation__rejection_logits', snapshot.files)
+            self.assertTrue((snapshot['bottom__after_propagation__rejection_labels'] == 1).any())
             extra = []
             for enabled in ['rejection_false', 'rejection_true']:
                 path = next((root / enabled).glob('checkpoints-1*'))

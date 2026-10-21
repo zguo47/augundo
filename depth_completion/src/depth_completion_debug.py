@@ -158,7 +158,7 @@ class DepthCompletionDebug(StageDiagnostics):
                   loss_definition='See captured loss_utils.py and model wrapper sources; detach sites in experiment_manifest',
                   propagation_activation='sigmoid',
                   sparse_scale_coordinates='original_selected_pixel_align_corners_true',
-                  sparse_injection='anchor_messages_only_without_anchor_restoration')
+                  sparse_injection='direct_scale_injection_once_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
                 continue
@@ -249,16 +249,16 @@ class DepthCompletionDebug(StageDiagnostics):
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
                         if name == 'scale_update' or name.endswith('.scale_update'):
-                            scale = inputs[0][:, -6:-5]
-                            accepted_scale = inputs[0][:, -5:-4]
-                            keep = inputs[0][:, -4:-3]
+                            scale = inputs[0][:, -4:-3]
+                            accepted_scale = inputs[0][:, -3:-2]
+                            keep = inputs[0][:, -2:-1]
                             refined = scale * torch.exp(torch.tanh(value))
                             level = 'bottom' if name == 'scale_update' else name.rsplit('.', 1)[0]
                             key = (name, str(value.device))
                             iteration = self.refinement_counts.get(key, 0) + 1
                             self.refinement_counts[key] = iteration
                             self.capture_stage(level, 'refinement_{}'.format(iteration),
-                                               inputs[0][:, -7:-6], refined,
+                                               inputs[0][:, -5:-4], refined,
                                                multiplier=torch.exp(torch.tanh(value)),
                                                **self.anchor_context.get(level, {}))
                             self.emit('scale_refinement', level=level,
@@ -293,33 +293,31 @@ class DepthCompletionDebug(StageDiagnostics):
                 self.handles.append(module.register_forward_hook(self.rejection_hook(level, parent)))
 
     def scale_hook(self, level):
-        '''Report anchor-message diffusion separately from the inherited scale.'''
+        '''Report direct scale injection and diffusion before learned refinement.'''
         def observe(module, inputs, output):
             if not self.active:
                 return
             with torch.no_grad():
                 scale, geometry, sparse, keep, logits, target = inputs
-                anchor_scale, support = output
+                propagated_scale = output
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
                 if self.context.get('phase') == 'validation':
-                    self.anchor_context[level] = dict(
-                        support=support, keep=keep)
+                    self.anchor_context[level] = dict(keep=keep)
                     self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else 'after_geometry_update',
                                        geometry, scale)
-                    self.capture_stage(level, 'after_anchor_messages', geometry, scale,
-                                       anchor_scale=anchor_scale, sparse_ratio=target,
+                    self.capture_stage(level, 'after_propagation', geometry, propagated_scale,
+                                       sparse_ratio=target,
                                        outgoing_weights=weights, **self.anchor_context[level])
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
                           output_stage='before_refinement',
                           inherited_scale=statistics(scale),
-                          anchor_scale=statistics(anchor_scale[support > 1e-7]),
-                          anchor_support=statistics(support),
-                          supported_fraction=float((support > 1e-7).float().mean()),
+                          injected_scale=statistics(keep * target + (1.0 - keep) * scale),
+                          propagated_scale=statistics(propagated_scale),
                           sparse_scale_target=statistics(target[accepted]),
-                          accepted_scale_residual=statistics((anchor_scale - target)[accepted]),
-                          accepted_scale_residual_scope='anchor_message_before_refinement',
+                          accepted_scale_residual=statistics((propagated_scale - target)[accepted]),
+                          accepted_scale_residual_scope='propagated_scale_before_refinement',
                           sparse_scale_coordinates='original_selected_pixel_align_corners_true',
                           scaleless_depth=statistics(geometry),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),

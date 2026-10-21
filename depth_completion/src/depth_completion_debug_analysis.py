@@ -231,7 +231,7 @@ class StageDiagnostics(object):
             if self.context.get('phase') == 'validation':
                 self.rejection_reports[(self.context.get('sample'), level)] = report
                 for entry in self.trace.get(level, []):
-                    if entry['stage'] == 'after_anchor_messages':
+                    if entry['stage'] == 'after_propagation':
                         entry['rejection_logits'] = logits.detach().cpu().numpy()[0].copy()
                         entry['rejection_labels'] = labels.cpu().numpy()[0].copy()
 
@@ -312,15 +312,7 @@ class StageDiagnostics(object):
                     record['multiplier'] = statistics(multiplier)
                     record['near_update_bound_fraction'] = float(np.mean(np.abs(np.log(multiplier)) > .95))
                     record['near_identity_fraction'] = float(np.mean(np.abs(np.log(multiplier)) < .001))
-                if 'support' in entry:
-                    support = resize_map(entry['support'], t.shape)
-                    # Support is interpolated only for evaluation grouping; it
-                    # is not a probability of correct surface association.
-                    record['support_errors'] = {label: errors(metric, t, valid & selection)
-                        for label, selection in {
-                            'none_le_1e-7': support <= 1e-7,
-                            'weak_1e-7_to_1e-3': (support > 1e-7) & (support <= 1e-3),
-                            'strong_gt_1e-3': support > 1e-3}.items()}
+                if 'keep' in entry:
                     if anchor_groups is None:
                         sampled, indices = self.sparse_indices(sparse, z.shape)
                         selected_target = t.ravel()[indices.ravel()].reshape(indices.shape)
@@ -383,10 +375,10 @@ class StageDiagnostics(object):
                 coordinates=coordinates, error=np.abs(p[coordinates] - t[coordinates]), step=self.context['step'])
 
     def probe_anchor_messages(self, image, sparse, target, prediction, valid):
-        '''Disable only Q/support inputs, not the direct sparse constraints.
+        '''Bypass direct scale injection and neighboring scale exchanges.
 
-        This measures the model's use of propagated messages while preserving
-        the prior, selected measurements, rejection, and direct K*r feedback.
+        Preserve the inherited prior, sparse encoder inputs, rejection, and
+        direct K*r refinement feedback while bypassing the propagation module.
         The extra eval forward cannot update parameters or normalization state.
         '''
         from depth_completion_debug import errors, statistics
@@ -396,7 +388,7 @@ class StageDiagnostics(object):
         for name, module in self.model.named_modules():
             if name == 'scale_propagation' or name.endswith('.scale_propagation'):
                 handles.append(module.register_forward_hook(
-                    lambda module, inputs, output: tuple(torch.zeros_like(x) for x in output)))
+                    lambda module, inputs, output: inputs[0]))
         active = self.active
         self.active, self.probing = False, True
         device = next(self.model.parameters()).device
@@ -409,6 +401,6 @@ class StageDiagnostics(object):
                 handle.remove()
             self.active, self.probing = active, False
         p, t = np.asarray(prediction).squeeze(), np.asarray(target).squeeze()
-        self.emit('anchor_message_ablation', enabled=errors(p, t, valid),
+        self.emit('scale_propagation_ablation', enabled=errors(p, t, valid),
                   disabled=errors(result, t, valid), change=statistics((result - p)[valid]),
-                  scope='all levels Q/support disabled; direct sparse inputs and bottom prior retained')
+                  scope='all levels scale injection/diffusion bypassed; direct sparse inputs and bottom prior retained')

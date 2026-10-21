@@ -198,12 +198,11 @@ def propagate_scale(
         keep_mask,
         propagation_logits,
         n_propagation_iterations=1):
-    '''Relay accepted-anchor numerator and support separately from inherited scale.
+    '''Inject accepted scale estimates once, then relay the persistent scale map.
 
     Arg(s):
         scale : torch.Tensor[float32]
-            B x 1 x H x W inherited positive scale map; provides shape only
-            and stays separate from anchor-message diffusion
+            B x 1 x H x W inherited and learned positive scale map
         sparse_scale : torch.Tensor[float32]
             B x 1 x H x W measured depth divided by geometry at the same
             original pixel; already computed with detached geometry
@@ -214,15 +213,15 @@ def propagate_scale(
         n_propagation_iterations : int
             number of neighboring exchanges at this resolution
     Returns:
-            tuple : B x 1 x H x W anchor scale and propagated support
+            torch.Tensor[float32] : B x 1 x H x W refined scale map
 
     '''
 
     n_batch, _, n_height, n_width = scale.shape
-    # Unsupported predictions are not messages. A single source therefore
-    # carries its ratio unchanged, rather than mixing it with the dense prior.
-    numerator = keep_mask * sparse_scale
-    support = keep_mask
+    # Accepting a measurement replaces the inherited scale at its location;
+    # rejecting it leaves the inherited estimate available for propagation.
+    # Inject only once, without restoring anchors inside or after the loop.
+    scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
     outgoing_weights = torch.sigmoid(propagation_logits)
 
     # Each column of fold is one source pixel's 3 x 3 outgoing message patch.
@@ -233,27 +232,16 @@ def propagate_scale(
         kernel_size=3,
         padding=1)
     for _ in range(n_propagation_iterations):
-        incoming_numerator = functional.fold(
-            (outgoing_weights * numerator).reshape(n_batch, 9, n_height * n_width),
-            output_size=(n_height, n_width),
-            kernel_size=3,
-            padding=1)
-        incoming_support = functional.fold(
-            (outgoing_weights * support).reshape(n_batch, 9, n_height * n_width),
+        incoming_scale = functional.fold(
+            (outgoing_weights * scale).reshape(n_batch, 9, n_height * n_width),
             output_size=(n_height, n_width),
             kernel_size=3,
             padding=1)
 
-        # Identical normalization keeps both fields bounded without diluting
-        # their ratio. Self-retention is not reinjection of the original anchors.
-        numerator = (numerator + incoming_numerator) / (1.0 + incoming_weight)
-        support = (support + incoming_support) / (1.0 + incoming_weight)
-    # Ignore numerically negligible support instead of returning an attenuated
-    # ratio. Raw support remains differentiable input to the refinement block.
-    anchor_scale = torch.where(
-        support > 1e-7, numerator / support.clamp_min(1e-7),
-        torch.zeros_like(numerator))
-    return anchor_scale, support
+        # Average the current scale with incoming scales. The denominator
+        # depends on propagation weights, not on a propagated keep/support map.
+        scale = (scale + incoming_scale) / (1.0 + incoming_weight)
+    return scale
 
 
 class ScalePropagation(nn.Module):
@@ -363,11 +351,10 @@ class ScaleUpdateBlock(nn.Module):
         super(ScaleUpdateBlock, self).__init__()
 
         # C feature channels plus scaleless, current scale, accepted ratios,
-        # keep mask, and the current discrepancy at accepted measurements;
-        # two more channels contain propagated anchor scale and support.
+        # keep mask, and the current discrepancy at accepted measurements.
         self.convolutions = nn.Sequential(
             Conv2d(
-                n_channels + 7,
+                n_channels + 5,
                 n_channels,
                 kernel_size=3,
                 stride=1,
@@ -384,7 +371,7 @@ class ScaleUpdateBlock(nn.Module):
                 kernel_size=3,
                 stride=1,
                 activation_func=None))
-        # Both passes initially preserve the inherited scale exactly.
+        # Both passes initially preserve the propagated scale exactly.
         nn.init.zeros_(self.convolutions[-1].conv.weight)
 
     def forward(self, feature):
@@ -393,7 +380,7 @@ class ScaleUpdateBlock(nn.Module):
 
 def refine_scale(
         feature, scaleless_depth, scale, sparse_scale, keep_mask,
-        anchor_scale, anchor_support, scale_update, n_scale_refinement=2):
+        scale_update, n_scale_refinement=2):
     '''Apply two weight-shared corrections after propagation, without restoration.'''
     for _ in range(n_scale_refinement):
         # Recompute feedback from the latest scale, not the original inherited
@@ -404,9 +391,7 @@ def refine_scale(
             scale,
             keep_mask * sparse_scale,
             keep_mask,
-            keep_mask * (sparse_scale - scale),
-            anchor_scale,
-            anchor_support
+            keep_mask * (sparse_scale - scale)
         ], dim=1)
         # Do not detach scale: the second pass trains through the first pass.
         # Scaleless is context only; metric products follow detach_scaleless_depth.
@@ -521,15 +506,14 @@ class PropagationDecoderBlock(nn.Module):
         sparse_geometry = geometry_at_sparse_points(
             scaleless_depth, measurement_indices, input_size)
         sparse_scale = sparse_depth / sparse_geometry.clamp_min(1e-7)
-        anchor_scale, anchor_support = self.scale_propagation(
+        scale = self.scale_propagation(
             scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
 
-        # Correct the inherited map using anchor messages and their support.
-        # The inherited map itself is never diffused or overwritten by anchors.
+        # Refine the actual propagated map, without restoring sparse anchors.
         scale = refine_scale(
             feature, scaleless_depth, scale, sparse_scale, keep_mask,
-            anchor_scale, anchor_support, self.scale_update,
+            self.scale_update,
             self.n_scale_refinement)
         # Keep the learned correction at all pixels, including accepted sources.
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
@@ -649,15 +633,15 @@ class ScalePropagationDepthModel(nn.Module):
             fallback_scale.detach()) / (
                 torch.sum(keep_mask, dim=[2, 3], keepdim=True) + 1.0)
         # Initialize a dense constant scale from the existing global estimate,
-        # then refine it using separately propagated accepted-anchor messages.
+        # then inject accepted measurements and propagate the scale map itself.
         scale = scale.expand_as(scaleless_depth)
         propagation_logits = self.propagation_map(propagation_input)
-        anchor_scale, anchor_support = self.scale_propagation(
+        scale = self.scale_propagation(
             scale, metric_geometry, coarse_sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
         scale = refine_scale(
             coarse_feature, scaleless_depth, scale, sparse_scale, keep_mask,
-            anchor_scale, anchor_support, self.scale_update,
+            self.scale_update,
             self.n_scale_refinement)
         # Pass the learned scale onward without restoring measurement values.
 

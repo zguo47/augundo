@@ -229,13 +229,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse[0, 0, 2, 2] = 3.
         logits = torch.full((1, 9, 5, 5), -100.)
         logits[0, 5, 2, 2] = 100.
-        result, support = propagate_scale(scale, sparse / geometry, (sparse > 0).float(), logits)
-        expected = torch.zeros_like(scale)
-        # Sparse scale is 3 / 0.5 = 6, with no dilution by the inherited scale 2.
+        result = propagate_scale(scale, sparse / geometry, (sparse > 0).float(), logits)
+        expected = scale.clone()
+        # The source injects 3 / 0.5 = 6; its right neighbor averages 6 and 2.
         expected[0, 0, 2, 2] = 6.
-        expected[0, 0, 2, 3] = 6.
+        expected[0, 0, 2, 3] = 4.
         torch.testing.assert_close(result, expected)
-        self.assertEqual(float(support[0, 0, 2, 3]), 0.5)
         torch.testing.assert_close(scale, torch.full_like(scale, 2.))
 
     def test_geometry_sampling_matches_upsampling_and_gathering_original_pixels(self):
@@ -276,8 +275,8 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         target = selected / sampled.clamp_min(1e-7)
         scale = torch.full_like(geometry, 2.)
         logits = torch.full((1, 9, 2, 2), -100.)
-        propagated, _ = propagate_scale(scale, target, (selected > 0).float(), logits)
-        expected = torch.zeros_like(scale)
+        propagated = propagate_scale(scale, target, (selected > 0).float(), logits)
+        expected = scale.clone()
         expected[0, 0, 0, 0] = 3.
         torch.testing.assert_close(propagated, expected)
         self.assertNotEqual(float(target[0, 0, 0, 0]), float((selected / geometry)[0, 0, 0, 0]))
@@ -324,15 +323,15 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         logits = torch.full((1, 9, 5, 7), -100.)
         logits[0, 5, 2, 2] = 100.
         logits[0, 5, 2, 3] = 100.
-        first, _ = propagate_scale(scale, sparse, keep, logits, 1)
-        second, support = propagate_scale(scale, sparse, keep, logits, 2)
-        self.assertEqual(float(first[0, 0, 2, 4]), 0.)
-        self.assertEqual(float(second[0, 0, 2, 4]), 6.)
-        self.assertGreater(float(support[0, 0, 2, 4]), 0.)
+        first = propagate_scale(scale, sparse, keep, logits, 1)
+        second = propagate_scale(scale, sparse, keep, logits, 2)
+        self.assertEqual(float(first[0, 0, 2, 4]), 2.)
+        self.assertEqual(float(first[0, 0, 2, 3]), 4.)
+        self.assertEqual(float(second[0, 0, 2, 4]), 3.)
         # A rejected source can relay scale, but cannot inject its measurement.
         sparse[0, 0, 2, 3] = 100.
         torch.testing.assert_close(
-            propagate_scale(scale, sparse, keep, logits, 2)[0], second)
+            propagate_scale(scale, sparse, keep, logits, 2), second)
 
     def test_measurements_are_not_restored_during_or_after_propagation(self):
         scale = torch.full((1, 1, 5, 5), 2.)
@@ -340,55 +339,49 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse[0, 0, 2, 2] = 6.
         sparse[0, 0, 2, 3] = 10.
         logits = torch.zeros(1, 9, 5, 5)
-        # Self-retention plus center weight gives 1.5 * 6 and the neighbor
-        # contributes 0.5 * 10: message ratio 7, not restored anchor ratio 6.
-        first, _ = propagate_scale(
+        # Neighboring dense priors also contribute: the center becomes
+        # (1.5 * 6 + 0.5 * 10 + 7 * 0.5 * 2) / 5.5, not restored scale 6.
+        first = propagate_scale(
             scale, sparse, (sparse > 0).float(), logits, 1)
-        self.assertAlmostEqual(float(first[0, 0, 2, 2]), 7., places=6)
-        second, support = propagate_scale(
+        self.assertAlmostEqual(float(first[0, 0, 2, 2]), 21. / 5.5, places=6)
+        second = propagate_scale(
             scale, sparse, (sparse > 0).float(), logits, 2)
         weight = functional.fold(torch.sigmoid(logits).reshape(1, 9, 25),
                                  (5, 5), kernel_size=3, padding=1)
-        numerator, expected_support = sparse.clone(), (sparse > 0).float()
+        expected = torch.where(sparse > 0, sparse, scale)
         for _ in range(2):
-            numerator = (numerator + functional.fold(
-                (0.5 * numerator).expand(1, 9, 5, 5).reshape(1, 9, 25),
+            expected = (expected + functional.fold(
+                (0.5 * expected).expand(1, 9, 5, 5).reshape(1, 9, 25),
                 (5, 5), kernel_size=3, padding=1)) / (1 + weight)
-            expected_support = (expected_support + functional.fold(
-                (0.5 * expected_support).expand(1, 9, 5, 5).reshape(1, 9, 25),
-                (5, 5), kernel_size=3, padding=1)) / (1 + weight)
-        torch.testing.assert_close(support, expected_support)
-        torch.testing.assert_close(second, numerator / expected_support)
+        torch.testing.assert_close(second, expected)
         self.assertNotEqual(float(second[0, 0, 2, 2]), 6.)
 
-    def test_more_iterations_expand_support_without_diluting_single_source(self):
-        scale = torch.rand(1, 1, 33, 33) * 100.
+    def test_more_iterations_relay_and_average_the_actual_scale(self):
+        scale = torch.full((1, 1, 33, 33), 2.)
         target = torch.zeros_like(scale)
         target[0, 0, 16, 16] = 6.
         keep = (target > 0).float()
         logits = torch.zeros(1, 9, 33, 33)
-        _, short_support = propagate_scale(scale, target, keep, logits, 2)
-        message, support = propagate_scale(scale, target, keep, logits, 12)
-        supported = support > 1e-7
-        self.assertGreater(int(supported.sum()), int((short_support > 1e-7).sum()))
-        torch.testing.assert_close(message[supported], torch.full_like(message[supported], 6.))
-        self.assertTrue(torch.isfinite(support).all())
-        self.assertTrue(((support >= 0.) & (support <= 1.)).all())
-        # The inherited map is not a source, regardless of its magnitude.
-        changed_message, changed_support = propagate_scale(scale * 100., target, keep, logits, 12)
-        torch.testing.assert_close(changed_message, message)
-        torch.testing.assert_close(changed_support, support)
+        short = propagate_scale(scale, target, keep, logits, 2)
+        longer = propagate_scale(scale, target, keep, logits, 12)
+        self.assertGreater(int((longer > 2. + 1e-6).sum()), int((short > 2. + 1e-6).sum()))
+        self.assertLess(float(longer.max()), float(short.max()))
+        self.assertTrue(torch.isfinite(longer).all())
+        self.assertTrue(((longer >= 2.) & (longer <= 6.)).all())
+        # Unlike normalized anchor messages, the dense prior participates.
+        changed = propagate_scale(scale * 100., target, keep, logits, 12)
+        self.assertFalse(torch.allclose(changed, longer))
 
-    def test_no_edges_preserve_only_source_messages_and_leave_prior_untouched(self):
+    def test_no_edges_inject_sources_once_and_leave_input_prior_untouched(self):
         scale = torch.rand(1, 1, 5, 7) + 1.
         sparse = torch.zeros_like(scale)
         sparse[0, 0, 2, 2] = 6.
         logits = torch.full((1, 9, 5, 7), -100.)
         original = scale.clone()
-        expected = sparse.clone()
+        expected = torch.where(sparse > 0, sparse, scale)
         torch.testing.assert_close(
             propagate_scale(scale, sparse,
-                            (sparse > 0).float(), logits, 6)[0], expected)
+                            (sparse > 0).float(), logits, 6), expected)
         torch.testing.assert_close(scale, original)
 
     def test_constant_scale_stays_constant_with_empty_or_rejected_sources(self):
@@ -397,11 +390,10 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse = torch.full_like(scale, 50.)
         logits = torch.randn(2, 9, 5, 7)
         keep = torch.zeros_like(scale, requires_grad=True)
-        result, support = propagate_scale(scale, sparse / geometry, keep, logits, 6)
-        torch.testing.assert_close(result, torch.zeros_like(scale))
-        torch.testing.assert_close(support, torch.zeros_like(scale))
+        result = propagate_scale(scale, sparse / geometry, keep, logits, 6)
+        torch.testing.assert_close(result, torch.full_like(scale, 3.))
         torch.testing.assert_close(scale, torch.full_like(scale, 3.))
-        support.sum().backward()
+        result.sum().backward()
         self.assertTrue(torch.isfinite(keep.grad).all())
         self.assertGreater(float(keep.grad.abs().sum()), 0.)
 
@@ -411,12 +403,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse[0, 0, 0, 0] = 6.
         logits = torch.full((1, 9, 3, 3), -100.)
         logits[0, 0, 0, 0] = 100.
-        expected = sparse.clone()
+        expected = torch.where(sparse > 0, sparse, scale)
         torch.testing.assert_close(
             propagate_scale(scale, sparse,
-                            (sparse > 0).float(), logits, 4)[0], expected)
+                            (sparse > 0).float(), logits, 4), expected)
 
-    def test_messages_train_weights_and_keep_but_not_prior_or_geometry(self):
+    def test_propagation_trains_weights_keep_and_prior_but_not_detached_geometry(self):
         scale = torch.full((1, 1, 5, 7), 2., requires_grad=True)
         geometry = torch.ones_like(scale, requires_grad=True)
         sparse = torch.zeros_like(scale)
@@ -425,14 +417,24 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         logits = torch.zeros(1, 9, 5, 7, requires_grad=True)
         _, indices = sparse_depth_at_resolution(sparse, scale.shape[-2:], return_indices=True)
         matched = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
-        result, support = propagate_scale(scale, sparse / matched.clamp_min(1e-7), keep, logits, 4)
-        (result.square().sum() + support.sum()).backward()
+        result = propagate_scale(scale, sparse / matched.clamp_min(1e-7), keep, logits, 4)
+        result.square().sum().backward()
         self.assertIsNone(geometry.grad)
-        self.assertIsNone(scale.grad)
-        self.assertTrue(((support >= 0.) & (support <= 1.)).all())
-        for value in (keep, logits):
+        for value in (keep, logits, scale):
             self.assertTrue(torch.isfinite(value.grad).all())
             self.assertGreater(float(value.grad.abs().sum()), 0.)
+
+    def test_single_anchor_keep_gradient_does_not_cancel(self):
+        scale = torch.full((1, 1, 3, 3), 2.)
+        ratio = torch.zeros_like(scale)
+        ratio[0, 0, 1, 1] = 6.
+        keep = torch.zeros_like(scale, requires_grad=True)
+        with torch.no_grad():
+            keep[0, 0, 1, 1] = 0.5
+        output = propagate_scale(scale, ratio, keep, torch.zeros(1, 9, 3, 3), 0)
+        self.assertEqual(float(output[0, 0, 1, 1]), 4.)
+        output[0, 0, 1, 1].backward()
+        self.assertEqual(float(keep.grad[0, 0, 1, 1]), 4.)
 
     def test_rejection_input_normalizes_features_without_mutating_them(self):
         feature = torch.arange(8.).reshape(1, 8, 1, 1).expand(1, 8, 3, 4).clone()
@@ -569,12 +571,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                 # second pass must see a different scale and discrepancy.
                 for convolution in stage.scale_update.convolutions:
                     convolution.conv.weight.zero_()
-                stage.scale_update.convolutions[0].conv.weight[0, -6, 1, 1] = 1.
+                stage.scale_update.convolutions[0].conv.weight[0, -4, 1, 1] = 1.
                 stage.scale_update.convolutions[1].conv.weight[0, 0, 1, 1] = 1.
                 stage.scale_update.convolutions[2].conv.weight[0, 0, 1, 1] = 0.05
             def propagated(module, inputs, output, record=record, level=level):
                 order.append(('propagate', level))
-                record.update(inherited=inputs[0], messages=output, keep=inputs[3], ratio=inputs[5])
+                record.update(inherited=inputs[0], propagated=output, keep=inputs[3], ratio=inputs[5])
             def refined(module, inputs, output, record=record, level=level):
                 order.append(('refine', level))
                 record['refinements'].append((inputs[0], output))
@@ -588,19 +590,18 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                                  for operation in ['propagate', 'refine', 'refine']])
         for record, actual in zip(observations, reversed(outputs['scale_maps'])):
             inherited = record['inherited']
-            anchor_scale, support = record['messages']
+            propagated = record['propagated']
             keep, ratio = record['keep'], record['ratio']
-            expected = inherited
+            expected = propagated
             for context, update in record['refinements']:
-                torch.testing.assert_close(context[:, -6:-5], expected)
-                torch.testing.assert_close(context[:, -5:-4], keep * ratio)
-                torch.testing.assert_close(context[:, -4:-3], keep)
-                torch.testing.assert_close(context[:, -3:-2], keep * (ratio - expected))
-                torch.testing.assert_close(context[:, -2:-1], anchor_scale)
-                torch.testing.assert_close(context[:, -1:], support)
+                self.assertEqual(context.shape[1], 8 + 5)
+                torch.testing.assert_close(context[:, -4:-3], expected)
+                torch.testing.assert_close(context[:, -3:-2], keep * ratio)
+                torch.testing.assert_close(context[:, -2:-1], keep)
+                torch.testing.assert_close(context[:, -1:], keep * (ratio - expected))
                 expected = expected * torch.exp(torch.tanh(update))
             torch.testing.assert_close(actual, expected)
-            self.assertTrue((actual > inherited).all())
+            self.assertTrue((actual > propagated).all())
         self.assertEqual(int(observations[1]['keep'].sum()), 0)
 
     def test_post_propagation_correction_trains_at_accepted_and_unmeasured_pixels(self):
