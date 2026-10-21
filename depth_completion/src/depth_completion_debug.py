@@ -335,17 +335,21 @@ class DepthCompletionDebug(StageDiagnostics):
                 logits = output + parent.rejection_bias.to(output.device)
                 margin = logits[:, 0:1] - logits[:, 1:2]
                 probability = functional.softmax(logits, dim=1)[:, 0:1]
-                # Rejection input ends in scaled sparse depth; positivity still
+                # Sparse depth precedes the two measurement-position offsets;
+                # positivity still
                 # identifies the same selected measurements as the metric map.
-                measured = inputs[0][:, -1:] > 0.0
+                measured = inputs[0][:, -3:-2] > 0.0
                 self.emit('rejection', level=level,
                           measurement_count=int(measured.sum()),
                           keep_minus_reject_at_sparse=statistics(margin[measured]),
                           keep_probability_at_sparse=statistics(probability[measured]),
                           deterministic_keep_fraction_at_sparse=float(
                               ((margin >= 0.0) & measured).sum() / measured.sum().clamp_min(1)),
-                          depth_context_input=statistics(inputs[0][:, -2:-1]),
-                          scaled_sparse_input=statistics(inputs[0][:, -1:]))
+                          depth_context_input=statistics(inputs[0][:, -4:-3]),
+                          scaled_sparse_input=statistics(inputs[0][:, -3:-2]),
+                          measurement_y_offset=statistics(inputs[0][:, -2:-1][measured]),
+                          measurement_x_offset=statistics(inputs[0][:, -1:][measured]),
+                          depth_context_location='selected original measurement pixel')
                 # Validation uses argmax, so this is the actual keep decision.
                 # Training uses sampled Gumbel decisions; do not label those
                 # using untransformed ground truth from the training batch.

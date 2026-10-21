@@ -187,10 +187,11 @@ class DepthCompletionModel(object):
 
     def compute_loss_rejection(self, target_depth, sparse_depth, logits,
                                keep_tolerance, reject_tolerance,
-                               supervision_levels=None, loss_type='cross_entropy'):
+                               supervision_levels=None, loss_type='cross_entropy',
+                               keep_weight=2.0):
         return self.model.compute_loss_rejection(
             target_depth, sparse_depth, logits, keep_tolerance, reject_tolerance,
-            supervision_levels, loss_type)
+            supervision_levels, loss_type, keep_weight)
 
     def forward_pose(self, image0, image1):
         '''

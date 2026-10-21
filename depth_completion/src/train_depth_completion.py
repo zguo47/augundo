@@ -89,7 +89,10 @@ parser.add_argument('--rejection_loss_type',
     help='Auxiliary rejection objective; existing supervise_outlier_rejection flag enables it')
 parser.add_argument('--rejection_supervision_levels',
     nargs='+', type=int, choices=range(5), default=None,
-    help='Rejection-loss resolutions: 0=full, ..., 4=bottom; defaults to 0 1 for cross_entropy, all for l1')
+    help='Rejection-loss resolutions: 0=full, ..., 4=bottom; defaults to all, weighted by 1/4**r')
+parser.add_argument('--rejection_keep_weight',
+    type=float, default=2.0,
+    help='Relative CE weight for good measurements versus bad; 1 restores equal-class weighting')
 parser.add_argument('--n_propagation_iterations',
     nargs=5, type=int, default=[2, 4, 6, 8, 12],
     help='Scale propagation exchanges at bottom, 1/8, 1/4, 1/2, full resolution; 0 disables exchanges')
@@ -326,6 +329,7 @@ if __name__ == '__main__':
           rejection_loss_type=args.rejection_loss_type,
           encoder_type=args.encoder_type,
           rejection_supervision_levels=args.rejection_supervision_levels,
+          rejection_keep_weight=args.rejection_keep_weight,
           n_propagation_iterations=args.n_propagation_iterations,
           n_scale_refinement=args.n_scale_refinement,
           rejection_keep_tolerance=args.rejection_keep_tolerance,

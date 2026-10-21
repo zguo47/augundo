@@ -40,13 +40,18 @@ def rejection_sparsity_loss_func(keep_mask, sparse_depth):
     return rejection.sum() / validity.sum().clamp_min(1)
 
 
-def balanced_rejection_loss_func(logits, labels):
+def balanced_rejection_loss_func(logits, labels, keep_weight=2.0):
     '''Average keep/reject cross-entropies separately, then average present classes.
 
     Balancing is over the minibatch at one native resolution. A missing class
     contributes no term; an entirely ignored level returns graph-connected zero.
     Cross-entropy acts on raw logits, before hard Gumbel sampling, and therefore
     retains a corrective gradient for confidently incorrect decisions.
+
+    Weight the good-measurement class more strongly to penalize false rejection.
+    keep_weight=1 restores the previous equal-class balance; the default 2
+    gives the good-point mean twice the weight of the bad-point mean. Normalize
+    by the weights of present classes, so a missing class does not dilute loss.
     '''
     labels = labels[:, 0]
     losses = torch.nn.functional.cross_entropy(
@@ -55,8 +60,9 @@ def balanced_rejection_loss_func(logits, labels):
     n_keep, n_reject = keep.sum(), reject.sum()
     loss_keep = (losses * keep).sum() / n_keep.clamp_min(1)
     loss_reject = (losses * reject).sum() / n_reject.clamp_min(1)
-    n_class = (n_keep > 0).to(logits.dtype) + (n_reject > 0).to(logits.dtype)
-    return (loss_keep + loss_reject) / n_class.clamp_min(1)
+    class_weight = keep_weight * (n_keep > 0).to(logits.dtype) + \
+        (n_reject > 0).to(logits.dtype)
+    return (keep_weight * loss_keep + loss_reject) / class_weight.clamp_min(1)
 
 
 def color_consistency_loss_func(src, tgt, w):

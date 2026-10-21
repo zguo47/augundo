@@ -77,10 +77,11 @@ class ScalePropagationDepthCompletionModel(object):
                                keep_tolerance=(0.1, 0.02),
                                reject_tolerance=(0.3, 0.05),
                                supervision_levels=None,
-                               loss_type='cross_entropy'):
-        '''Average selected-level classification or rejection-sparsity losses.'''
+                               loss_type='cross_entropy',
+                               keep_weight=2.0):
+        '''Sum resolution-weighted classification or rejection-sparsity losses.'''
         if supervision_levels is None:
-            supervision_levels = range(5) if loss_type == 'l1' else (0, 1)
+            supervision_levels = range(5)
         if loss_type == 'none':
             loss = logits[0].sum() * 0.0
             return loss, {'loss_rejection': loss}
@@ -99,14 +100,16 @@ class ScalePropagationDepthCompletionModel(object):
                 matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
                 labels = loss_utils.rejection_supervision_targets(
                     selected, matched, keep_tolerance, reject_tolerance)
-                value = loss_utils.balanced_rejection_loss_func(scores, labels)
+                value = loss_utils.balanced_rejection_loss_func(scores, labels, keep_weight)
                 for name, label in [('keep', 0), ('reject', 1), ('ignored', -1)]:
                     loss_info['rejection_{}_count_r{}'.format(name, resolution)] = (labels == label).sum()
-            losses.append(value)
+            weight = 1.0 / (4 ** resolution)
+            losses.append(weight * value)
             loss_info['loss_rejection_r{}'.format(resolution)] = value
-        # No 4**(-r) factor: coarse rejection must not lose its direct signal.
-        # Average only the requested resolutions; L1 defaults to all five.
-        loss = torch.stack(losses).mean()
+            loss_info['loss_rejection_weighted_r{}'.format(resolution)] = weight * value
+        # Match SI and metric losses: sum 4**(-r) times each selected loss.
+        # Both CE and L1 use this weighting, with r=0 at full resolution.
+        loss = torch.stack(losses).sum()
         loss_info['loss_rejection'] = loss
         return loss, loss_info
 

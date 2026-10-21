@@ -99,7 +99,8 @@ def train(train_images_path,
           n_propagation_iterations=(2, 4, 6, 8, 12),
           n_scale_refinement=2,
           rejection_loss_type='cross_entropy',
-          encoder_type='conv'):
+          encoder_type='conv',
+          rejection_keep_weight=2.0):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -110,7 +111,7 @@ def train(train_images_path,
         raise ValueError('Unsupported device: {}'.format(device))
 
     if rejection_supervision_levels is None:
-        rejection_supervision_levels = list(range(5)) if rejection_loss_type == 'l1' else [0, 1]
+        rejection_supervision_levels = list(range(5))
     rejection_loss_active = supervise_outlier_rejection and use_outlier_rejection and \
         'scale_propagation' in model_name and supervision_type == 'supervised'
     rejection_loss_active = rejection_loss_active and rejection_loss_type != 'none'
@@ -322,6 +323,9 @@ def train(train_images_path,
                 rejection_loss_active=rejection_loss_active,
                 rejection_loss_type=rejection_loss_type,
                 rejection_supervision_levels=list(rejection_supervision_levels),
+                rejection_keep_weight=rejection_keep_weight,
+                rejection_resolution_weights=[1.0 / (4 ** r) for r in range(5)],
+                rejection_input='normalized coarse features, location-matched depth, sparse depth, y/x cell offsets',
                 n_propagation_iterations=list(n_propagation_iterations),
                 n_scale_refinement=n_scale_refinement,
                 rejection_keep_tolerance=rejection_keep_tolerance,
@@ -401,6 +405,8 @@ def train(train_images_path,
             supervise_outlier_rejection, rejection_loss_active,
             w_losses.get('w_rejection', 0.1)), log_path)
         log('rejection_loss_type={}'.format(rejection_loss_type), log_path)
+        log('rejection_keep_weight={}  rejection_resolution_weights={}'.format(
+            rejection_keep_weight, [1.0 / (4 ** r) for r in range(5)]), log_path)
         if rejection_loss_active:
             log('rejection_supervision_levels={} (0=full, 4=bottom)'.format(
                 rejection_supervision_levels), log_path)
@@ -713,7 +719,7 @@ def train(train_images_path,
                 rejection_loss, rejection_info = depth_completion_model.compute_loss_rejection(
                     rejection_target, input_sparse_depth0, rejection_outputs,
                     rejection_keep_tolerance, rejection_reject_tolerance,
-                    rejection_supervision_levels, rejection_loss_type)
+                    rejection_supervision_levels, rejection_loss_type, rejection_keep_weight)
                 if is_debug_step and rejection_supervision_active:
                     depth_debug.rejection_training(
                         rejection_outputs, input_sparse_depth0, rejection_target)

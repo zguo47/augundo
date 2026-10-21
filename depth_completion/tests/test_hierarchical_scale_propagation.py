@@ -15,7 +15,9 @@ from scale_propagation_model import (
     PropagationDecoderBlock,
     ScalePropagationDepthModel,
     SharedEncoder,
+    feature_at_sparse_points,
     geometry_at_sparse_points,
+    measurement_rejection_input,
     normalize_rejection_input,
     propagate_scale,
     rejection_keep_mask,
@@ -40,12 +42,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         labels = torch.zeros(1, 1, 1, 101, dtype=torch.long)
         labels[:, :, :, -1] = 1
         loss = loss_utils.balanced_rejection_loss_func(logits, labels)
-        expected = 0.5 * functional.cross_entropy(logits[:, :, :, :100], labels[:, 0, :, :100]) + \
-            0.5 * functional.cross_entropy(logits[:, :, :, 100:], labels[:, 0, :, 100:])
+        expected = (2. * functional.cross_entropy(logits[:, :, :, :100], labels[:, 0, :, :100]) + \
+            functional.cross_entropy(logits[:, :, :, 100:], labels[:, 0, :, 100:])) / 3.
         torch.testing.assert_close(loss, expected)
         loss.backward()
-        self.assertGreater(float(logits.grad[0, 0, 0, -1]), 0.49)
-        self.assertLess(float(logits.grad[0, 1, 0, -1]), -0.49)
+        self.assertGreater(float(logits.grad[0, 0, 0, -1]), 0.32)
+        self.assertLess(float(logits.grad[0, 1, 0, -1]), -0.32)
         for label in [-1, 0, 1]:
             scores = torch.zeros(1, 2, 2, 3, requires_grad=True)
             value = loss_utils.balanced_rejection_loss_func(
@@ -76,7 +78,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         value, info = wrapper.compute_loss_rejection(
             target, sparse, logits, supervision_levels=range(5))
         torch.testing.assert_close(value, torch.stack([
-            info['loss_rejection_r{}'.format(r)] for r in range(5)]).mean())
+            info['loss_rejection_r{}'.format(r)] / (4 ** r) for r in range(5)]).sum())
         for r in range(5):
             n_selected = int((sparse_depth_at_resolution(sparse, logits[r].shape[-2:]) > 0).sum())
             self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
@@ -120,7 +122,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             value, info = wrapper.compute_loss_rejection(
                 None, sparse, masks, supervision_levels=levels, loss_type='l1')
             selected = range(5) if levels is None else levels
-            expected = sum(1. - float(r % 2) for r in selected) / len(selected)
+            expected = sum((1. - float(r % 2)) / (4 ** r) for r in selected)
             self.assertAlmostEqual(float(value), expected, places=6)
             value.backward()
             for r, mask in enumerate(masks):
@@ -163,20 +165,20 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(gradient).all())
             self.assertGreater(float(gradient.abs().sum()), 0.)
 
-    def test_rejection_supervision_defaults_to_fine_levels(self):
+    def test_rejection_supervision_defaults_to_all_levels_with_resolution_weights(self):
         wrapper = self.make_wrapper(True)
         sparse = torch.full((1, 1, 17, 25), 20.)
         target = torch.full_like(sparse, 5.)
-        for levels in [(0, 1), (0,), tuple(range(5))]:
+        for levels in [tuple(range(5)), (0,), (0, 1)]:
             logits = [torch.zeros(1, 2, h, w, requires_grad=True)
                       for h, w in [(17, 25), (9, 13), (5, 7), (3, 4), (2, 2)]]
-            if levels == (0, 1):
+            if levels == tuple(range(5)):
                 loss, info = wrapper.compute_loss_rejection(target, sparse, logits)
             else:
                 loss, info = wrapper.compute_loss_rejection(
                     target, sparse, logits, supervision_levels=levels)
             torch.testing.assert_close(loss, torch.stack([
-                info['loss_rejection_r{}'.format(r)] for r in levels]).mean())
+                info['loss_rejection_r{}'.format(r)] / (4 ** r) for r in levels]).sum())
             loss.backward()
             for r, scores in enumerate(logits):
                 self.assertEqual(scores.grad is not None, r in levels)
@@ -580,6 +582,9 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
 
     def test_only_rejection_receives_scaled_depth_at_every_level(self):
         model = ScalePropagationDepthModel(n_channels=8, max_predict_depth=100.).eval()
+        coarse_predictions = []
+        model.coarse_scaleless_depth.register_forward_hook(
+            lambda module, inputs, output: coarse_predictions.append(functional.softplus(output) + 1e-3))
         captured = []
         for stage in [model] + list(model.decoder):
             pair = dict(rejection=[], propagation=[])
@@ -596,9 +601,54 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             rejection, propagation = pair['rejection'][0], pair['propagation'][0]
             torch.testing.assert_close(rejection[:, :8].mean(dim=1),
                                        torch.zeros_like(rejection[:, 0]), atol=1e-5, rtol=0.)
-            torch.testing.assert_close(rejection[:, -1:], propagation[:, -1:] / 100.)
-            torch.testing.assert_close(
-                rejection[:, -2:-1], propagation[:, -2:-1] / (1. if level == 0 else 100.))
+            selected, indices = sparse_depth_at_resolution(
+                sparse, rejection.shape[-2:], return_indices=True)
+            torch.testing.assert_close(rejection[:, 9:10], selected / 100.)
+            expected_depth = feature_at_sparse_points(
+                (coarse_predictions[0] if level == 0 else propagation[:, -2:-1]) / 100.,
+                indices, sparse.shape[-2:])
+            torch.testing.assert_close(rejection[:, 8:9], expected_depth)
+            self.assertEqual(rejection.shape[1], 12)
+
+    def test_measurement_rejection_input_samples_depth_and_encodes_original_offsets(self):
+        feature = torch.rand(1, 8, 2, 2, requires_grad=True)
+        depth = torch.tensor([[[[1., 3.], [5., 7.]]]], requires_grad=True)
+        sparse = torch.zeros(1, 1, 8, 8)
+        sparse[0, 0, 0, 0] = 10.
+        sparse[0, 0, 3, 7] = 20.
+        selected, indices = sparse_depth_at_resolution(sparse, (2, 2), return_indices=True)
+        result = measurement_rejection_input(feature, depth, selected, indices, (8, 8))
+        self.assertEqual(result.shape, (1, 12, 2, 2))
+        torch.testing.assert_close(result[:, 8:9], feature_at_sparse_points(depth, indices, (8, 8)))
+        torch.testing.assert_close(result[:, 9:10], selected)
+        torch.testing.assert_close(result[0, 10:, 0, 0], torch.tensor([-.75, -.75]))
+        torch.testing.assert_close(result[0, 10:, 0, 1], torch.tensor([.75, .75]))
+        torch.testing.assert_close(result[0, 10:, 1], torch.zeros(2, 2))
+        result.sum().backward()
+        self.assertTrue(torch.isfinite(depth.grad).all())
+        self.assertTrue(torch.isfinite(feature.grad).all())
+        # At full resolution, every measurement is at its own cell center.
+        full = measurement_rejection_input(torch.rand(1, 8, 8, 8),
+            torch.rand_like(sparse), sparse, torch.arange(64).reshape(1, 1, 8, 8), (8, 8))
+        torch.testing.assert_close(full[:, -2:], torch.zeros(1, 2, 8, 8))
+        # Odd image sizes use overlapping adaptive bins with floor/ceil edges.
+        odd = torch.zeros(1, 1, 5, 7)
+        odd[0, 0, 2, 3] = 10.
+        selected, indices = sparse_depth_at_resolution(odd, (2, 2), return_indices=True)
+        result = measurement_rejection_input(feature, depth, selected, indices, (5, 7))
+        torch.testing.assert_close(result[0, -2:],
+            torch.tensor([[[2./3., 2./3.], [-2./3., -2./3.]],
+                          [[.75, -.75], [.75, -.75]]]))
+
+    def test_rejection_class_balance_penalizes_false_rejection_more(self):
+        labels = torch.tensor([[[[0, 1]]]])
+        scores = torch.zeros(1, 2, 1, 2, requires_grad=True)
+        equal = loss_utils.balanced_rejection_loss_func(scores, labels, keep_weight=1.)
+        equal_gradient = torch.autograd.grad(equal, scores)[0]
+        adjusted = loss_utils.balanced_rejection_loss_func(scores, labels)
+        gradient = torch.autograd.grad(adjusted, scores)[0]
+        self.assertGreater(float(gradient[0, 1, 0, 0]), float(equal_gradient[0, 1, 0, 0]))
+        self.assertLess(float(gradient[0, 0, 0, 1]), float(equal_gradient[0, 0, 0, 1]))
 
     def test_rejection_masks_missing_points_and_has_finite_gradients(self):
         sparse = torch.tensor([[[[0., 3.], [4., 0.]]]])

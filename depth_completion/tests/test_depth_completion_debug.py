@@ -286,6 +286,13 @@ class DepthDebugTest(unittest.TestCase):
             debug.close()
             with open(debug.path) as stream:
                 records = [json.loads(line) for line in stream]
+            inputs = {r['level']: r for r in records if r['event'] == 'rejection'}
+            self.assertEqual(inputs['bottom']['measurement_count'], 1)
+            for level in ['decoder.0', 'decoder.1', 'decoder.2', 'decoder.3']:
+                self.assertEqual(inputs[level]['measurement_count'], 2)
+            self.assertEqual(inputs['decoder.3']['measurement_x_offset']['max'], 0.)
+            self.assertTrue(all(r['depth_context_location'] == 'selected original measurement pixel'
+                                for r in inputs.values()))
             quality = {r['level']: r for r in records if r['event'] == 'rejection_quality'}
             self.assertEqual(len(quality), 5)
             bottom = quality['bottom']['categories']
@@ -413,10 +420,13 @@ class DepthDebugTest(unittest.TestCase):
             reports = [r for r in supervised if r['event'] == 'rejection_supervision']
             self.assertTrue(any(r['phase'] == 'train' and r['reject_target_count'] > 0 for r in reports))
             self.assertTrue(any(r['phase'] == 'validation' for r in reports))
-            self.assertTrue(all(r['supervision_enabled'] ==
-                                (r['level'] in ['decoder.2', 'decoder.3']) for r in reports))
+            self.assertTrue(all(r['supervision_enabled'] for r in reports))
             config = next(r for r in supervised if r['event'] == 'configuration')
-            self.assertEqual(config['settings']['rejection_supervision_levels'], [0, 1])
+            self.assertEqual(config['settings']['rejection_supervision_levels'], list(range(5)))
+            self.assertEqual(config['settings']['rejection_keep_weight'], 2.)
+            self.assertEqual(config['settings']['rejection_resolution_weights'],
+                             [1., .25, .0625, .015625, .00390625])
+            self.assertTrue(all(r['resolution_weight'] > 0 for r in reports))
             self.assertEqual(config['propagation_iterations'], [1, 2, 3, 4, 6])
             self.assertEqual(config['settings']['n_scale_refinement'], 1)
             refinements = [r for r in supervised if r['event'] == 'scale_refinement']
@@ -448,7 +458,7 @@ class DepthDebugTest(unittest.TestCase):
             self.assertEqual(l1_config['rejection_supervision_levels'], list(range(5)))
             l1 = next(r for r in l1_records if r['event'] == 'rejection_sparsity')
             self.assertEqual(len(l1['fractions']), 5)
-            self.assertTrue(0. <= l1['loss'] <= 1.)
+            self.assertTrue(0. <= l1['loss'] <= sum(4. ** -r for r in range(5)))
             objectives = next(r for r in l1_records if r['event'] == 'gradient_objectives')
             self.assertTrue(any(v['rejection_norm'] > 0. for v in objectives['groups'].values()))
             none_records = [json.loads(line) for line in

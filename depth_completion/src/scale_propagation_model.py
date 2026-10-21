@@ -194,13 +194,13 @@ def normalize_rejection_input(feature, depth, sparse_depth):
     return torch.cat([feature, depth, sparse_depth], dim=1)
 
 
-def geometry_at_sparse_points(scaleless_depth, measurement_indices, input_size):
-    '''Sample this level's geometry at the selected original-image pixels.'''
+def feature_at_sparse_points(feature, measurement_indices, input_size):
+    '''Sample a coarse map at the selected original-image measurement pixels.'''
     n_input_height, n_input_width = input_size
     # The sampler returns flattened indices into the original sparse image,
     # not coordinates of coarse-cell centers. Keep the per-image indices.
-    y = (measurement_indices // n_input_width).to(scaleless_depth.dtype)
-    x = (measurement_indices % n_input_width).to(scaleless_depth.dtype)
+    y = (measurement_indices // n_input_width).to(feature.dtype)
+    x = (measurement_indices % n_input_width).to(feature.dtype)
     y = 2.0 * y / max(n_input_height - 1, 1) - 1.0
     x = 2.0 * x / max(n_input_width - 1, 1) - 1.0
     grid = torch.cat([x, y], dim=1).permute(0, 2, 3, 1)
@@ -209,11 +209,50 @@ def geometry_at_sparse_points(scaleless_depth, measurement_indices, input_size):
     # selected pixels, without allocating a full-resolution map at each level.
     # align_corners matches the existing decoder/loss interpolation convention.
     return functional.grid_sample(
-        scaleless_depth.detach(),
+        feature,
         grid,
         mode='bilinear',
         padding_mode='border',
         align_corners=True)
+
+
+def geometry_at_sparse_points(scaleless_depth, measurement_indices, input_size):
+    '''Sample this level's detached geometry at selected original-image pixels.'''
+    return feature_at_sparse_points(
+        scaleless_depth.detach(), measurement_indices, input_size)
+
+
+def measurement_rejection_input(
+        feature, depth, sparse_depth, measurement_indices, input_size):
+    '''Describe the selected measurement rather than only its coarse cell.
+
+    Keep the normalized coarse feature and selected sparse depth. Sample the
+    predicted depth at the same original pixel as that measurement, and append
+    its y/x offsets within the adaptive-pooling cell, normalized to [-1, 1].
+    A selected car measurement can therefore be distinguished from a road
+    measurement elsewhere in the same coarse cell. Missing points have zero
+    offsets; their keep masks and auxiliary losses remain excluded as before.
+    '''
+    n_input_height, n_input_width = input_size
+    n_height, n_width = sparse_depth.shape[-2:]
+    y = (measurement_indices // n_input_width).to(feature.dtype)
+    x = (measurement_indices % n_input_width).to(feature.dtype)
+    row = torch.arange(n_height, device=feature.device).reshape(1, 1, -1, 1)
+    column = torch.arange(n_width, device=feature.device).reshape(1, 1, 1, -1)
+    # Match adaptive_max_pool2d's bins, including odd input dimensions.
+    y_start = row * n_input_height // n_height
+    y_end = ((row + 1) * n_input_height + n_height - 1) // n_height
+    x_start = column * n_input_width // n_width
+    x_end = ((column + 1) * n_input_width + n_width - 1) // n_width
+    measured = (sparse_depth > 0.0).to(feature.dtype)
+    y_offset = (2.0 * (y - y_start + 0.5) / (y_end - y_start) - 1.0) * measured
+    x_offset = (2.0 * (x - x_start + 0.5) / (x_end - x_start) - 1.0) * measured
+    sampled_depth = feature_at_sparse_points(depth, measurement_indices, input_size)
+    return torch.cat([
+        normalize_rejection_input(feature, sampled_depth, sparse_depth),
+        y_offset,
+        x_offset
+    ], dim=1)
 
 
 def propagate_scale(
@@ -459,6 +498,7 @@ class PropagationDecoderBlock(nn.Module):
 
         # Heads see features, current metric depth, and current sparse depth.
         # Both heads are freshly evaluated at each level
+        # Rejection additionally receives y/x offsets of the selected source.
         self.propagation_map = Conv2d(
             n_channels + 2,
             9,
@@ -466,7 +506,7 @@ class PropagationDecoderBlock(nn.Module):
             stride=1,
             activation_func=None)
         self.rejection_map = Conv2d(
-            n_channels + 2,
+            n_channels + 4,
             2,
             kernel_size=3,
             stride=1,
@@ -511,10 +551,12 @@ class PropagationDecoderBlock(nn.Module):
 
         propagation_input = torch.cat([feature, depth, sparse_depth], dim=1)
         if self.use_outlier_rejection:
-            rejection_input = normalize_rejection_input(
+            rejection_input = measurement_rejection_input(
                 feature=feature,
                 depth=depth / self.max_predict_depth,
-                sparse_depth=sparse_depth / self.max_predict_depth)
+                sparse_depth=sparse_depth / self.max_predict_depth,
+                measurement_indices=measurement_indices,
+                input_size=input_size)
             rejection_logits = \
                 self.rejection_map(rejection_input) + self.rejection_bias
             keep_mask = rejection_keep_mask(
@@ -592,7 +634,7 @@ class ScalePropagationDepthModel(nn.Module):
             stride=1,
             activation_func=None)
         self.rejection_map = Conv2d(
-            n_channels + 2,
+            n_channels + 4,
             2,
             kernel_size=3,
             stride=1,
@@ -633,10 +675,15 @@ class ScalePropagationDepthModel(nn.Module):
         # Reject before computing either the global metric initialization or
         # local messages.
         if self.use_outlier_rejection:
-            rejection_input = normalize_rejection_input(
+            # No sparse-derived scale exists until this decision is made. Use
+            # the positive coarse prediction as the initial metric context;
+            # normalize it and the measurement with the same dataset range.
+            rejection_input = measurement_rejection_input(
                 feature=coarse_feature,
-                depth=metric_geometry,
-                sparse_depth=coarse_sparse_depth / self.max_predict_depth)
+                depth=coarse_depth.detach() / self.max_predict_depth,
+                sparse_depth=coarse_sparse_depth / self.max_predict_depth,
+                measurement_indices=measurement_indices,
+                input_size=sparse_depth.shape[-2:])
             rejection_logits = \
                 self.rejection_map(rejection_input) + self.rejection_bias
             keep_mask = rejection_keep_mask(
