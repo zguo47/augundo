@@ -112,14 +112,17 @@ class ConvolutionBlock(nn.Module):
 
 
 class SharedEncoder(nn.Module):
-    '''Five-resolution RGB encoder shared by geometry and scale prediction.'''
+    '''Five-resolution encoder, with optional raw sparse-depth features.'''
 
-    def __init__(self, n_channels, n_head, encoder_type='conv'):
+    def __init__(self, n_channels, n_head, encoder_type='conv',
+                 use_sparse_depth_features=False):
         super(SharedEncoder, self).__init__()
 
         self.encoder_type = encoder_type
+        self.use_sparse_depth_features = use_sparse_depth_features
         n_convolution = (3, 6, 6, 4, 4) if encoder_type == 'conv_attention' else (3, 3, 3, 3, 3)
-        self.level0 = ConvolutionBlock(3, n_channels, stride=1, n_convolution=n_convolution[0])
+        self.level0 = ConvolutionBlock(3 + int(use_sparse_depth_features), n_channels,
+                                       stride=1, n_convolution=n_convolution[0])
         self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[1])
         self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[2])
         self.level3 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[3])
@@ -150,7 +153,9 @@ class SharedEncoder(nn.Module):
             n_width,
             n_channel).permute(0, 3, 1, 2)
 
-    def forward(self, image):
+    def forward(self, image, sparse_depth=None):
+        if self.use_sparse_depth_features:
+            image = torch.cat([image, sparse_depth], dim=1)
         level0 = self.level0(image)
         level1 = self.level1(level0)
         level2 = self.level2(level1)
@@ -470,13 +475,16 @@ class PropagationDecoderBlock(nn.Module):
             use_outlier_rejection,
             n_propagation_iterations=4,
             max_predict_depth=8.0,
-            n_scale_refinement=2):
+            n_scale_refinement=2,
+            use_sparse_depth_features=False):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry features, scaleless geometry, and scale separately. Add this
         # level's RGB encoder skip, without raw sparse depth: C + C + 1 + 1.
+        # The optional sparse-feature mode adds one raw measurement channel.
+        self.use_sparse_depth_features = use_sparse_depth_features
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 2,
+            2 * n_channels + 2 + int(use_sparse_depth_features),
             n_channels,
             stride=1)
         self.gumbel_temperature = gumbel_temperature
@@ -531,14 +539,17 @@ class PropagationDecoderBlock(nn.Module):
             output_size=skip.shape[-2:],
             return_indices=True)
 
-        feature = self.fusion(torch.cat([
+        fusion_inputs = [
             feature,
             skip,
             # Shared features can train under both objectives, but map inputs
             # are context only: SI losses must not train preceding scale heads.
             scaleless_depth.detach(),
             scale.detach()
-        ], dim=1))
+        ]
+        if self.use_sparse_depth_features:
+            fusion_inputs.append(sparse_depth)
+        feature = self.fusion(torch.cat(fusion_inputs, dim=1))
         # Scaleless stays positive and mean-one at every resolution. SI directly
         # trains scaleless; metric products follow detach_scaleless_depth.
         scaleless_depth = normalize_scaleless_depth(
@@ -597,7 +608,8 @@ class ScalePropagationDepthModel(nn.Module):
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  detach_scaleless_depth=True,
                  n_scale_refinement=2,
-                 encoder_type='conv'):
+                 encoder_type='conv',
+                 use_sparse_depth_features=False):
         super(ScalePropagationDepthModel, self).__init__()
 
         self.min_predict_depth = min_predict_depth
@@ -606,15 +618,17 @@ class ScalePropagationDepthModel(nn.Module):
         self.use_outlier_rejection = use_outlier_rejection
         self.detach_scaleless_depth = detach_scaleless_depth
         self.n_scale_refinement = n_scale_refinement
+        self.use_sparse_depth_features = use_sparse_depth_features
         # Iteration counts are ordered from the bottom to full resolution.
         # Coarse scales are denser; finer scales receive more exchanges.
         self.n_propagation_iterations = n_propagation_iterations
 
-        # Takes in RGB and sparse depth together and produce 5 feature maps.
+        # RGB-only by default; optionally concatenate raw sparse measurements.
         self.encoder = SharedEncoder(
             n_channels=n_channels,
             n_head=n_head,
-            encoder_type=encoder_type)
+            encoder_type=encoder_type,
+            use_sparse_depth_features=use_sparse_depth_features)
 
         # Positive bottom prediction supplies both a normalized scaleless depth
         self.coarse_scaleless_depth = Conv2d(
@@ -646,13 +660,14 @@ class ScalePropagationDepthModel(nn.Module):
                 use_outlier_rejection=use_outlier_rejection,
                 n_propagation_iterations=n_iteration,
                 max_predict_depth=max_predict_depth,
-                n_scale_refinement=n_scale_refinement)
+                n_scale_refinement=n_scale_refinement,
+                use_sparse_depth_features=use_sparse_depth_features)
             for n_iteration in n_propagation_iterations[1:]
         ])
 
     def forward(self, image, sparse_depth, return_all_outputs=False,
                 return_rejection_outputs=False):
-        features = self.encoder(image)
+        features = self.encoder(image, sparse_depth)
         coarse_feature = features[-1]
         coarse_sparse_depth, measurement_indices = sparse_depth_at_resolution(
             sparse_depth=sparse_depth,

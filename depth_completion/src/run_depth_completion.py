@@ -51,6 +51,9 @@ parser.add_argument('--n_shift',
 parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder architecture; match the choice used during training')
+parser.add_argument('--use_sparse_depth_features',
+    type=parse_boolean, default=False,
+    help='Match the scale checkpoint: raw sparse depth in encoder input and decoder fusion')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 
@@ -116,4 +119,5 @@ if __name__ == '__main__':
         keep_input_filenames=args.keep_input_filenames,
         # Hardware settings
         device=args.device,
-        encoder_type=args.encoder_type)
+        encoder_type=args.encoder_type,
+        use_sparse_depth_features=args.use_sparse_depth_features)

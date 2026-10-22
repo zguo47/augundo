@@ -19,7 +19,8 @@ class ScalePropagationDepthCompletionModel(object):
                  detach_scaleless_depth=True,
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  n_scale_refinement=2,
-                 encoder_type='conv'):
+                 encoder_type='conv',
+                 use_sparse_depth_features=False):
         del dataset_name, network_modules
 
         self.model_depth = ScalePropagationDepthModel(
@@ -29,7 +30,8 @@ class ScalePropagationDepthCompletionModel(object):
             detach_scaleless_depth=detach_scaleless_depth,
             n_propagation_iterations=n_propagation_iterations,
             n_scale_refinement=n_scale_refinement,
-            encoder_type=encoder_type)
+            encoder_type=encoder_type,
+            use_sparse_depth_features=use_sparse_depth_features)
 
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth

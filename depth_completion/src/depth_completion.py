@@ -1,4 +1,4 @@
-import os, time, sys
+import os, time, sys, random
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -10,6 +10,24 @@ from erosion2d import Erosion2d
 from depth_completion_model import DepthCompletionModel
 from utils.src.transforms import Transforms
 from PIL import Image
+
+
+def set_random_seed(seed):
+    '''Repeat initialization, augmentation, and stochastic keep-mask sampling.'''
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    '''Match Python/NumPy worker RNGs to the seed assigned by the DataLoader.'''
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def train(train_images_path,
@@ -101,7 +119,15 @@ def train(train_images_path,
           rejection_loss_type='cross_entropy',
           encoder_type='conv',
           rejection_keep_weight=2.0,
-          w_rejection_l1=None):
+          w_rejection_l1=None,
+          use_sparse_depth_features=False,
+          seed=0):
+
+    set_random_seed(seed)
+    # Separate loader generators keep shuffling independent of model size and
+    # prevent validation iterator creation from advancing training's RNG stream.
+    train_generator = torch.Generator().manual_seed(seed)
+    validation_generator = torch.Generator().manual_seed(seed + 1)
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -195,7 +221,9 @@ def train(train_images_path,
             batch_size=n_batch,
             shuffle=True,
             num_workers=n_thread,
-            drop_last=True)
+            drop_last=True,
+            worker_init_fn=seed_worker,
+            generator=train_generator)
     elif supervision_type == 'supervised':
         train_dataloader = torch.utils.data.DataLoader(
             datasets.DepthCompletionSupervisedTrainingDataset(
@@ -208,7 +236,9 @@ def train(train_images_path,
             batch_size=n_batch,
             shuffle=True,
             num_workers=n_thread,
-            drop_last=True)
+            drop_last=True,
+            worker_init_fn=seed_worker,
+            generator=train_generator)
     else:
         raise ValueError('Unsupported supervision type: {}'.format(supervision_type))
 
@@ -277,7 +307,9 @@ def train(train_images_path,
             batch_size=1,
             shuffle=False,
             num_workers=1,
-            drop_last=False)
+            drop_last=False,
+            worker_init_fn=seed_worker,
+            generator=validation_generator)
 
         val_transforms = Transforms(
             normalized_image_range=normalized_image_range)
@@ -300,7 +332,8 @@ def train(train_images_path,
         detach_scaleless_depth=detach_scaleless_depth,
         n_propagation_iterations=n_propagation_iterations,
         n_scale_refinement=n_scale_refinement,
-        encoder_type=encoder_type)
+        encoder_type=encoder_type,
+        use_sparse_depth_features=use_sparse_depth_features)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
 
@@ -323,7 +356,10 @@ def train(train_images_path,
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
                 encoder_type=encoder_type,
-                encoder_input='rgb_only', decoder_fusion_uses_sparse_depth=False,
+                use_sparse_depth_features=use_sparse_depth_features,
+                encoder_input='rgb_sparse' if use_sparse_depth_features else 'rgb_only',
+                decoder_fusion_uses_sparse_depth=use_sparse_depth_features,
+                seed=seed, data_order_seed=seed, validation_loader_seed=seed + 1,
                 sparse_scale_coordinates='current_resolution_grid_pixel',
                 detach_scaleless_depth=detach_scaleless_depth,
                 supervise_outlier_rejection=supervise_outlier_rejection,
@@ -408,6 +444,8 @@ def train(train_images_path,
         parameters_pose_model=parameters_pose_model)
 
     if 'scale_propagation' in model_name:
+        log('seed={}  use_sparse_depth_features={}'.format(
+            seed, use_sparse_depth_features), log_path)
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
         log('encoder_type={}'.format(encoder_type), log_path)
         log('n_propagation_iterations={}  n_scale_refinement={}'.format(
@@ -1162,7 +1200,8 @@ def run(image_path,
         keep_input_filenames,
         # Hardware settings
         device,
-        encoder_type='conv'):
+        encoder_type='conv',
+        use_sparse_depth_features=False):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -1261,7 +1300,8 @@ def run(image_path,
         n_shift=n_shift,
         use_outlier_rejection=use_outlier_rejection,
         device=device,
-        encoder_type=encoder_type)
+        encoder_type=encoder_type,
+        use_sparse_depth_features=use_sparse_depth_features)
 
     # Restore model and set to evaluation mode
     depth_model.restore_model(restore_paths)

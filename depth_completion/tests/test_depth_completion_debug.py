@@ -20,6 +20,27 @@ from scale_propagation_model import ScalePropagationDepthModel
 
 
 class DepthDebugTest(unittest.TestCase):
+    def test_fusion_stage_maps_are_correct_with_and_without_sparse_features(self):
+        for enabled in [False, True]:
+            model = ScalePropagationDepthModel(n_channels=8, use_sparse_depth_features=enabled).eval()
+            with tempfile.TemporaryDirectory() as directory:
+                debug = self.make_debug(model, directory)
+                debug.begin('validation', 1)
+                with torch.no_grad():
+                    model(torch.rand(1, 3, 17, 25), torch.ones(1, 1, 17, 25) * 5.)
+                for entries in debug.trace.values():
+                    stages = {r['stage']: r for r in entries}
+                    if 'after_upsampling' not in stages:
+                        continue
+                    before, after = stages['before_upsampling'], stages['after_upsampling']
+                    for name in ['geometry', 'scale']:
+                        value = torch.from_numpy(before[name])[None, None]
+                        expected = torch.nn.functional.interpolate(
+                            value, size=after[name].shape, mode='bilinear', align_corners=True)
+                        np.testing.assert_allclose(after[name], expected.numpy()[0, 0],
+                                                   atol=1e-5, rtol=1e-5)
+                debug.close()
+
     def test_distance_and_boundary_masks_ignore_missing_targets(self):
         mask = np.zeros((5, 7), dtype=bool)
         self.assertTrue(np.isinf(anchor_distance(mask)).all())
@@ -337,6 +358,7 @@ class DepthDebugTest(unittest.TestCase):
                 (root / (name + '.txt')).write_text((str(path) + '\n') * 2)
             arguments = [
                 '--model_name', 'scale_propagation_kitti', '--supervision_type', 'supervised',
+                '--seed', '17',
                 '--w_losses', 'w_supervised=1.0',
                 '--use_outlier_rejection', 'false', '--min_predict_depth', '1.5',
                 '--max_predict_depth', '100', '--n_batch', '1', '--n_height', '32', '--n_width', '48',
@@ -361,7 +383,7 @@ class DepthDebugTest(unittest.TestCase):
                 argv = [script] + arguments + ['--debug_depth', debug_enabled,
                                                '--checkpoint_path', str(root / enabled)]
                 if enabled == 'encoder_true':
-                    argv += ['--encoder_type', 'conv_attention']
+                    argv += ['--encoder_type', 'conv_attention', '--use_sparse_depth_features', 'true']
                 if enabled in ['none', 'none_reference']:
                     argv += ['--debug_depth', 'true', '--use_outlier_rejection', 'true',
                              '--supervise_outlier_rejection', 'true',
@@ -425,6 +447,11 @@ class DepthDebugTest(unittest.TestCase):
             self.assertTrue(all(r['supervision_enabled'] for r in reports))
             config = next(r for r in supervised if r['event'] == 'configuration')
             self.assertEqual(config['settings']['rejection_supervision_levels'], list(range(5)))
+            self.assertEqual(config['settings']['seed'], 17)
+            self.assertEqual(config['settings']['data_order_seed'], 17)
+            self.assertEqual(config['settings']['validation_loader_seed'], 18)
+            manifest = next(r for r in supervised if r['event'] == 'experiment_manifest')
+            self.assertEqual(manifest['torch_initial_seed'], 17)
             self.assertEqual(config['settings']['rejection_keep_weight'], 2.)
             self.assertEqual(config['settings']['rejection_resolution_weights'],
                              [1., .25, .0625, .015625, .00390625])
@@ -495,12 +522,17 @@ class DepthDebugTest(unittest.TestCase):
                                (root / 'encoder_true/debug/diagnostics.jsonl').read_text().splitlines()]
             encoder_config = next(r for r in encoder_records if r['event'] == 'configuration')
             self.assertEqual(encoder_config['settings']['encoder_type'], 'conv_attention')
+            self.assertTrue(encoder_config['settings']['use_sparse_depth_features'])
+            self.assertTrue(encoder_config['settings']['decoder_fusion_uses_sparse_depth'])
+            self.assertEqual(encoder_config['settings']['encoder_input'], 'rgb_sparse')
             path = next((root / 'encoder_true').glob('checkpoints-1*'))
             if path.is_dir():
                 path = next(path.glob('scale-propagation-*.pth'))
             weights = torch.load(str(path), map_location='cpu')['model_state_dict']
             self.assertIn('encoder.level1.convolutions.5.conv.weight', weights)
             self.assertIn('encoder.level3_attention.1.attention.in_proj_weight', weights)
+            self.assertEqual(weights['encoder.level0.convolutions.0.conv.weight'].shape[1], 4)
+            self.assertEqual(weights['decoder.0.fusion.convolutions.0.conv.weight'].shape[1], 67)
 
 
 if __name__ == '__main__':

@@ -137,9 +137,13 @@ class StageDiagnostics(object):
             level = 'decoder.{}'.format(index)
             def before(module, inputs, level=level):
                 self.capture_stage(level, 'before_upsampling', inputs[2], inputs[3])
-            def fused(module, inputs, level=level):
-                # Fusion concatenates features, skip, Z, M, sparse depth.
-                self.capture_stage(level, 'after_upsampling', inputs[0][:, -3:-2], inputs[0][:, -2:-1])
+            def fused(module, inputs, level=level,
+                      use_sparse_depth_features=block.use_sparse_depth_features):
+                # Fusion ends in Z, M, and optionally sparse depth. Select maps
+                # explicitly so toggling sparse features cannot relabel them.
+                start = inputs[0].shape[1] - (3 if use_sparse_depth_features else 2)
+                self.capture_stage(level, 'after_upsampling',
+                                   inputs[0][:, start:start + 1], inputs[0][:, start + 1:start + 2])
             self.handles.append(block.register_forward_pre_hook(before))
             self.handles.append(block.fusion.register_forward_pre_hook(fused))
 

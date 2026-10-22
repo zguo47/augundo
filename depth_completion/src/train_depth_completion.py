@@ -78,6 +78,9 @@ parser.add_argument('--n_shift',
 parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder: current 3/3/3/3/3 conv or 3/6/6/4+2SA/4+2SA')
+parser.add_argument('--use_sparse_depth_features',
+    type=parse_boolean, default=False,
+    help='Concatenate raw sparse depth to the scale encoder input and decoder fusion')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 parser.add_argument('--detach_scaleless_depth',
@@ -110,6 +113,8 @@ parser.add_argument('--rejection_reject_tolerance',
     help='Label reject when error > max(METERS, FRACTION * GT); ignore the gap')
 
 # Training settings
+parser.add_argument('--seed',
+    type=int, default=0, help='Fixed random seed for initialization, sampling, and augmentation')
 parser.add_argument('--learning_rates',
     nargs='+', type=float, default=[1e-4, 5e-5], help='Space delimited list of learning rates')
 parser.add_argument('--learning_schedule',
@@ -332,6 +337,8 @@ if __name__ == '__main__':
           rejection_loss_type=args.rejection_loss_type,
           w_rejection_l1=args.w_rejection_l1,
           encoder_type=args.encoder_type,
+          use_sparse_depth_features=args.use_sparse_depth_features,
+          seed=args.seed,
           rejection_supervision_levels=args.rejection_supervision_levels,
           rejection_keep_weight=args.rejection_keep_weight,
           n_propagation_iterations=args.n_propagation_iterations,

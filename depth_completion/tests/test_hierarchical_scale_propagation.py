@@ -292,8 +292,10 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         model = DepthCompletionModel(
             model_name='scale_propagation_kitti', network_modules=[],
             min_predict_depth=1.5, max_predict_depth=100., device=torch.device('cpu'),
-            use_outlier_rejection=False, encoder_type='conv_attention')
+            use_outlier_rejection=False, encoder_type='conv_attention',
+            use_sparse_depth_features=True)
         self.assertEqual(model.model.model_depth.encoder.encoder_type, 'conv_attention')
+        self.assertTrue(model.model.model_depth.use_sparse_depth_features)
         sparse = torch.zeros(1, 1, 17, 25)
         output = model.forward_depth(torch.rand(1, 3, 17, 25), sparse, torch.zeros_like(sparse))
         self.assertEqual(output.shape, sparse.shape)
@@ -306,10 +308,70 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             argv = [script, '--image_path', 'images.txt', '--sparse_depth_path', 'sparse.txt',
                     '--intrinsics_path', 'intrinsics.txt', '--output_path', 'outputs', '--device', 'cpu']
             if selected is not None:
-                argv += ['--encoder_type', selected]
+                argv += ['--encoder_type', selected, '--use_sparse_depth_features', 'true']
             with mock.patch.object(sys, 'argv', argv), mock.patch('depth_completion.run') as run:
                 runpy.run_path(script, run_name='__main__')
             self.assertEqual(run.call_args.kwargs['encoder_type'], selected or 'conv')
+            self.assertEqual(run.call_args.kwargs['use_sparse_depth_features'], selected is not None)
+
+    def test_sparse_feature_flag_controls_encoder_and_all_decoder_inputs(self):
+        image = torch.rand(1, 3, 17, 25)
+        sparse = torch.rand(1, 1, 17, 25) * 5.
+        for encoder_type in ['conv', 'conv_attention']:
+            for enabled in [False, True]:
+                model = ScalePropagationDepthModel(
+                    n_channels=8, encoder_type=encoder_type,
+                    use_sparse_depth_features=enabled).eval()
+                self.assertEqual(model.encoder.level0.convolutions[0].conv.in_channels,
+                                 4 if enabled else 3)
+                for block in model.decoder:
+                    self.assertEqual(block.fusion.convolutions[0].conv.in_channels,
+                                     19 if enabled else 18)
+                seen = []
+                handle = model.encoder.level0.register_forward_pre_hook(
+                    lambda module, inputs: seen.append(inputs[0].clone()))
+                fusion = []
+                model.decoder[-1].fusion.register_forward_pre_hook(
+                    lambda module, inputs: fusion.append(inputs[0].clone()))
+                with torch.no_grad():
+                    output = model(image, sparse)
+                handle.remove()
+                torch.testing.assert_close(seen[0][:, :3], image)
+                if enabled:
+                    torch.testing.assert_close(seen[0][:, 3:], sparse)
+                    torch.testing.assert_close(fusion[0][:, -1:], sparse)
+                self.assertEqual(output.shape, sparse.shape)
+                self.assertTrue(torch.isfinite(output).all())
+
+    def test_fixed_seed_repeats_all_rngs_and_keeps_data_order_independent_of_model(self):
+        import random
+        import numpy as np
+        from depth_completion import set_random_seed, seed_worker
+        results = []
+        for _ in range(2):
+            set_random_seed(17)
+            results.append((random.random(), np.random.rand(), torch.rand(5),
+                rejection_keep_mask(torch.zeros(1, 2, 3, 4), torch.ones(1, 1, 3, 4),
+                                    1., training=True)))
+        self.assertEqual(results[0][:2], results[1][:2])
+        for a, b in zip(results[0][2:], results[1][2:]):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        self.assertTrue(torch.backends.cudnn.deterministic)
+        self.assertFalse(torch.backends.cudnn.benchmark)
+        orders = []
+        for enabled in [False, True]:
+            set_random_seed(17)
+            ScalePropagationDepthModel(n_channels=8, use_sparse_depth_features=enabled)
+            loader = torch.utils.data.DataLoader(
+                torch.arange(16), batch_size=4, shuffle=True,
+                generator=torch.Generator().manual_seed(17), worker_init_fn=seed_worker)
+            orders.append(torch.cat(list(loader)))
+        torch.testing.assert_close(orders[0], orders[1], rtol=0, atol=0)
+        with mock.patch('torch.initial_seed', return_value=1234):
+            seed_worker(0)
+            first = (random.random(), np.random.rand())
+            seed_worker(1)
+            self.assertEqual(first, (random.random(), np.random.rand()))
 
     def test_guided_scale_initialization_matches_bilinear_for_arbitrary_shapes(self):
         upsampling = FeatureGuidedScaleUpsampling(n_channels=3)
