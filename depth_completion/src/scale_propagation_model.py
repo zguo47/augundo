@@ -112,14 +112,14 @@ class ConvolutionBlock(nn.Module):
 
 
 class SharedEncoder(nn.Module):
-    '''Five-resolution encoder shared by concatenated RGB and sparse depth.'''
+    '''Five-resolution RGB encoder shared by geometry and scale prediction.'''
 
     def __init__(self, n_channels, n_head, encoder_type='conv'):
         super(SharedEncoder, self).__init__()
 
         self.encoder_type = encoder_type
         n_convolution = (3, 6, 6, 4, 4) if encoder_type == 'conv_attention' else (3, 3, 3, 3, 3)
-        self.level0 = ConvolutionBlock(4, n_channels, stride=1, n_convolution=n_convolution[0])
+        self.level0 = ConvolutionBlock(3, n_channels, stride=1, n_convolution=n_convolution[0])
         self.level1 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[1])
         self.level2 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[2])
         self.level3 = ConvolutionBlock(n_channels, n_channels, stride=2, n_convolution=n_convolution[3])
@@ -150,10 +150,8 @@ class SharedEncoder(nn.Module):
             n_width,
             n_channel).permute(0, 3, 1, 2)
 
-    def forward(self, image, sparse_depth):
-        feature = torch.cat([image, sparse_depth], dim=1)
-
-        level0 = self.level0(feature)
+    def forward(self, image):
+        level0 = self.level0(image)
         level1 = self.level1(level0)
         level2 = self.level2(level1)
         level3 = self.level3(level2)
@@ -268,7 +266,7 @@ def propagate_scale(
             B x 1 x H x W inherited and learned positive scale map
         sparse_scale : torch.Tensor[float32]
             B x 1 x H x W measured depth divided by geometry at the same
-            original pixel; already computed with detached geometry
+            current-resolution grid pixel; computed with detached geometry
         keep_mask : torch.Tensor[float32]
             B x 1 x H x W keep decisions, zero at missing or rejected points
         propagation_logits : torch.Tensor[float32]
@@ -318,7 +316,7 @@ class ScalePropagation(nn.Module):
             self, scale, scaleless_depth, sparse_depth, keep_mask, logits,
             sparse_scale):
         # Geometry and sampled depth remain explicit inputs for debug hooks;
-        # propagation consumes the aligned ratio directly, without redivision.
+        # propagation consumes the current-cell ratio directly, without redivision.
         return propagate_scale(
             scale, sparse_scale, keep_mask, logits, self.n_propagation_iterations)
 
@@ -476,9 +474,9 @@ class PropagationDecoderBlock(nn.Module):
         super(PropagationDecoderBlock, self).__init__()
 
         # Carry features, scaleless geometry, and scale separately. Add this
-        # level's encoder skip and sparse measurements: C + C + 1 + 1 + 1.
+        # level's RGB encoder skip, without raw sparse depth: C + C + 1 + 1.
         self.fusion = ConvolutionBlock(
-            2 * n_channels + 3,
+            2 * n_channels + 2,
             n_channels,
             stride=1)
         self.gumbel_temperature = gumbel_temperature
@@ -539,8 +537,7 @@ class PropagationDecoderBlock(nn.Module):
             # Shared features can train under both objectives, but map inputs
             # are context only: SI losses must not train preceding scale heads.
             scaleless_depth.detach(),
-            scale.detach(),
-            sparse_depth
+            scale.detach()
         ], dim=1))
         # Scaleless stays positive and mean-one at every resolution. SI directly
         # trains scaleless; metric products follow detach_scaleless_depth.
@@ -569,9 +566,10 @@ class PropagationDecoderBlock(nn.Module):
             keep_mask = (sparse_depth > 0.0).to(sparse_depth.dtype)
 
         propagation_logits = self.propagation_map(propagation_input)
-        sparse_geometry = geometry_at_sparse_points(
-            scaleless_depth, measurement_indices, input_size)
-        sparse_scale = sparse_depth / sparse_geometry.clamp_min(1e-7)
+        # Ratios now use the geometry at this level's grid cell. The original
+        # measurement coordinates remain available only for rejection inputs
+        # and coordinate-matched CE labels, not for scale-ratio computation.
+        sparse_scale = sparse_depth / scaleless_depth.detach().clamp_min(1e-7)
         scale = self.scale_propagation(
             scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
@@ -654,7 +652,7 @@ class ScalePropagationDepthModel(nn.Module):
 
     def forward(self, image, sparse_depth, return_all_outputs=False,
                 return_rejection_outputs=False):
-        features = self.encoder(image, sparse_depth)
+        features = self.encoder(image)
         coarse_feature = features[-1]
         coarse_sparse_depth, measurement_indices = sparse_depth_at_resolution(
             sparse_depth=sparse_depth,
@@ -696,11 +694,9 @@ class ScalePropagationDepthModel(nn.Module):
             rejection_logits = torch.zeros_like(coarse_sparse_depth).repeat(1, 2, 1, 1)
 
         # Each accepted measurement proposes a metric scale d_sparse / scaleless.
-        # Pair that depth with scaleless depth at its original location, not merely
-        # the value at the coarse cell that contains the measurement.
-        sparse_geometry = geometry_at_sparse_points(
-            metric_geometry, measurement_indices, sparse_depth.shape[-2:])
-        sparse_scale = coarse_sparse_depth / sparse_geometry.clamp_min(1e-3)
+        # Use the current coarse-cell geometry directly, without sampling an
+        # interpolated geometry value at the selected original-image location.
+        sparse_scale = coarse_sparse_depth / metric_geometry.clamp_min(1e-3)
         scale = (
             torch.sum(keep_mask * sparse_scale, dim=[2, 3], keepdim=True) +
             fallback_scale.detach()) / (

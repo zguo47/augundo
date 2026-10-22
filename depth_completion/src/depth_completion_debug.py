@@ -157,7 +157,7 @@ class DepthCompletionDebug(StageDiagnostics):
                   model=str(self.model),
                   loss_definition='See captured loss_utils.py and model wrapper sources; detach sites in experiment_manifest',
                   propagation_activation='sigmoid',
-                  sparse_scale_coordinates='original_selected_pixel_align_corners_true',
+                  sparse_scale_coordinates='current_resolution_grid_pixel',
                   sparse_injection='direct_scale_injection_once_without_anchor_restoration')
         for split, dataset in datasets.items():
             if dataset is None:
@@ -316,9 +316,11 @@ class DepthCompletionDebug(StageDiagnostics):
                           injected_scale=statistics(keep * target + (1.0 - keep) * scale),
                           propagated_scale=statistics(propagated_scale),
                           sparse_scale_target=statistics(target[accepted]),
+                          keep_fraction_at_sparse=float(keep.sum() / (sparse > 0.0).sum().clamp_min(1)),
+                          available_sparse_count=int((sparse > 0.0).sum()),
                           accepted_scale_residual=statistics((propagated_scale - target)[accepted]),
                           accepted_scale_residual_scope='propagated_scale_before_refinement',
-                          sparse_scale_coordinates='original_selected_pixel_align_corners_true',
+                          sparse_scale_coordinates='current_resolution_grid_pixel',
                           scaleless_depth=statistics(geometry),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),
                           center_outgoing_weight=statistics(weights[:, 4]),

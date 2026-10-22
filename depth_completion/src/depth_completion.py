@@ -100,7 +100,8 @@ def train(train_images_path,
           n_scale_refinement=2,
           rejection_loss_type='cross_entropy',
           encoder_type='conv',
-          rejection_keep_weight=2.0):
+          rejection_keep_weight=2.0,
+          w_rejection_l1=None):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -117,6 +118,11 @@ def train(train_images_path,
     rejection_loss_active = rejection_loss_active and rejection_loss_type != 'none'
     rejection_supervision_active = rejection_loss_active and rejection_loss_type == 'cross_entropy'
     rejection_sparsity_active = rejection_loss_active and rejection_loss_type == 'l1'
+    # CE keeps its existing weight. L1 optionally has a separate bash override
+    # because it now penalizes keeping anchors, rather than rejecting them.
+    rejection_loss_weight = w_losses.get('w_rejection', 0.1)
+    if rejection_loss_type == 'l1' and w_rejection_l1 is not None:
+        rejection_loss_weight = w_rejection_l1
 
     # Set up checkpoint and event paths
     if not os.path.exists(checkpoint_path):
@@ -317,6 +323,8 @@ def train(train_images_path,
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
                 encoder_type=encoder_type,
+                encoder_input='rgb_only', decoder_fusion_uses_sparse_depth=False,
+                sparse_scale_coordinates='current_resolution_grid_pixel',
                 detach_scaleless_depth=detach_scaleless_depth,
                 supervise_outlier_rejection=supervise_outlier_rejection,
                 rejection_supervision_active=rejection_supervision_active,
@@ -331,6 +339,9 @@ def train(train_images_path,
                 rejection_keep_tolerance=rejection_keep_tolerance,
                 rejection_reject_tolerance=rejection_reject_tolerance,
                 w_rejection=w_losses.get('w_rejection', 0.1),
+                w_rejection_l1=w_rejection_l1,
+                rejection_loss_weight=rejection_loss_weight,
+                l1_regularized_mask='keep',
                 w_losses=dict(w_losses), learning_rates=learning_rates,
                 learning_schedule=learning_schedule, restore_paths=restore_paths,
                 accumulation=n_step_per_gradient_accumulation,
@@ -405,6 +416,8 @@ def train(train_images_path,
             supervise_outlier_rejection, rejection_loss_active,
             w_losses.get('w_rejection', 0.1)), log_path)
         log('rejection_loss_type={}'.format(rejection_loss_type), log_path)
+        log('rejection_loss_weight={}  l1_regularized_mask=keep'.format(
+            rejection_loss_weight), log_path)
         log('rejection_keep_weight={}  rejection_resolution_weights={}'.format(
             rejection_keep_weight, [1.0 / (4 ** r) for r in range(5)]), log_path)
         if rejection_loss_active:
@@ -727,8 +740,12 @@ def train(train_images_path,
                     depth_debug.emit('rejection_sparsity',
                                      levels=list(rejection_supervision_levels),
                                      loss=float(rejection_loss.detach()),
+                                     loss_weight=rejection_loss_weight,
+                                     regularized_mask='keep',
                                      fractions={k: float(v) for k, v in rejection_info.items()
-                                                if k.startswith('rejection_rejected_fraction_')},
+                                                if k.startswith('rejection_kept_fraction_')},
+                                     rejected_fractions={k: float(v) for k, v in rejection_info.items()
+                                                        if k.startswith('rejection_rejected_fraction_')},
                                      mask_source='actual straight-through masks used for scale injection')
 
             if is_summary_step:
@@ -764,7 +781,7 @@ def train(train_images_path,
                 w_losses=w_losses)
 
             if rejection_loss_active:
-                weighted_rejection = w_losses.get('w_rejection', 0.1) * rejection_loss
+                weighted_rejection = rejection_loss_weight * rejection_loss
                 loss = loss + weighted_rejection
                 loss_info.update(rejection_info)
                 loss_info['loss_rejection_weighted'] = weighted_rejection

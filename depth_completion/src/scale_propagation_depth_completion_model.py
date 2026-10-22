@@ -95,7 +95,10 @@ class ScalePropagationDepthCompletionModel(object):
                 sparse_depth, scores.shape[-2:], return_indices=True)
             if loss_type == 'l1':
                 value = loss_utils.rejection_sparsity_loss_func(scores, selected)
-                loss_info['rejection_rejected_fraction_r{}'.format(resolution)] = value.detach()
+                loss_info['rejection_kept_fraction_r{}'.format(resolution)] = value.detach()
+                measured = (selected > 0.0).to(scores.dtype)
+                rejected_fraction = (measured * (1.0 - scores)).sum() / measured.sum().clamp_min(1)
+                loss_info['rejection_rejected_fraction_r{}'.format(resolution)] = rejected_fraction.detach()
             else:
                 matched = torch.gather(target_depth.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
                 labels = loss_utils.rejection_supervision_targets(

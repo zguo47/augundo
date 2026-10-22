@@ -29,15 +29,18 @@ def rejection_supervision_targets(sparse_depth, target_depth,
 
 
 def rejection_sparsity_loss_func(keep_mask, sparse_depth):
-    '''Penalize the fraction of valid sparse measurements rejected.
+    '''Penalize the fraction of available sparse measurements kept.
 
     Use the actual straight-through Gumbel keep mask from propagation, not a
     newly sampled decision or an argmax. Missing measurements contribute zero.
-    Rejection V * (1 - K) is nonnegative, so its sum is exactly its L1 norm.
+    Selection V * K is nonnegative, so its sum is exactly its L1 norm. This
+    favors fewer anchors; GT-based metric losses favor the subset that improves
+    dense depth. Unlike CE, no pointwise keep/reject GT labels are constructed.
+    Normalize by the available count so the weight is independent of density.
     '''
     validity = (sparse_depth > 0.0).to(keep_mask.dtype)
-    rejection = validity * (1.0 - keep_mask)
-    return rejection.sum() / validity.sum().clamp_min(1)
+    selection = validity * keep_mask
+    return selection.sum() / validity.sum().clamp_min(1)
 
 
 def balanced_rejection_loss_func(logits, labels, keep_weight=2.0):

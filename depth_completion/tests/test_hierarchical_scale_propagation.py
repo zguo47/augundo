@@ -99,13 +99,15 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             n_selected = int((sparse_depth_at_resolution(flipped_sparse, scores.shape[-2:]) > 0).sum())
             self.assertEqual(int(info['rejection_reject_count_r{}'.format(r)]), n_selected)
 
-    def test_rejection_l1_penalizes_rejected_valid_points_not_missing_pixels(self):
+    def test_rejection_l1_penalizes_kept_valid_points_not_missing_pixels(self):
         sparse = torch.tensor([[[[5., 0., 8., 0.]]]])
         keep = torch.tensor([[[[1., 0., 0., 0.]]]], requires_grad=True)
         value = loss_utils.rejection_sparsity_loss_func(keep, sparse)
         self.assertEqual(float(value), 0.5)
         value.backward()
-        torch.testing.assert_close(keep.grad, torch.tensor([[[[-0.5, 0., -0.5, 0.]]]]))
+        torch.testing.assert_close(keep.grad, torch.tensor([[[[0.5, 0., 0.5, 0.]]]]))
+        self.assertEqual(float(loss_utils.rejection_sparsity_loss_func(torch.zeros_like(keep), sparse)), 0.)
+        self.assertEqual(float(loss_utils.rejection_sparsity_loss_func(torch.ones_like(keep), sparse)), 1.)
         empty = torch.zeros_like(sparse, requires_grad=True)
         value = loss_utils.rejection_sparsity_loss_func(empty, torch.zeros_like(sparse))
         self.assertEqual(float(value), 0.)
@@ -122,12 +124,13 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             value, info = wrapper.compute_loss_rejection(
                 None, sparse, masks, supervision_levels=levels, loss_type='l1')
             selected = range(5) if levels is None else levels
-            expected = sum((1. - float(r % 2)) / (4 ** r) for r in selected)
+            expected = sum(float(r % 2) / (4 ** r) for r in selected)
             self.assertAlmostEqual(float(value), expected, places=6)
             value.backward()
             for r, mask in enumerate(masks):
                 self.assertEqual(mask.grad is not None, r in selected)
                 self.assertEqual('rejection_rejected_fraction_r{}'.format(r) in info, r in selected)
+                self.assertEqual('rejection_kept_fraction_r{}'.format(r) in info, r in selected)
             self.assertFalse(any(k.startswith('rejection_reject_count') for k in info))
         scores = [torch.zeros(1, 2, 1, 1, requires_grad=True)]
         value, _ = wrapper.compute_loss_rejection(None, sparse, scores, loss_type='none')
@@ -206,12 +209,13 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         encoder = SharedEncoder(n_channels=8, n_head=4)
         with mock.patch('scale_propagation_model.add_position_encoding') as position, \
                 mock.patch('scale_propagation_model.SelfAttentionBlock.forward') as attention:
-            features = encoder(torch.rand(1, 3, 17, 25), torch.rand(1, 1, 17, 25))
+            features = encoder(torch.rand(1, 3, 17, 25))
         position.assert_not_called()
         attention.assert_not_called()
         self.assertEqual([tuple(feature.shape) for feature in features], [
             (1, 8, 17, 25), (1, 8, 9, 13), (1, 8, 5, 7),
             (1, 8, 3, 4), (1, 8, 2, 2)])
+        self.assertEqual(encoder.level0.convolutions[0].conv.in_channels, 3)
         for level in range(5):
             convolutions = getattr(encoder, 'level{}'.format(level)).convolutions
             self.assertEqual(len(convolutions), 3)
@@ -239,8 +243,9 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                                             order.append('sa{}.{}'.format(level, index)))
         with mock.patch('scale_propagation_model.add_position_encoding',
                         wraps=sys.modules['scale_propagation_model'].add_position_encoding) as position:
-            features = encoder(torch.rand(1, 3, 17, 25), torch.rand(1, 1, 17, 25))
+            features = encoder(torch.rand(1, 3, 17, 25))
         self.assertEqual(position.call_count, 2)
+        self.assertEqual(encoder.level0.convolutions[0].conv.in_channels, 3)
         self.assertEqual(order, ['conv0', 'conv1', 'conv2', 'conv3', 'sa3.0', 'sa3.1',
                                  'conv4', 'sa4.0', 'sa4.1'])
         self.assertEqual([tuple(f.shape) for f in features], [
@@ -258,6 +263,29 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertFalse(any('attention' in key for key in default.state_dict()))
         for key, value in default.state_dict().items():
             torch.testing.assert_close(value, explicit.state_dict()[key], rtol=0, atol=0)
+
+    def test_decoder_fusion_and_geometry_update_do_not_receive_raw_sparse_depth(self):
+        block = PropagationDecoderBlock(
+            n_channels=8, gumbel_temperature=1., use_outlier_rejection=False,
+            n_scale_refinement=0).eval()
+        self.assertEqual(block.fusion.convolutions[0].conv.in_channels, 18)
+        feature = torch.rand(1, 8, 3, 4)
+        skip = torch.rand(1, 8, 5, 7)
+        geometry = torch.rand(1, 1, 3, 4) + 0.5
+        scale = torch.full_like(geometry, 2.)
+        fusion_inputs = []
+        handle = block.fusion.register_forward_pre_hook(
+            lambda module, inputs: fusion_inputs.append(inputs[0].clone()))
+        with torch.no_grad():
+            empty = block(feature, skip, geometry, scale, torch.zeros(1, 1, 17, 25))
+            measured = block(feature, skip, geometry, scale, torch.full((1, 1, 17, 25), 7.))
+        handle.remove()
+        # Hold inherited state fixed: changing only raw sparse depth cannot
+        # change fused features or Z. It still changes the explicit scale path.
+        torch.testing.assert_close(fusion_inputs[0], fusion_inputs[1], rtol=0, atol=0)
+        torch.testing.assert_close(empty[0], measured[0], rtol=0, atol=0)
+        torch.testing.assert_close(empty[1], measured[1], rtol=0, atol=0)
+        self.assertFalse(torch.allclose(empty[2], measured[2]))
 
     def test_optional_encoder_selection_through_repository_wrapper(self):
         from depth_completion_model import DepthCompletionModel
@@ -394,7 +422,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             expected = torch.gather(full_geometry.flatten(2), 2, indices.flatten(2)).reshape_as(sampled)
             torch.testing.assert_close(sampled, expected)
 
-    def test_aligned_scale_ratio_is_injected_directly_without_redivision(self):
+    def test_current_cell_scale_ratio_is_injected_directly_without_redivision(self):
         sparse = torch.zeros(1, 1, 4, 4)
         sparse[0, 0, 1, 1] = 6.
         geometry = torch.tensor([[[[1., 3.], [2., 4.]]]])
@@ -402,16 +430,16 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sampled = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
         # At original pixel (1, 1), interpolated Z is 2, not coarse-cell Z = 1.
         self.assertAlmostEqual(float(sampled[0, 0, 0, 0]), 2., places=6)
-        target = selected / sampled.clamp_min(1e-7)
+        target = selected / geometry.detach().clamp_min(1e-7)
         scale = torch.full_like(geometry, 2.)
         logits = torch.full((1, 9, 2, 2), -100.)
         propagated = propagate_scale(scale, target, (selected > 0).float(), logits)
         expected = scale.clone()
-        expected[0, 0, 0, 0] = 3.
+        expected[0, 0, 0, 0] = 6.
         torch.testing.assert_close(propagated, expected)
-        self.assertNotEqual(float(target[0, 0, 0, 0]), float((selected / geometry)[0, 0, 0, 0]))
+        self.assertNotEqual(float(target[0, 0, 0, 0]), float((selected / sampled)[0, 0, 0, 0]))
 
-    def test_every_level_uses_aligned_ratios_and_bottom_reuses_them_for_initialization(self):
+    def test_every_level_uses_current_cell_ratios_and_bottom_reuses_them_for_initialization(self):
         model = ScalePropagationDepthModel(n_channels=8, use_outlier_rejection=False).eval()
         observed, raw_bottom = [], []
         handles = [model.coarse_scaleless_depth.register_forward_hook(
@@ -429,14 +457,10 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertEqual([iteration for iteration, _ in observed], [2, 4, 6, 8, 12])
         for level, (_, inputs) in enumerate(observed):
             scale, geometry, selected, keep, logits, ratio = inputs
-            expected_sparse, indices = sparse_depth_at_resolution(
-                sparse, geometry.shape[-2:], return_indices=True)
-            full_geometry = functional.interpolate(
-                geometry.detach(), size=sparse.shape[-2:], mode='bilinear', align_corners=True)
-            matched = torch.gather(full_geometry.flatten(2), 2, indices.flatten(2)).reshape_as(selected)
+            expected_sparse = sparse_depth_at_resolution(sparse, geometry.shape[-2:])
             torch.testing.assert_close(selected, expected_sparse)
             epsilon = 1e-3 if level == 0 else 1e-7
-            torch.testing.assert_close(ratio, selected / matched.clamp_min(epsilon))
+            torch.testing.assert_close(ratio, selected / geometry.detach().clamp_min(epsilon))
             self.assertEqual(ratio.shape, scale.shape)
         scale, _, _, keep, _, ratio = observed[0][1]
         fallback = (functional.softplus(raw_bottom[0]) + 1e-3).mean(dim=[2, 3], keepdim=True)
@@ -545,9 +569,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         sparse[0, 0, 2, 2] = 6.
         keep = (sparse > 0).float().requires_grad_()
         logits = torch.zeros(1, 9, 5, 7, requires_grad=True)
-        _, indices = sparse_depth_at_resolution(sparse, scale.shape[-2:], return_indices=True)
-        matched = geometry_at_sparse_points(geometry, indices, sparse.shape[-2:])
-        result = propagate_scale(scale, sparse / matched.clamp_min(1e-7), keep, logits, 4)
+        result = propagate_scale(scale, sparse / geometry.detach().clamp_min(1e-7), keep, logits, 4)
         result.square().sum().backward()
         self.assertIsNone(geometry.grad)
         for value in (keep, logits, scale):

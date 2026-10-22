@@ -86,7 +86,10 @@ parser.add_argument('--supervise_outlier_rejection',
     type=parse_boolean, default=False, help='Enable the selected auxiliary rejection loss (cross_entropy or l1)')
 parser.add_argument('--rejection_loss_type',
     choices=['cross_entropy', 'l1', 'none'], default='cross_entropy',
-    help='Auxiliary rejection objective; existing supervise_outlier_rejection flag enables it')
+    help='Auxiliary rejection objective: CE labels or L1 kept-anchor sparsity; supervise_outlier_rejection enables it')
+parser.add_argument('--w_rejection_l1',
+    type=float, default=None,
+    help='L1 kept-anchor penalty weight; defaults to w_losses w_rejection (0.1)')
 parser.add_argument('--rejection_supervision_levels',
     nargs='+', type=int, choices=range(5), default=None,
     help='Rejection-loss resolutions: 0=full, ..., 4=bottom; defaults to all, weighted by 1/4**r')
@@ -327,6 +330,7 @@ if __name__ == '__main__':
           detach_scaleless_depth=args.detach_scaleless_depth,
           supervise_outlier_rejection=args.supervise_outlier_rejection,
           rejection_loss_type=args.rejection_loss_type,
+          w_rejection_l1=args.w_rejection_l1,
           encoder_type=args.encoder_type,
           rejection_supervision_levels=args.rejection_supervision_levels,
           rejection_keep_weight=args.rejection_keep_weight,

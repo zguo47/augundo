@@ -239,7 +239,9 @@ class DepthDebugTest(unittest.TestCase):
                 self.assertIn('injected_scale', record)
                 self.assertNotIn('anchor_support', record)
                 self.assertEqual(record['sparse_scale_coordinates'],
-                                 'original_selected_pixel_align_corners_true')
+                                 'current_resolution_grid_pixel')
+                self.assertAlmostEqual(record['keep_fraction_at_sparse'],
+                                       float(inputs[3].sum() / (inputs[2] > 0).sum().clamp_min(1)), places=6)
                 self.assertAlmostEqual(record['sparse_scale_target']['mean'],
                                        float(inputs[5][accepted].double().mean()), places=6)
                 self.assertAlmostEqual(record['outgoing_weight_sum']['mean'],
@@ -368,7 +370,7 @@ class DepthDebugTest(unittest.TestCase):
                         argv += ['--supervise_outlier_rejection', 'false']
                 if enabled.startswith('l1_'):
                     argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true',
-                             '--rejection_loss_type', 'l1']
+                             '--rejection_loss_type', 'l1', '--w_rejection_l1', '0.03']
                 if enabled.startswith('rejection_'):
                     argv += ['--supervise_outlier_rejection', 'true', '--use_outlier_rejection', 'true']
                     argv += ['--n_propagation_iterations', '1', '2', '3', '4', '6',
@@ -456,9 +458,22 @@ class DepthDebugTest(unittest.TestCase):
             self.assertTrue(l1_config['rejection_loss_active'])
             self.assertFalse(l1_config['rejection_supervision_active'])
             self.assertEqual(l1_config['rejection_supervision_levels'], list(range(5)))
+            self.assertEqual(l1_config['encoder_input'], 'rgb_only')
+            self.assertFalse(l1_config['decoder_fusion_uses_sparse_depth'])
+            self.assertEqual(l1_config['sparse_scale_coordinates'], 'current_resolution_grid_pixel')
+            self.assertEqual(l1_config['w_rejection_l1'], 0.03)
+            self.assertEqual(l1_config['rejection_loss_weight'], 0.03)
+            self.assertEqual(l1_config['l1_regularized_mask'], 'keep')
             l1 = next(r for r in l1_records if r['event'] == 'rejection_sparsity')
             self.assertEqual(len(l1['fractions']), 5)
+            self.assertTrue(all(k.startswith('rejection_kept_fraction_') for k in l1['fractions']))
+            self.assertEqual(l1['regularized_mask'], 'keep')
+            self.assertEqual(l1['loss_weight'], 0.03)
             self.assertTrue(0. <= l1['loss'] <= sum(4. ** -r for r in range(5)))
+            training = next(r for r in l1_records if r['event'] == 'training_prediction')['loss_info']
+            self.assertAlmostEqual(training['loss_rejection_weighted'], 0.03 * training['loss_rejection'], places=6)
+            for r in range(5):
+                self.assertIn('rejection_kept_fraction_r{}'.format(r), training)
             objectives = next(r for r in l1_records if r['event'] == 'gradient_objectives')
             self.assertTrue(any(v['rejection_norm'] > 0. for v in objectives['groups'].values()))
             none_records = [json.loads(line) for line in

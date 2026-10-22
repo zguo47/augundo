@@ -190,7 +190,7 @@ class StageDiagnostics(object):
                     dot = item.pop(names[i] + '_' + names[j] + '_dot')
                     item[key] = dot / denominator if denominator else None
         self.emit('gradient_objectives', groups=groups,
-                  scope='current microbatch before accumulation division; rejection includes w_rejection')
+                  scope='current microbatch before accumulation division; rejection includes its configured loss weight')
 
     def supervised_rejection_report(self, level, logits, selected, matched):
         '''Report the actual label policy separately from generic GT disagreements.'''
