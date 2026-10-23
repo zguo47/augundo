@@ -303,6 +303,8 @@ class DepthCompletionDebug(StageDiagnostics):
                 accepted = keep > 0.0
                 weights = torch.sigmoid(logits)
                 if self.context.get('phase') == 'validation':
+                    if level in self.rejection_observations:
+                        self.rejection_observations[level]['keep'] = accepted.detach()
                     self.anchor_context[level] = dict(keep=keep)
                     self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else 'after_geometry_update',
                                        geometry, scale)
@@ -352,14 +354,12 @@ class DepthCompletionDebug(StageDiagnostics):
                           measurement_y_offset=statistics(inputs[0][:, -2:-1][measured]),
                           measurement_x_offset=statistics(inputs[0][:, -1:][measured]),
                           depth_context_location='selected original measurement pixel')
-                # Validation uses argmax, so this is the actual keep decision.
-                # Training uses sampled Gumbel decisions; do not label those
-                # using untransformed ground truth from the training batch.
+                # The propagation hook records the actual sampled Gumbel mask.
+                # Do not resample here or use argmax as the validation decision.
                 if self.context['phase'] == 'validation':
                     self.rejection_observations[level] = dict(
                         size=tuple(margin.shape[-2:]),
-                        logits=logits.detach(),
-                        keep=(margin >= 0.0).detach())
+                        logits=logits.detach())
         return observe
 
     def rejection_quality(self, sparse, target):
@@ -399,7 +399,9 @@ class DepthCompletionDebug(StageDiagnostics):
                           ground_truth_scope='original_selected_pixel',
                           sparse_vs_target=errors(sampled, selected_target, array(known)),
                           categories=reports)
-                self.supervised_rejection_report(level, observation['logits'], sampled, selected_target)
+                self.supervised_rejection_report(
+                    level, observation['logits'], sampled, selected_target,
+                    keep_mask=observation['keep'])
 
     def output_gradient(self, gradient):
         if not self.probing:

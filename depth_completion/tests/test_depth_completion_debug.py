@@ -20,6 +20,30 @@ from scale_propagation_model import ScalePropagationDepthModel
 
 
 class DepthDebugTest(unittest.TestCase):
+    def test_validation_rejection_diagnostics_use_actual_gumbel_mask(self):
+        model = ScalePropagationDepthModel(n_channels=8).eval()
+        with torch.no_grad():
+            for stage in [model] + list(model.decoder):
+                stage.rejection_map.conv.weight.zero_()
+                stage.rejection_bias.zero_()
+        sparse = torch.ones(1, 1, 17, 25) * 5.
+        with tempfile.TemporaryDirectory() as directory:
+            debug = self.make_debug(model, directory)
+            debug.begin('validation', 1)
+            with torch.no_grad():
+                model(torch.rand(1, 3, 17, 25), sparse)
+            for level, observation in debug.rejection_observations.items():
+                torch.testing.assert_close(
+                    observation['keep'], debug.anchor_context[level]['keep'].bool())
+            keep = debug.rejection_observations['decoder.3']['keep']
+            self.assertTrue(keep.any())
+            self.assertTrue((~keep).any())
+            debug.rejection_quality(sparse, sparse)
+            report = debug.rejection_reports[(None, 'decoder.3')]
+            self.assertEqual(report['decision_rule'], 'sampled_gumbel')
+            self.assertEqual(report['confusion']['false_reject'], int((~keep).sum()))
+            debug.close()
+
     def test_fusion_stage_maps_are_correct_with_and_without_sparse_features(self):
         for enabled in [False, True]:
             model = ScalePropagationDepthModel(n_channels=8, use_sparse_depth_features=enabled).eval()

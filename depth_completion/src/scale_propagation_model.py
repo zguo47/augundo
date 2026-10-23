@@ -335,19 +335,13 @@ def rejection_keep_mask(rejection_logits, sparse_depth, temperature, training):
     '''Make keep/reject decisions for this level's sparse depth.
     '''
 
-    if training:
-        rejection_decision = functional.gumbel_softmax(
-            rejection_logits,
-            tau=temperature,
-            hard=True,
-            dim=1)
-        keep_mask = rejection_decision[:, 0:1, :, :]
-    else:
-        rejection_decision = torch.argmax(
-            rejection_logits,
-            dim=1,
-            keepdim=True)
-        keep_mask = (rejection_decision == 0).to(sparse_depth.dtype)
+    # Sample the same hard decisions during training and evaluation.
+    rejection_decision = functional.gumbel_softmax(
+        rejection_logits,
+        tau=temperature,
+        hard=True,
+        dim=1)
+    keep_mask = rejection_decision[:, 0:1, :, :]
 
     return keep_mask * (sparse_depth > 0.0).to(sparse_depth.dtype)
 
@@ -492,6 +486,7 @@ class PropagationDecoderBlock(nn.Module):
         self.n_propagation_iterations = n_propagation_iterations
         self.max_predict_depth = max_predict_depth
         self.n_scale_refinement = n_scale_refinement
+        # Retain the unused parameters for existing checkpoint compatibility.
         self.scale_upsampling = FeatureGuidedScaleUpsampling(n_channels)
         self.depth_update = Conv2d(
             n_channels,
@@ -532,7 +527,11 @@ class PropagationDecoderBlock(nn.Module):
             size=skip.shape[-2:],
             mode='bilinear',
             align_corners=True)
-        scale = self.scale_upsampling(scale, skip)
+        scale = functional.interpolate(
+            scale,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
         input_size = sparse_depth.shape[-2:]
         sparse_depth, measurement_indices = sparse_depth_at_resolution(
             sparse_depth=sparse_depth,

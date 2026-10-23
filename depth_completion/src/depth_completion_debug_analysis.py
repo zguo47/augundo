@@ -196,7 +196,7 @@ class StageDiagnostics(object):
         self.emit('gradient_objectives', groups=groups,
                   scope='current microbatch before accumulation division; rejection includes its configured loss weight')
 
-    def supervised_rejection_report(self, level, logits, selected, matched):
+    def supervised_rejection_report(self, level, logits, selected, matched, keep_mask=None):
         '''Report the actual label policy separately from generic GT disagreements.'''
         from utils.src import loss_utils
         from depth_completion_debug import statistics
@@ -205,7 +205,8 @@ class StageDiagnostics(object):
         with torch.no_grad():
             labels = loss_utils.rejection_supervision_targets(
                 selected, matched, keep_tolerance, reject_tolerance)
-            prediction = logits.argmax(1, keepdim=True)
+            prediction = logits.argmax(1, keepdim=True) if keep_mask is None else \
+                (~keep_mask.bool()).long()
             probability = logits.softmax(1)[:, 0:1]
             measured = (selected > 0) & torch.isfinite(selected)
             known = measured & (matched > 0) & torch.isfinite(matched)
@@ -217,7 +218,9 @@ class StageDiagnostics(object):
             n_keep, n_reject = int(keep.sum()), int(reject.sum())
             n_predicted_reject = counts['true_reject'] + counts['false_reject']
             resolution = 4 if level == 'bottom' else 3 - int(level.split('.')[1])
-            report = dict(level=level, keep_target_count=n_keep, reject_target_count=n_reject,
+            report = dict(level=level,
+                          decision_rule='argmax' if keep_mask is None else 'sampled_gumbel',
+                          keep_target_count=n_keep, reject_target_count=n_reject,
                           ambiguous_count=int((known & (labels == -1)).sum()),
                           missing_gt_count=int((measured & ~known).sum()),
                           confusion=counts,

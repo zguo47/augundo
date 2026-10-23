@@ -385,6 +385,22 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                 scale, size=fine_size, mode='bilinear', align_corners=True)
             torch.testing.assert_close(upsampling(scale, skip), expected)
 
+    def test_decoder_scale_upsampling_is_bilinear_despite_guided_weights(self):
+        block = PropagationDecoderBlock(8, 1., False)
+        with torch.no_grad():
+            block.scale_upsampling.weight_prediction.conv.weight.normal_(std=10.)
+        scale = torch.rand(1, 1, 3, 4) + 1.
+        seen = []
+        block.fusion.register_forward_pre_hook(
+            lambda module, inputs: seen.append(inputs[0][:, -1:].clone()))
+        with mock.patch.object(block.scale_upsampling, 'forward',
+                               side_effect=AssertionError('guided upsampling is inactive')):
+            block(torch.rand(1, 8, 3, 4), torch.rand(1, 8, 5, 7),
+                  torch.ones_like(scale), scale, torch.zeros(1, 1, 5, 7))
+        expected = functional.interpolate(
+            scale, size=(5, 7), mode='bilinear', align_corners=True)
+        torch.testing.assert_close(seen[0], expected)
+
     def test_guided_scale_weights_use_fine_features_to_choose_a_surface(self):
         upsampling = FeatureGuidedScaleUpsampling(n_channels=1)
         with torch.no_grad():
@@ -744,6 +760,22 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits.grad).all())
         self.assertGreater(float(logits.grad.abs().sum()), 0.)
 
+    def test_validation_uses_same_gumbel_sample_as_training_with_same_seed(self):
+        logits = torch.zeros(1, 2, 16, 16)
+        sparse = torch.ones(1, 1, 16, 16)
+        sparse[:, :, 0] = 0.
+        torch.manual_seed(17)
+        training = rejection_keep_mask(logits, sparse, 1., training=True)
+        torch.manual_seed(17)
+        with torch.no_grad():
+            validation = rejection_keep_mask(logits, sparse, 1., training=False)
+            another = rejection_keep_mask(logits, sparse, 1., training=False)
+        torch.testing.assert_close(training, validation, rtol=0, atol=0)
+        self.assertTrue((validation[sparse > 0] == 0).any())
+        self.assertTrue((validation[sparse > 0] == 1).any())
+        self.assertTrue((validation[sparse == 0] == 0).all())
+        self.assertFalse(torch.equal(validation, another))
+
     def make_wrapper(self, rejection=False):
         wrapper = ScalePropagationDepthCompletionModel.__new__(ScalePropagationDepthCompletionModel)
         wrapper.min_predict_depth = 0.01
@@ -772,7 +804,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             self.assertGreater(float(wrapper.model_depth.coarse_scaleless_depth.conv.weight.grad.abs().sum()), 0.)
             self.assertEqual(len([key for key in info if key.startswith('loss_si_r')]), 5)
 
-    def test_fresh_rejection_at_each_level_and_deterministic_eval(self):
+    def test_fresh_rejection_at_each_level_with_confident_gumbel_eval(self):
         model = ScalePropagationDepthModel(n_channels=8).eval()
         decisions = []
         with torch.no_grad():
@@ -906,7 +938,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         self.assertTrue(any(stage.scale_update.convolutions[-1].conv.weight.grad.abs().sum() > 0
                             for stage in [model] + list(model.decoder)))
         self.assertTrue(all(
-            block.scale_upsampling.weight_prediction.conv.weight.grad.abs().sum() > 0
+            block.scale_upsampling.weight_prediction.conv.weight.grad is None
             for block in model.decoder))
 
     def test_detach_flag_through_repo_wrapper_controls_only_metric_geometry_gradients(self):
