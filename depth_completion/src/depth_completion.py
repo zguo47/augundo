@@ -1201,7 +1201,8 @@ def run(image_path,
         # Hardware settings
         device,
         encoder_type='conv',
-        use_sparse_depth_features=False):
+        use_sparse_depth_features=False,
+        n_scale_refinement=2):
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -1301,7 +1302,8 @@ def run(image_path,
         use_outlier_rejection=use_outlier_rejection,
         device=device,
         encoder_type=encoder_type,
-        use_sparse_depth_features=use_sparse_depth_features)
+        use_sparse_depth_features=use_sparse_depth_features,
+        n_scale_refinement=n_scale_refinement)
 
     # Restore model and set to evaluation mode
     depth_model.restore_model(restore_paths)

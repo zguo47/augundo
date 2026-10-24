@@ -56,6 +56,9 @@ parser.add_argument('--use_sparse_depth_features',
     help='Match the scale checkpoint: raw sparse depth in encoder input and decoder fusion')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
+parser.add_argument('--n_scale_refinement',
+    type=int, default=2,
+    help='Number of weight-shared scale refinement passes at every level; match training, 0 disables refinement')
 
 # Evaluation settings
 parser.add_argument('--min_evaluate_depth',
@@ -120,4 +123,5 @@ if __name__ == '__main__':
         # Hardware settings
         device=args.device,
         encoder_type=args.encoder_type,
-        use_sparse_depth_features=args.use_sparse_depth_features)
+        use_sparse_depth_features=args.use_sparse_depth_features,
+        n_scale_refinement=args.n_scale_refinement)

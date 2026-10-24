@@ -441,7 +441,7 @@ class ScaleUpdateBlock(nn.Module):
 def refine_scale(
         feature, scaleless_depth, scale, sparse_scale, keep_mask,
         scale_update, n_scale_refinement=2):
-    '''Apply two weight-shared corrections after propagation, without restoration.'''
+    '''Apply the configured weight-shared corrections after propagation, without restoration.'''
     for _ in range(n_scale_refinement):
         # Recompute feedback from the latest scale, not the original inherited
         # map. Missing/rejected measurements contribute neither ratios nor error.

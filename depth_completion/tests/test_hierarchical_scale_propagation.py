@@ -191,7 +191,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         image, sparse = torch.rand(1, 3, 17, 25), torch.zeros(1, 1, 17, 25)
         sparse[:, :, 7, 11] = 5.
         for iterations, passes in [((1, 2, 3, 4, 6), 1), ((0, 0, 0, 0, 0), 0),
-                                    ((2, 4, 6, 8, 12), 2)]:
+                                    ((2, 4, 6, 8, 12), 2), ((1, 2, 3, 4, 6), 4)]:
             model = ScalePropagationDepthModel(
                 n_channels=8, use_outlier_rejection=False,
                 n_propagation_iterations=iterations, n_scale_refinement=passes).eval()
@@ -313,6 +313,35 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
                 runpy.run_path(script, run_name='__main__')
             self.assertEqual(run.call_args.kwargs['encoder_type'], selected or 'conv')
             self.assertEqual(run.call_args.kwargs['use_sparse_depth_features'], selected is not None)
+
+    def test_refinement_count_cli_defaults_and_larger_counts(self):
+        import runpy
+        from depth_completion_model import DepthCompletionModel
+        for command in ['train', 'run']:
+            script = os.path.join(os.path.dirname(__file__), '..', 'src',
+                                  command + '_depth_completion.py')
+            required = ['--train_images_path', 'images.txt',
+                        '--train_sparse_depth_path', 'sparse.txt',
+                        '--train_intrinsics_path', 'intrinsics.txt',
+                        '--checkpoint_path', 'outputs'] if command == 'train' else [
+                        '--image_path', 'images.txt', '--sparse_depth_path', 'sparse.txt',
+                        '--intrinsics_path', 'intrinsics.txt', '--output_path', 'outputs']
+            for count in [None, 0, 1, 4]:
+                argv = [script] + required + ['--device', 'cpu']
+                if count is not None:
+                    argv += ['--n_scale_refinement', str(count)]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch('depth_completion.' + command) as entry:
+                    runpy.run_path(script, run_name='__main__')
+                expected = 2 if count is None else count
+                self.assertEqual(entry.call_args.kwargs['n_scale_refinement'], expected)
+        wrapper = DepthCompletionModel(
+            model_name='scale_propagation_kitti', network_modules=[],
+            min_predict_depth=1.5, max_predict_depth=100., device=torch.device('cpu'),
+            n_scale_refinement=4)
+        model = wrapper.model.model_depth
+        self.assertEqual([stage.n_scale_refinement for stage in [model] + list(model.decoder)],
+                         [4] * 5)
 
     def test_sparse_feature_flag_controls_encoder_and_all_decoder_inputs(self):
         image = torch.rand(1, 3, 17, 25)

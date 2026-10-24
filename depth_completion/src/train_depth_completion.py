@@ -103,8 +103,8 @@ parser.add_argument('--n_propagation_iterations',
     nargs=5, type=int, default=[2, 4, 6, 8, 12],
     help='Scale propagation exchanges at bottom, 1/8, 1/4, 1/2, full resolution; 0 disables exchanges')
 parser.add_argument('--n_scale_refinement',
-    type=int, choices=range(3), default=2,
-    help='Scale refinement passes per level: 0=bypass, 1=single, 2=current two passes')
+    type=int, default=2,
+    help='Number of weight-shared scale refinement passes at every level; 0 disables refinement')
 parser.add_argument('--rejection_keep_tolerance',
     nargs=2, type=float, default=[0.1, 0.02], metavar=('METERS', 'FRACTION'),
     help='Label keep when error <= max(METERS, FRACTION * GT)')
