@@ -15,7 +15,6 @@ from scale_propagation_model import (
     PropagationDecoderBlock,
     ScalePropagationDepthModel,
     SharedEncoder,
-    feature_at_sparse_points,
     geometry_at_sparse_points,
     measurement_rejection_input,
     normalize_rejection_input,
@@ -724,7 +723,9 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             captured.append(pair)
         sparse = torch.zeros(1, 1, 17, 25)
         sparse[0, 0, 7, 11] = 55.
-        with torch.no_grad():
+        with torch.no_grad(), mock.patch(
+                'scale_propagation_model.feature_at_sparse_points',
+                side_effect=AssertionError('rejection must use current-grid depth')):
             model(torch.rand(1, 3, 17, 25), sparse)
         for level, pair in enumerate(captured):
             rejection, propagation = pair['rejection'][0], pair['propagation'][0]
@@ -733,13 +734,12 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
             selected, indices = sparse_depth_at_resolution(
                 sparse, rejection.shape[-2:], return_indices=True)
             torch.testing.assert_close(rejection[:, 9:10], selected / 100.)
-            expected_depth = feature_at_sparse_points(
-                (coarse_predictions[0] if level == 0 else propagation[:, -2:-1]) / 100.,
-                indices, sparse.shape[-2:])
+            expected_depth = \
+                (coarse_predictions[0] if level == 0 else propagation[:, -2:-1]) / 100.
             torch.testing.assert_close(rejection[:, 8:9], expected_depth)
             self.assertEqual(rejection.shape[1], 12)
 
-    def test_measurement_rejection_input_samples_depth_and_encodes_original_offsets(self):
+    def test_measurement_rejection_input_uses_current_grid_depth_and_preserves_offsets(self):
         feature = torch.rand(1, 8, 2, 2, requires_grad=True)
         depth = torch.tensor([[[[1., 3.], [5., 7.]]]], requires_grad=True)
         sparse = torch.zeros(1, 1, 8, 8)
@@ -748,7 +748,7 @@ class HierarchicalScalePropagationTest(unittest.TestCase):
         selected, indices = sparse_depth_at_resolution(sparse, (2, 2), return_indices=True)
         result = measurement_rejection_input(feature, depth, selected, indices, (8, 8))
         self.assertEqual(result.shape, (1, 12, 2, 2))
-        torch.testing.assert_close(result[:, 8:9], feature_at_sparse_points(depth, indices, (8, 8)))
+        torch.testing.assert_close(result[:, 8:9], depth)
         torch.testing.assert_close(result[:, 9:10], selected)
         torch.testing.assert_close(result[0, 10:, 0, 0], torch.tensor([-.75, -.75]))
         torch.testing.assert_close(result[0, 10:, 0, 1], torch.tensor([.75, .75]))

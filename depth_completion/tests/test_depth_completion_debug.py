@@ -338,7 +338,7 @@ class DepthDebugTest(unittest.TestCase):
             for level in ['decoder.0', 'decoder.1', 'decoder.2', 'decoder.3']:
                 self.assertEqual(inputs[level]['measurement_count'], 2)
             self.assertEqual(inputs['decoder.3']['measurement_x_offset']['max'], 0.)
-            self.assertTrue(all(r['depth_context_location'] == 'selected original measurement pixel'
+            self.assertTrue(all(r['depth_context_location'] == 'current_resolution_grid_pixel'
                                 for r in inputs.values()))
             quality = {r['level']: r for r in records if r['event'] == 'rejection_quality'}
             self.assertEqual(len(quality), 5)

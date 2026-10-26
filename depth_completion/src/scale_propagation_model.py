@@ -239,9 +239,8 @@ def measurement_rejection_input(
     measured = (sparse_depth > 0.0).to(feature.dtype)
     y_offset = (2.0 * (y - y_start + 0.5) / (y_end - y_start) - 1.0) * measured
     x_offset = (2.0 * (x - x_start + 0.5) / (x_end - x_start) - 1.0) * measured
-    sampled_depth = feature_at_sparse_points(depth, measurement_indices, input_size)
     return torch.cat([
-        normalize_rejection_input(feature, sampled_depth, sparse_depth),
+        normalize_rejection_input(feature, depth, sparse_depth),
         y_offset,
         x_offset
     ], dim=1)

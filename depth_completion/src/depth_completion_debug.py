@@ -353,7 +353,7 @@ class DepthCompletionDebug(StageDiagnostics):
                           scaled_sparse_input=statistics(inputs[0][:, -3:-2]),
                           measurement_y_offset=statistics(inputs[0][:, -2:-1][measured]),
                           measurement_x_offset=statistics(inputs[0][:, -1:][measured]),
-                          depth_context_location='selected original measurement pixel')
+                          depth_context_location='current_resolution_grid_pixel')
                 # The propagation hook records the actual sampled Gumbel mask.
                 # Do not resample here or use argmax as the validation decision.
                 if self.context['phase'] == 'validation':
