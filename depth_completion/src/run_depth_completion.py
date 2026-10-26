@@ -57,7 +57,7 @@ parser.add_argument('--use_sparse_depth_features',
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
 parser.add_argument('--n_scale_refinement',
-    type=int, default=2,
+    type=int, default=1,
     help='Number of weight-shared scale refinement passes at every level; match training, 0 disables refinement')
 
 # Evaluation settings

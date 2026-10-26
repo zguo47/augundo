@@ -196,32 +196,6 @@ def normalize_rejection_input(feature, depth, sparse_depth):
         normalized_shape=(n_channel,)).permute(0, 3, 1, 2)
     return torch.cat([feature, depth, sparse_depth], dim=1)
 
-
-def feature_at_sparse_points(feature, measurement_indices, input_size):
-    '''Sample a coarse map at the selected original-image measurement pixels.'''
-    n_input_height, n_input_width = input_size
-    # The sampler returns flattened indices into the original sparse image,
-    # not coordinates of coarse-cell centers. Keep the per-image indices.
-    y = (measurement_indices // n_input_width).to(feature.dtype)
-    x = (measurement_indices % n_input_width).to(feature.dtype)
-    y = 2.0 * y / max(n_input_height - 1, 1) - 1.0
-    x = 2.0 * x / max(n_input_width - 1, 1) - 1.0
-    grid = torch.cat([x, y], dim=1).permute(0, 2, 3, 1)
-
-    return functional.grid_sample(
-        feature,
-        grid,
-        mode='bilinear',
-        padding_mode='border',
-        align_corners=True)
-
-
-def geometry_at_sparse_points(scaleless_depth, measurement_indices, input_size):
-    '''Sample this level's detached geometry at selected original-image pixels.'''
-    return feature_at_sparse_points(
-        scaleless_depth.detach(), measurement_indices, input_size)
-
-
 def measurement_rejection_input(
         feature, depth, sparse_depth, measurement_indices, input_size):
 
@@ -392,7 +366,7 @@ class PropagationDecoderBlock(nn.Module):
             use_outlier_rejection,
             n_propagation_iterations=4,
             max_predict_depth=8.0,
-            n_scale_refinement=2,
+            n_scale_refinement=1,
             use_sparse_depth_features=False):
         super(PropagationDecoderBlock, self).__init__()
 
