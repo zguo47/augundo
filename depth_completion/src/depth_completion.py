@@ -372,6 +372,8 @@ def train(train_images_path,
                 rejection_input='normalized coarse features, current-grid depth, sparse depth, y/x cell offsets',
                 n_propagation_iterations=list(n_propagation_iterations),
                 n_scale_refinement=n_scale_refinement,
+                w_si=w_losses.get('w_si', 1.0),
+                w_log_l1=w_losses.get('w_log_l1', 1.0),
                 rejection_keep_tolerance=rejection_keep_tolerance,
                 rejection_reject_tolerance=rejection_reject_tolerance,
                 w_rejection=w_losses.get('w_rejection', 0.1),
@@ -448,6 +450,9 @@ def train(train_images_path,
             seed, use_sparse_depth_features), log_path)
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
         log('encoder_type={}'.format(encoder_type), log_path)
+        log('w_supervised={}  w_si={}  w_log_l1={}'.format(
+            w_losses.get('w_supervised', 1.0),
+            w_losses.get('w_si', 1.0), w_losses.get('w_log_l1', 1.0)), log_path)
         log('n_propagation_iterations={}  n_scale_refinement={}'.format(
             n_propagation_iterations, n_scale_refinement), log_path)
         log('supervise_outlier_rejection={}  effective={}  w_rejection={}'.format(

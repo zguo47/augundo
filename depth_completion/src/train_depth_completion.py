@@ -188,7 +188,7 @@ parser.add_argument('--augmentation_random_remove_patch_size_depth',
 parser.add_argument('--supervision_type',
     type=str, default='unsupervised', help='Supervision type for training')
 parser.add_argument('--w_losses',
-    nargs='+', type=str, action=ParseStrFloatKeyValueAction, help='Weight of each loss term as key-value pairs: w_color=0.90 w_smoothness=2.00')
+    nargs='+', type=str, action=ParseStrFloatKeyValueAction, help='Weight of each loss term as key-value pairs: w_color=0.90 w_smoothness=2.00; scale propagation also accepts w_si=1.0 w_log_l1=1.0')
 parser.add_argument('--w_weight_decay_depth',
     type=float, default=0.00, help='Weight of weight decay regularization for depth')
 parser.add_argument('--w_weight_decay_pose',

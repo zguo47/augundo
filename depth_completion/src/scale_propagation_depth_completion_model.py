@@ -152,12 +152,18 @@ class ScalePropagationDepthCompletionModel(object):
             loss_info['loss_si_r{}'.format(resolution)] = scale_invariant
             loss_info['loss_log_l1_r{}'.format(resolution)] = metric_loss
         w_supervised = w_losses.get('w_supervised', 1.0)
-        loss = w_supervised * (loss_si + loss_log_l1)
+        w_si = w_losses.get('w_si', 1.0)
+        w_log_l1 = w_losses.get('w_log_l1', 1.0)
+        loss_si_weighted = w_supervised * w_si * loss_si
+        loss_log_l1_weighted = w_supervised * w_log_l1 * loss_log_l1
+        loss = loss_si_weighted + loss_log_l1_weighted
 
         loss_info.update({
             'loss': loss,
             'loss_si': loss_si,
-            'loss_log_l1': loss_log_l1
+            'loss_log_l1': loss_log_l1,
+            'loss_si_weighted': loss_si_weighted,
+            'loss_log_l1_weighted': loss_log_l1_weighted
         })
         return loss, loss_info
 

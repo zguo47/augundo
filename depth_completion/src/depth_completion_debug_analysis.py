@@ -152,7 +152,8 @@ class StageDiagnostics(object):
         step = self.context['step']
         if step != 1 and step % self.probe_interval:
             return
-        terms = [loss_info.get('loss_si'), loss_info.get('loss_log_l1')]
+        terms = [loss_info.get('loss_si_weighted', loss_info.get('loss_si')),
+                 loss_info.get('loss_log_l1_weighted', loss_info.get('loss_log_l1'))]
         if not all(torch.is_tensor(term) and term.requires_grad for term in terms):
             self.emit('gradient_objectives', unavailable='SI/metric graph terms not exposed')
             return
@@ -194,7 +195,7 @@ class StageDiagnostics(object):
                     dot = item.pop(names[i] + '_' + names[j] + '_dot')
                     item[key] = dot / denominator if denominator else None
         self.emit('gradient_objectives', groups=groups,
-                  scope='current microbatch before accumulation division; rejection includes its configured loss weight')
+                  scope='current microbatch before accumulation division; SI/metric use weighted terms when available; rejection includes its configured loss weight')
 
     def supervised_rejection_report(self, level, logits, selected, matched, keep_mask=None):
         '''Report the actual label policy separately from generic GT disagreements.'''
