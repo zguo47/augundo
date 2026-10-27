@@ -22,9 +22,10 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
                  device=torch.device('cuda'),
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  encoder_type='conv',
-                 training_stage='scale',
+                 training_stage='joint',
                  propagation_mode='hierarchical',
-                 geometry_restore_path=None):
+                 geometry_restore_path=None,
+                 detach_scaleless_depth=True):
         del dataset_name, network_modules
         self.model_depth = FixedGeometryScalePropagationDepthModel(
             min_predict_depth=min_predict_depth,
@@ -32,7 +33,8 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
             n_propagation_iterations=n_propagation_iterations,
             encoder_type=encoder_type,
             training_stage=training_stage,
-            propagation_mode=propagation_mode)
+            propagation_mode=propagation_mode,
+            detach_scaleless_depth=detach_scaleless_depth)
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
         self.training_stage = training_stage
@@ -46,7 +48,7 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
             self.model_depth.geometry.load_state_dict(checkpoint['geometry_state_dict'])
 
     def compute_loss_supervised(self, target_depth, output_depth, w_losses):
-        '''Stage one trains Z with SI; stage two trains scales with log L1.'''
+        '''Train SI geometry and metric scale together, unless a stage is selected.'''
         validity = (target_depth > 0.0).to(target_depth.dtype)
         target_depth = torch.where(
             validity > 0.0,
@@ -65,12 +67,12 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
             loss_info['loss_log_l1_r{}'.format(resolution)] = value
 
         w_supervised = w_losses.get('w_supervised', 1.0)
-        # Do not silently combine the stages: reporting the inactive objective
-        # is useful, but it must not contribute a gradient or trainable loss.
+        # Joint mode combines both objectives in the same optimizer step.
+        # Separate-stage ablations still report, but do not train, the other.
         loss_si_weighted = w_supervised * w_losses.get('w_si', 1.0) * loss_si \
-            if self.training_stage == 'geometry' else loss_si.detach() * 0.0
+            if self.training_stage in ['joint', 'geometry'] else loss_si.detach() * 0.0
         loss_log_l1_weighted = w_supervised * w_losses.get('w_log_l1', 1.0) * loss_log_l1 \
-            if self.training_stage == 'scale' else loss_log_l1.detach() * 0.0
+            if self.training_stage in ['joint', 'scale'] else loss_log_l1.detach() * 0.0
         loss = loss_si_weighted + loss_log_l1_weighted
         loss_info.update(
             loss=loss, loss_si=loss_si, loss_log_l1=loss_log_l1,

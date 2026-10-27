@@ -35,7 +35,7 @@ class DepthCompletionModel(object):
                  n_scale_refinement=2,
                  encoder_type='conv',
                  use_sparse_depth_features=False,
-                 fixed_geometry_stage='scale',
+                 fixed_geometry_stage='joint',
                  fixed_geometry_mode='hierarchical',
                  geometry_restore_path=None):
 
@@ -73,7 +73,8 @@ class DepthCompletionModel(object):
                 encoder_type=encoder_type,
                 training_stage=fixed_geometry_stage,
                 propagation_mode=fixed_geometry_mode,
-                geometry_restore_path=geometry_restore_path)
+                geometry_restore_path=geometry_restore_path,
+                detach_scaleless_depth=detach_scaleless_depth)
         elif 'scale_propagation' in model_name:
             from scale_propagation_depth_completion_model import \
                 ScalePropagationDepthCompletionModel

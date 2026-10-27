@@ -1,46 +1,52 @@
-# Fixed-geometry scale-propagation baseline
+# Shared-geometry scale-propagation baseline
 
 This is a separate pipeline, selected with
 `--model_name fixed_geometry_scale_propagation_kitti` or
 `--model_name fixed_geometry_scale_propagation_void`.
 The existing `scale_propagation_*` pipeline is unchanged.
 
-## Geometry stage
+## One-run joint training (default)
 
 An RGB-only five-resolution U-Net predicts one positive full-resolution
-geometry `Z`, normalized once to spatial mean one. Only the existing SI loss
-at full resolution trains this stage. Sparse depth is never an input to the
-geometry encoder or decoder. It is used for global metric alignment of the
-displayed predictions, so validation depth metrics here are not SI metrics.
+geometry `Z`, normalized once to spatial mean one. Scale propagation uses
+resized copies of this same final prediction at every level. Geometry and
+scale are trained together in one run; no pretrained checkpoint is required.
+The historical `fixed_geometry_*` filenames mean a shared geometry reference
+within each forward pass, not frozen geometry across optimizer steps.
 
 From the repository root:
 
 ```bash
-STAGE=geometry bash bash/depth_completion/train/fixed_geometry_scale_propagation/train_fixed_geometry_scale_propagation-kitti-supervised.sh
+bash bash/depth_completion/train/fixed_geometry_scale_propagation/train_fixed_geometry_scale_propagation-kitti-supervised.sh
 ```
 
 The VOID script in the same directory ends in `-void1500-supervised.sh`.
 Use `ENCODER_TYPE=conv_attention` to select the existing larger encoder;
 otherwise the existing all-convolution encoder is used. Match that selection
-in both stages and evaluation. `DEBUG=true` enables the existing diagnostics.
+in evaluation. `DEBUG=true` enables the existing diagnostics.
 
-## Scale stage
+For an existing custom training script, use:
 
-Load a checkpoint produced by the geometry stage:
-
-```bash
-STAGE=scale GEOMETRY_CHECKPOINT=/absolute/path/fixed-geometry-scale-propagation-20000.pth \
-bash bash/depth_completion/train/fixed_geometry_scale_propagation/train_fixed_geometry_scale_propagation-kitti-supervised.sh
+```text
+--model_name fixed_geometry_scale_propagation_kitti
+--fixed_geometry_stage joint
+--use_outlier_rejection false
+--n_scale_refinement 0
+--w_losses w_supervised=1.0 w_si=1.0 w_log_l1=1.0
 ```
 
-`--geometry_restore_path` loads **only geometry**, starts a new optimizer, and
-starts the scale experiment at step zero. `RESUME_CHECKPOINT=/absolute/path/...`
-instead passes `--restore_paths` to resume the same stage and its optimizer.
-Do not resume geometry-stage optimizer state as a scale-stage optimizer.
+Both objectives are active in joint mode: full-resolution SI for `Z`, and
+multiscale log L1 for metric depth. They are summed in a single backward and
+optimizer step. With `--detach_scaleless_depth true` (default), metric loss
+cannot update geometry through either `Z` OR the RGB guidance features; SI
+still trains the entire RGB U-Net each step. Setting the flag to `false`
+also permits metric gradients into geometry through both routes.
 
-During scale training the whole geometry network is frozen and kept in eval
-mode. Each scale level receives a resized copy of the same final `Z`; those
-copies are not renormalized. RGB decoder features guide the scale decoder.
+Sparse depth and scale maps never enter the geometry U-Net. Geometry is not
+updated or renormalized independently at decoder levels. Its parameters do
+change between training steps, so joint training does not guarantee the same
+optimization stability as a separately pretrained and frozen geometry model.
+RGB decoder features guide the separate scale decoder.
 The initial scale is the mean of full-resolution positive sparse-to-geometry
 ratios (one scalar per image). With no measurements it falls back to one.
 
@@ -53,15 +59,13 @@ The final depth is `clamp(Z * M, min_depth, max_depth)`.
 
 The scale loss is the existing **unclamped** log L1 metric loss, summed over
 all five resolutions with weights `1 / 4**r`, with `r=0` at full resolution.
-`w_supervised` and `w_log_l1` control scale-stage loss; `w_supervised` and
-`w_si` control geometry-stage loss. Inactive losses are reported for monitoring
-but do not train either network. The common 16-map output layout preserves
+The joint objective is `w_supervised * (w_si * SI_r0 +
+w_log_l1 * sum_r(4**(-r) * log_L1_r))`. The common 16-map output layout preserves
 TensorBoard geometry/scale views and the debug interface.
 
 Scripts accept additional CLI arguments at the end, for example:
 
 ```bash
-STAGE=scale GEOMETRY_CHECKPOINT=/absolute/path/geometry.pth \
 bash bash/depth_completion/train/fixed_geometry_scale_propagation/train_fixed_geometry_scale_propagation-kitti-supervised.sh \
     --n_propagation_iterations 1 2 3 4 6
 ```
@@ -69,6 +73,18 @@ bash bash/depth_completion/train/fixed_geometry_scale_propagation/train_fixed_ge
 This is intentionally a stability ablation, not the full proposed redesign:
 there is no log-scale solver, new confidence module, or new geometry loss.
 Coarse sampling and limited propagation reach remain possible limitations.
+
+## Optional separate-stage ablations
+
+`STAGE=geometry` / `--fixed_geometry_stage geometry` trains only full-resolution
+SI geometry. Displayed metric predictions then use sparse global alignment
+for previews, not a metric training loss. `STAGE=scale` freezes a pretrained
+geometry network and trains only scale propagation with log L1.
+
+Only that optional scale-only mode requires `GEOMETRY_CHECKPOINT=...` /
+`--geometry_restore_path ...` (or a full resume checkpoint). A geometry restore
+loads geometry weights only and starts a new optimizer/step. To resume the
+same training mode, use `RESUME_CHECKPOINT=...` / `--restore_paths ...` instead.
 
 ## Global-scale-only comparison
 

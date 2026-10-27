@@ -52,8 +52,8 @@ parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder architecture; match the choice used during training')
 parser.add_argument('--fixed_geometry_stage',
-    choices=['geometry', 'scale'], default='scale',
-    help='Fixed-geometry baseline stage; geometry previews use global sparse scaling')
+    choices=['joint', 'geometry', 'scale'], default='joint',
+    help='Shared-geometry baseline stage; joint training needs no geometry pretraining')
 parser.add_argument('--fixed_geometry_mode',
     choices=['hierarchical', 'global'], default='hierarchical',
     help='Fixed-geometry baseline: learned propagation or global-scale-only evaluation control')

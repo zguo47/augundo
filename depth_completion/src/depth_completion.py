@@ -122,7 +122,7 @@ def train(train_images_path,
           w_rejection_l1=None,
           use_sparse_depth_features=False,
           seed=0,
-          fixed_geometry_stage='scale',
+          fixed_geometry_stage='joint',
           geometry_restore_path=None):
 
     set_random_seed(seed)
@@ -133,7 +133,6 @@ def train(train_images_path,
         use_outlier_rejection = False
         use_sparse_depth_features = False
         supervise_outlier_rejection = False
-        detach_scaleless_depth = True
         n_scale_refinement = 0
         if fixed_geometry_stage == 'scale' and not geometry_restore_path and not restore_paths:
             raise ValueError('Scale training requires --geometry_restore_path or --restore_paths; '
@@ -469,7 +468,7 @@ def train(train_images_path,
         if is_fixed_geometry:
             log('fixed_geometry_stage={}  geometry_restore_path={}'.format(
                 fixed_geometry_stage, geometry_restore_path), log_path)
-            log('geometry stage: full-resolution SI only; scale stage: multiscale log L1 only', log_path)
+            log('joint: full-resolution SI + multiscale log L1; optional geometry/scale stages use one objective', log_path)
         log('seed={}  use_sparse_depth_features={}'.format(
             seed, use_sparse_depth_features), log_path)
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
@@ -1232,7 +1231,7 @@ def run(image_path,
         encoder_type='conv',
         use_sparse_depth_features=False,
         n_scale_refinement=2,
-        fixed_geometry_stage='scale',
+        fixed_geometry_stage='joint',
         fixed_geometry_mode='hierarchical',
         geometry_restore_path=None,
         n_propagation_iterations=(2, 4, 6, 8, 12)):

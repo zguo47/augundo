@@ -77,6 +77,43 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
             wrapper.eval()
             self.assertFalse(any(module.training for module in model.modules()))
 
+    def test_joint_default_trains_both_networks_in_one_step_without_checkpoint(self):
+        wrapper = FixedGeometryScalePropagationDepthCompletionModel(
+            device=torch.device('cpu'), min_predict_depth=0.1, max_predict_depth=100.0,
+            n_propagation_iterations=(1, 1, 1, 1, 1))
+        self.assertEqual(wrapper.training_stage, 'joint')
+        model = wrapper.model_depth
+        self.assertTrue(model.geometry.training)
+        self.assertTrue(all(value.requires_grad for value in model.parameters()))
+        geometry_before = model.geometry.depth_output[-1].conv.weight.detach().clone()
+        propagation_before = model.propagation_map.conv.weight.detach().clone()
+        optimizer = torch.optim.Adam(wrapper.parameters_depth(), lr=1e-3)
+        outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
+        loss, info = wrapper.compute_loss_supervised(
+            self.target, outputs, dict(w_supervised=2.0, w_si=3.0, w_log_l1=0.5))
+        torch.testing.assert_close(loss, 6.0 * info['loss_si'] + info['loss_log_l1'])
+        loss.backward()
+        self.assertGreater(float(model.geometry.depth_output[-1].conv.weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.propagation_map.conv.weight.grad.abs().sum()), 0.0)
+        optimizer.step()
+        self.assertFalse(torch.equal(model.geometry.depth_output[-1].conv.weight, geometry_before))
+        self.assertFalse(torch.equal(model.propagation_map.conv.weight, propagation_before))
+
+    def test_joint_detach_flag_controls_metric_gradients_through_all_geometry_routes(self):
+        for detach in [True, False]:
+            wrapper = self.wrapper('joint', detach_scaleless_depth=detach)
+            outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
+            _, info = wrapper.compute_loss_supervised(self.target, outputs, {})
+            gradients = torch.autograd.grad(
+                info['loss_log_l1_weighted'], list(wrapper.model_depth.geometry.parameters()),
+                allow_unused=True, retain_graph=True)
+            if detach:
+                self.assertTrue(all(value is None for value in gradients))
+            else:
+                self.assertTrue(any(value is not None and value.abs().sum() > 0.0 for value in gradients))
+            info['loss_si_weighted'].backward()
+            self.assertGreater(float(wrapper.model_depth.geometry.depth_output[-1].conv.weight.grad.abs().sum()), 0.0)
+
     def test_geometry_stage_trains_full_resolution_si_only(self):
         wrapper = self.wrapper('geometry')
         outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
@@ -262,7 +299,7 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
                     stream.write(path + '\n')
                 lists.append(list_path)
             geometry_checkpoint = None
-            for stage in ['geometry', 'scale']:
+            for stage in ['geometry', 'scale', 'joint']:
                 destination = os.path.join(directory, stage)
                 argv = [script, '--train_images_path', lists[0], '--train_sparse_depth_path', lists[1],
                         '--train_ground_truth_path', lists[2], '--train_intrinsics_path', lists[3],
@@ -278,7 +315,7 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
                         '--start_step_validation', '1',
                         '--n_image_per_summary', '1', '--debug_depth', 'true', '--debug_interval', '1',
                         '--n_propagation_iterations', '1', '1', '1', '1', '1']
-                if geometry_checkpoint:
+                if stage == 'scale':
                     argv += ['--geometry_restore_path', geometry_checkpoint]
                 with mock.patch.object(sys, 'argv', argv), mock.patch('depth_completion.train') as capture:
                     runpy.run_path(script, run_name='__main__')
@@ -301,7 +338,7 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
                                     for path in manifest['source_files']))
                 if stage == 'geometry':
                     geometry_checkpoint = checkpoint_path
-                else:
+                elif stage == 'scale':
                     first = torch.load(geometry_checkpoint, map_location='cpu')['geometry_state_dict']
                     second = torch.load(checkpoint_path, map_location='cpu')['geometry_state_dict']
                     for name in first:

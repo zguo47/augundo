@@ -122,10 +122,10 @@ class FixedGeometryPropagationDecoderBlock(nn.Module):
 
 
 class FixedGeometryScalePropagationDepthModel(nn.Module):
-    '''Two-stage baseline: RGB geometry first, then hierarchical scale only.
+    '''Joint RGB-geometry and hierarchical scale-propagation baseline.
 
-    Stage geometry: train the RGB U-Net with full-resolution SI supervision.
-    Stage scale: freeze that entire U-Net and train only propagation guidance.
+    Stage joint: train geometry and propagation together in one run (default).
+    Optional stages geometry/scale retain the separate pretrain/freeze ablation.
     Mode global: bypass propagation to evaluate global scaling of the exact
     same geometry checkpoint. This is an evaluation control, not a third head.
     '''
@@ -137,8 +137,9 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
                  n_head=4,
                  encoder_type='conv',
                  n_propagation_iterations=(2, 4, 6, 8, 12),
-                 training_stage='scale',
-                 propagation_mode='hierarchical'):
+                 training_stage='joint',
+                 propagation_mode='hierarchical',
+                 detach_scaleless_depth=True):
         super(FixedGeometryScalePropagationDepthModel, self).__init__()
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth
@@ -146,7 +147,7 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
         self.propagation_mode = propagation_mode
         self.n_propagation_iterations = n_propagation_iterations
         self.fixed_geometry = True
-        self.detach_scaleless_depth = True
+        self.detach_scaleless_depth = detach_scaleless_depth
         self.use_outlier_rejection = False
         self.use_sparse_depth_features = False
         self.n_scale_refinement = 0
@@ -159,23 +160,23 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
             FixedGeometryPropagationDecoderBlock(n_channels, n_iteration)
             for n_iteration in n_propagation_iterations[1:]
         ])
-        # Freezing parameters, not just detaching Z, also prevents scale loss
-        # from changing RGB features and indirectly changing the geometry.
+        # Joint training enables both networks. The optional scale-only stage
+        # still freezes the entire RGB network, not just its output tensor.
         for name, parameter in self.named_parameters():
             parameter.requires_grad_(
-                name.startswith('geometry.') if training_stage == 'geometry'
-                else not name.startswith('geometry.'))
+                training_stage == 'joint' or
+                (name.startswith('geometry.') == (training_stage == 'geometry')))
         self.train()
 
     def train(self, mode=True):
         super(FixedGeometryScalePropagationDepthModel, self).train(mode)
-        if self.training_stage != 'geometry':
+        if self.training_stage == 'scale':
             self.geometry.eval()
         return self
 
     def forward(self, image, sparse_depth, return_all_outputs=False,
                 return_rejection_outputs=False):
-        if self.training_stage == 'geometry':
+        if self.training_stage != 'scale':
             features, geometries = self.geometry(image)
         else:
             # No geometry graph is retained during scale training. Its weights
@@ -183,6 +184,14 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
             with torch.no_grad():
                 features, geometries = self.geometry(image)
 
+        # Both losses can train in ONE forward/backward pass. With detachment
+        # enabled, SI trains geometry and metric loss trains propagation only.
+        # Detach RGB guidance too: otherwise metric gradients could change Z
+        # indirectly through its encoder/decoder features. Setting the common
+        # detach flag false permits metric gradients through both routes.
+        detach_geometry = self.detach_scaleless_depth or self.training_stage == 'geometry'
+        scale_features = [value.detach() for value in features] if detach_geometry else features
+        scale_geometries = [value.detach() for value in geometries] if detach_geometry else geometries
         global_scale = global_scale_from_sparse(sparse_depth, geometries[0])
         if self.training_stage == 'geometry' or self.propagation_mode == 'global':
             # Metric images during SI pretraining are previews using sparse
@@ -191,7 +200,7 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
             keep_masks = [(sparse_depth_at_resolution(sparse_depth, value.shape[-2:]) > 0.0)
                           .to(value.dtype) for value in geometries]
         else:
-            feature, geometry = features[-1], geometries[-1]
+            feature, geometry = scale_features[-1], scale_geometries[-1]
             sparse = sparse_depth_at_resolution(sparse_depth, geometry.shape[-2:])
             keep_mask = (sparse > 0.0).to(sparse.dtype)
             scale = global_scale.expand_as(geometry)
@@ -204,15 +213,15 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
             scales, keep_masks = [scale], [keep_mask]
             for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
                 feature, geometry, scale, _, _, keep_mask = decoder_block(
-                    feature, features[level], geometry, scale, sparse_depth,
-                    geometries[level])
+                    feature, scale_features[level], geometry, scale, sparse_depth,
+                    scale_geometries[level])
                 scales.append(scale)
                 keep_masks.append(keep_mask)
             scales, keep_masks = scales[::-1], keep_masks[::-1]
 
-        # SI is the only geometry objective. Metric loss always uses fixed Z;
-        # no metric gradient can train geometry, even during its first stage.
-        metric_depths = [value.detach() * scale for value, scale in zip(geometries, scales)]
+        # Geometry is shared across levels within this forward pass, but in
+        # joint mode its parameters are updated at every optimizer step.
+        metric_depths = [value * scale for value, scale in zip(scale_geometries, scales)]
         depth = torch.clamp(
             metric_depths[0], min=self.min_predict_depth, max=self.max_predict_depth)
         if not return_all_outputs and not return_rejection_outputs:

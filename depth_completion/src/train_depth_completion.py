@@ -79,8 +79,8 @@ parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder: current 3/3/3/3/3 conv or 3/6/6/4+2SA/4+2SA')
 parser.add_argument('--fixed_geometry_stage',
-    choices=['geometry', 'scale'], default='scale',
-    help='Fixed-geometry baseline only: SI geometry pretraining or frozen-geometry scale training')
+    choices=['joint', 'geometry', 'scale'], default='joint',
+    help='Shared-geometry baseline: joint one-run training (default), or optional geometry/scale stages')
 parser.add_argument('--geometry_restore_path',
     type=str, default=None,
     help='Fixed-geometry baseline: initialize ONLY RGB geometry from its stage-one checkpoint; start a new optimizer/step')
