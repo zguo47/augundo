@@ -121,9 +121,23 @@ def train(train_images_path,
           rejection_keep_weight=2.0,
           w_rejection_l1=None,
           use_sparse_depth_features=False,
-          seed=0):
+          seed=0,
+          fixed_geometry_stage='scale',
+          geometry_restore_path=None):
 
     set_random_seed(seed)
+    is_fixed_geometry = 'fixed_geometry_scale_propagation' in model_name
+    if is_fixed_geometry:
+        # This independent baseline deliberately has no rejection, raw sparse
+        # feature fusion, or unconstrained scale-refinement head.
+        use_outlier_rejection = False
+        use_sparse_depth_features = False
+        supervise_outlier_rejection = False
+        detach_scaleless_depth = True
+        n_scale_refinement = 0
+        if fixed_geometry_stage == 'scale' and not geometry_restore_path and not restore_paths:
+            raise ValueError('Scale training requires --geometry_restore_path or --restore_paths; '
+                             'pretrain with --fixed_geometry_stage geometry first.')
     # Separate loader generators keep shuffling independent of model size and
     # prevent validation iterator creation from advancing training's RNG stream.
     train_generator = torch.Generator().manual_seed(seed)
@@ -333,7 +347,9 @@ def train(train_images_path,
         n_propagation_iterations=n_propagation_iterations,
         n_scale_refinement=n_scale_refinement,
         encoder_type=encoder_type,
-        use_sparse_depth_features=use_sparse_depth_features)
+        use_sparse_depth_features=use_sparse_depth_features,
+        fixed_geometry_stage=fixed_geometry_stage,
+        geometry_restore_path=geometry_restore_path)
 
     parameters_depth_model = depth_completion_model.parameters_depth()
 
@@ -355,6 +371,10 @@ def train(train_images_path,
         depth_debug.provenance(
             settings=dict(
                 model_name=model_name, supervision_type=supervision_type,
+                fixed_geometry_stage=fixed_geometry_stage if is_fixed_geometry else None,
+                geometry_restore_path=geometry_restore_path,
+                geometry_reference='one RGB-only full-resolution Z resized without renormalization'
+                if is_fixed_geometry else 'independently updated geometry at each level',
                 encoder_type=encoder_type,
                 use_sparse_depth_features=use_sparse_depth_features,
                 encoder_input='rgb_sparse' if use_sparse_depth_features else 'rgb_only',
@@ -446,6 +466,10 @@ def train(train_images_path,
         parameters_pose_model=parameters_pose_model)
 
     if 'scale_propagation' in model_name:
+        if is_fixed_geometry:
+            log('fixed_geometry_stage={}  geometry_restore_path={}'.format(
+                fixed_geometry_stage, geometry_restore_path), log_path)
+            log('geometry stage: full-resolution SI only; scale stage: multiscale log L1 only', log_path)
         log('seed={}  use_sparse_depth_features={}'.format(
             seed, use_sparse_depth_features), log_path)
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)
@@ -1207,7 +1231,16 @@ def run(image_path,
         device,
         encoder_type='conv',
         use_sparse_depth_features=False,
-        n_scale_refinement=2):
+        n_scale_refinement=2,
+        fixed_geometry_stage='scale',
+        fixed_geometry_mode='hierarchical',
+        geometry_restore_path=None,
+        n_propagation_iterations=(2, 4, 6, 8, 12)):
+
+    if 'fixed_geometry_scale_propagation' in model_name:
+        use_outlier_rejection = False
+        use_sparse_depth_features = False
+        n_scale_refinement = 0
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
@@ -1308,7 +1341,11 @@ def run(image_path,
         device=device,
         encoder_type=encoder_type,
         use_sparse_depth_features=use_sparse_depth_features,
-        n_scale_refinement=n_scale_refinement)
+        n_scale_refinement=n_scale_refinement,
+        fixed_geometry_stage=fixed_geometry_stage,
+        fixed_geometry_mode=fixed_geometry_mode,
+        geometry_restore_path=geometry_restore_path,
+        n_propagation_iterations=n_propagation_iterations)
 
     # Restore model and set to evaluation mode
     depth_model.restore_model(restore_paths)
@@ -1353,6 +1390,10 @@ def run(image_path,
         use_outlier_rejection=use_outlier_rejection,
         # Weight settings
         parameters_depth_model=parameters_depth_model)
+
+    if 'fixed_geometry_scale_propagation' in model_name:
+        log('fixed_geometry_stage={}  fixed_geometry_mode={}  n_propagation_iterations={}'.format(
+            fixed_geometry_stage, fixed_geometry_mode, n_propagation_iterations), log_path)
 
     log_evaluation_settings(
         log_path,

@@ -51,6 +51,17 @@ parser.add_argument('--n_shift',
 parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder architecture; match the choice used during training')
+parser.add_argument('--fixed_geometry_stage',
+    choices=['geometry', 'scale'], default='scale',
+    help='Fixed-geometry baseline stage; geometry previews use global sparse scaling')
+parser.add_argument('--fixed_geometry_mode',
+    choices=['hierarchical', 'global'], default='hierarchical',
+    help='Fixed-geometry baseline: learned propagation or global-scale-only evaluation control')
+parser.add_argument('--geometry_restore_path',
+    type=str, default=None, help='Initialize only the fixed RGB geometry from its checkpoint')
+parser.add_argument('--n_propagation_iterations',
+    nargs=5, type=int, default=[2, 4, 6, 8, 12],
+    help='Match training: scale exchanges from bottom to full resolution')
 parser.add_argument('--use_sparse_depth_features',
     type=parse_boolean, default=False,
     help='Match the scale checkpoint: raw sparse depth in encoder input and decoder fusion')
@@ -123,5 +134,9 @@ if __name__ == '__main__':
         # Hardware settings
         device=args.device,
         encoder_type=args.encoder_type,
+        fixed_geometry_stage=args.fixed_geometry_stage,
+        fixed_geometry_mode=args.fixed_geometry_mode,
+        geometry_restore_path=args.geometry_restore_path,
+        n_propagation_iterations=args.n_propagation_iterations,
         use_sparse_depth_features=args.use_sparse_depth_features,
         n_scale_refinement=args.n_scale_refinement)

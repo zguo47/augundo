@@ -34,7 +34,10 @@ class DepthCompletionModel(object):
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  n_scale_refinement=2,
                  encoder_type='conv',
-                 use_sparse_depth_features=False):
+                 use_sparse_depth_features=False,
+                 fixed_geometry_stage='scale',
+                 fixed_geometry_mode='hierarchical',
+                 geometry_restore_path=None):
 
         self.model_name = model_name
         self.network_modules = network_modules
@@ -56,7 +59,22 @@ class DepthCompletionModel(object):
         else:
             dataset_name = 'kitti'
 
-        if 'scale_propagation' in model_name:
+        if 'fixed_geometry_scale_propagation' in model_name:
+            from fixed_geometry_scale_propagation_depth_completion_model import \
+                FixedGeometryScalePropagationDepthCompletionModel
+
+            self.model = FixedGeometryScalePropagationDepthCompletionModel(
+                dataset_name=dataset_name,
+                network_modules=network_modules,
+                min_predict_depth=min_predict_depth,
+                max_predict_depth=max_predict_depth,
+                device=device,
+                n_propagation_iterations=n_propagation_iterations,
+                encoder_type=encoder_type,
+                training_stage=fixed_geometry_stage,
+                propagation_mode=fixed_geometry_mode,
+                geometry_restore_path=geometry_restore_path)
+        elif 'scale_propagation' in model_name:
             from scale_propagation_depth_completion_model import \
                 ScalePropagationDepthCompletionModel
 
@@ -413,7 +431,14 @@ class DepthCompletionModel(object):
 
         os.makedirs(checkpoint_dirpath, exist_ok=True)
 
-        if 'scale_propagation' in self.model_name:
+        if 'fixed_geometry_scale_propagation' in self.model_name:
+            self.model.save_model(
+                os.path.join(
+                    checkpoint_dirpath,
+                    'fixed-geometry-scale-propagation-{}.pth'.format(step)),
+                step=step,
+                optimizer=optimizer_depth)
+        elif 'scale_propagation' in self.model_name:
             self.model.save_model(
                 os.path.join(
                     checkpoint_dirpath,

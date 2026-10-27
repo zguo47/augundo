@@ -78,6 +78,12 @@ parser.add_argument('--n_shift',
 parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder: current 3/3/3/3/3 conv or 3/6/6/4+2SA/4+2SA')
+parser.add_argument('--fixed_geometry_stage',
+    choices=['geometry', 'scale'], default='scale',
+    help='Fixed-geometry baseline only: SI geometry pretraining or frozen-geometry scale training')
+parser.add_argument('--geometry_restore_path',
+    type=str, default=None,
+    help='Fixed-geometry baseline: initialize ONLY RGB geometry from its stage-one checkpoint; start a new optimizer/step')
 parser.add_argument('--use_sparse_depth_features',
     type=parse_boolean, default=False,
     help='Concatenate raw sparse depth to the scale encoder input and decoder fusion')
@@ -337,6 +343,8 @@ if __name__ == '__main__':
           rejection_loss_type=args.rejection_loss_type,
           w_rejection_l1=args.w_rejection_l1,
           encoder_type=args.encoder_type,
+          fixed_geometry_stage=args.fixed_geometry_stage,
+          geometry_restore_path=args.geometry_restore_path,
           use_sparse_depth_features=args.use_sparse_depth_features,
           seed=args.seed,
           rejection_supervision_levels=args.rejection_supervision_levels,

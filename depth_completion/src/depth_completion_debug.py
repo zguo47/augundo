@@ -146,6 +146,14 @@ class DepthCompletionDebug(StageDiagnostics):
                      os.path.abspath('utils/src/data_utils.py')]:
             with open(path, 'rb') as stream:
                 sources[os.path.abspath(path)] = hashlib.sha256(stream.read()).hexdigest()
+        if getattr(self.model, 'fixed_geometry', False):
+            # The independent baseline reuses encoder and propagation helpers.
+            # Snapshot those definitions as well as its own network/wrapper.
+            for name in ['scale_propagation_model.py',
+                         'fixed_geometry_scale_propagation_depth_completion_model.py']:
+                path = os.path.join(root, name)
+                with open(path, 'rb') as stream:
+                    sources[os.path.abspath(path)] = hashlib.sha256(stream.read()).hexdigest()
         git = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)
         self.save_provenance(sources, settings, datasets)
         self.emit('configuration', argv=sys.argv, cwd=os.getcwd(),
@@ -306,7 +314,9 @@ class DepthCompletionDebug(StageDiagnostics):
                     if level in self.rejection_observations:
                         self.rejection_observations[level]['keep'] = accepted.detach()
                     self.anchor_context[level] = dict(keep=keep)
-                    self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else 'after_geometry_update',
+                    geometry_stage = 'fixed_geometry' if getattr(self.model, 'fixed_geometry', False) \
+                        else 'after_geometry_update'
+                    self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else geometry_stage,
                                        geometry, scale)
                     self.capture_stage(level, 'after_propagation', geometry, propagated_scale,
                                        sparse_ratio=target,
