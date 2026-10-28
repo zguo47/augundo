@@ -11,12 +11,15 @@ The encoder and joint decoder follow the original model. Every finer level:
 3. Adapts scale using features, old/new geometry, inherited scale, current metric
    depth, and log geometry change.
 4. Predicts rejection and propagation weights using the adapted metric depth.
-5. Injects accepted ratios once and propagates. No post-propagation refinement
-   or anchor restoration occurs at finer levels.
+5. Injects accepted ratios once and propagates.
+6. Refines the propagated scale with a separate head using features, detached
+   geometry, current scale, accepted ratios, keep mask, and anchor discrepancy.
+   No anchor restoration occurs.
 
 The bottom level keeps the original initialization, propagation, and refinement;
 there is no previous geometry to adapt to there. Adaptation uses KBNet convolutions
-and starts at identity. It does not impose inverse geometry compensation.
+and starts at identity. The separate post-propagation head also starts at
+identity. Neither head imposes inverse geometry compensation.
 
 Use a fresh checkpoint directory with:
 ```bash
@@ -28,8 +31,10 @@ Use a fresh checkpoint directory with:
 ```
 Keep the remaining training settings matched to the original comparison run.
 The existing rejection and sparse-feature flags are now honored.
-`--n_scale_refinement 0` disables learned adaptation (and bottom refinement);
-use 1 for this experiment. No bash scripts were changed.
+`--n_scale_refinement 1` performs one adaptation and one post-propagation
+refinement per finer level, and the original one refinement at the bottom.
+Setting it to 0 disables both heads and bottom refinement.
+No bash scripts were changed.
 
 Geometry in metric products and sparse-ratio denominators remains detached when
 using the configuration above. Shared features still receive metric gradients,
@@ -39,6 +44,7 @@ The old separate geometry/scale stages, global-only mode, auxiliary heads, and
 geometry-only checkpoint initialization no longer apply.
 
 Debug stage records distinguish `after_geometry_update`,
-`scale_adaptation_1`, `after_scale_adaptation`, and `after_propagation`.
-Training records add `scale_adaptation` with geometry changes and scale statistics.
-Old fixed-geometry checkpoints are incompatible. Train fresh for this experiment.
+`scale_adaptation_1`, `after_scale_adaptation`, `after_propagation`, and
+`refinement_1`. Training records distinguish `scale_adaptation` from
+`scale_refinement`. Previous checkpoints lack the new post-propagation heads;
+train fresh in a new checkpoint directory for this comparison.

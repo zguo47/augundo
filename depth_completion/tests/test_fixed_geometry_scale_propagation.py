@@ -46,10 +46,11 @@ class ScaleAdaptationTest(unittest.TestCase):
         block = model.decoder[-1]
         block.scale_update.register_forward_hook(lambda *args: events.append('adapt'))
         block.scale_propagation.register_forward_hook(lambda *args: events.append('propagate'))
+        block.post_scale_update.register_forward_hook(lambda *args: events.append('refine'))
         out = model(self.image, self.sparse, return_all_outputs=True)
         reference = old(self.image, self.sparse, return_all_outputs=True)
         torch.testing.assert_close(out['depth'], reference['depth'])
-        self.assertEqual(events, ['adapt', 'propagate'])
+        self.assertEqual(events, ['adapt', 'propagate', 'refine'])
         self.assertEqual([z.shape[-2:] for z in out['scaleless_depths']],
                          [(17,25), (9,13), (5,7), (3,4), (2,2)])
         for z in out['scaleless_depths']:
@@ -85,7 +86,24 @@ class ScaleAdaptationTest(unittest.TestCase):
         self.assertGreater(float(params[-1].grad.abs().sum()), 0)
         scale_head = wrapper.model_depth.decoder[-1].scale_update.convolutions[-1].conv.weight
         self.assertGreater(float(scale_head.grad.abs().sum()), 0)
+        post_head = wrapper.model_depth.decoder[-1].post_scale_update.convolutions[-1].conv.weight
+        self.assertGreater(float(post_head.grad.abs().sum()), 0)
+        self.assertNotEqual(scale_head.data_ptr(), post_head.data_ptr())
         self.assertTrue(torch.isfinite(loss))
+
+    def test_post_refinement_changes_the_returned_scale(self):
+        wrapper = self.wrapper()
+        block = wrapper.model_depth.decoder[-1]
+        with torch.no_grad():
+            block.post_scale_update.convolutions[-1].conv.weight.fill_(0.01)
+        captured = {}
+        def refinement(module, inputs, output):
+            captured['before'] = inputs[0][:, -4:-3]
+            captured['expected'] = captured['before'] * torch.exp(torch.tanh(output))
+        block.post_scale_update.register_forward_hook(refinement)
+        output = wrapper.model_depth(self.image, self.sparse, return_all_outputs=True)
+        torch.testing.assert_close(output['scale_maps'][0], captured['expected'])
+        self.assertFalse(torch.equal(output['scale_maps'][0], captured['before']))
 
     def test_repository_flags_checkpoint_and_debug_stages(self):
         wrapper = DepthCompletionModel(
@@ -101,7 +119,7 @@ class ScaleAdaptationTest(unittest.TestCase):
             with open(debug.path) as stream:
                 records = [json.loads(line) for line in stream]
             self.assertEqual(len([r for r in records if r['event']=='scale_adaptation']), 4)
-            self.assertEqual(len([r for r in records if r['event']=='scale_refinement']), 1)
+            self.assertEqual(len([r for r in records if r['event']=='scale_refinement']), 5)
             debug.begin('validation', 1, sample=0)
             wrapper.forward_depth(self.image[:1], self.sparse[:1], None)
             for level in ['decoder.0', 'decoder.1', 'decoder.2', 'decoder.3']:
@@ -109,7 +127,7 @@ class ScaleAdaptationTest(unittest.TestCase):
                 self.assertEqual(stages, [
                     'before_upsampling', 'after_upsampling',
                     'after_geometry_update', 'scale_adaptation_1',
-                    'after_scale_adaptation', 'after_propagation'])
+                    'after_scale_adaptation', 'after_propagation', 'refinement_1'])
             debug.close()
             path = os.path.join(directory, 'model.pth')
             wrapper.model.save_model(path, step=7)

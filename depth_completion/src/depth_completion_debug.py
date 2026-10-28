@@ -256,7 +256,7 @@ class DepthCompletionDebug(StageDiagnostics):
                                       keep.sum() / (sparse > 0).sum().clamp_min(1)))
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
-                        if name == 'scale_update' or name.endswith('.scale_update'):
+                        if name == 'scale_update' or name.endswith(('.scale_update', '.post_scale_update')):
                             if getattr(module, 'pre_propagation_refinement', False):
                                 geometry = inputs[0][:, -5:-4]
                                 scale = inputs[0][:, -4:-3]
@@ -313,7 +313,7 @@ class DepthCompletionDebug(StageDiagnostics):
             if name == 'scale_propagation' or name.endswith('.scale_propagation'):
                 level = 'bottom' if name == 'scale_propagation' else name.rsplit('.', 1)[0]
                 self.handles.append(module.register_forward_hook(self.scale_hook(level)))
-            if name.endswith('.scale_update'):
+            if name.endswith(('.scale_update', '.post_scale_update')):
                 self.handles.append(module.register_forward_hook(hook(name)))
             if name == 'rejection_map' or name.endswith('.rejection_map'):
                 level = 'bottom' if name == 'rejection_map' else name.rsplit('.', 1)[0]
@@ -347,6 +347,7 @@ class DepthCompletionDebug(StageDiagnostics):
                           propagation_iterations=module.n_propagation_iterations,
                           output_stage='final_level_scale' if (
                               level != 'bottom' and getattr(self.model, 'pre_propagation_refinement', False)
+                              and not getattr(self.model, 'post_propagation_refinement', False)
                           ) else 'before_refinement',
                           inherited_scale=statistics(scale),
                           injected_scale=statistics(keep * target + (1.0 - keep) * scale),
@@ -357,6 +358,7 @@ class DepthCompletionDebug(StageDiagnostics):
                           accepted_scale_residual=statistics((propagated_scale - target)[accepted]),
                           accepted_scale_residual_scope='final_level_scale' if (
                               level != 'bottom' and getattr(self.model, 'pre_propagation_refinement', False)
+                              and not getattr(self.model, 'post_propagation_refinement', False)
                           ) else 'propagated_scale_before_refinement',
                           sparse_scale_coordinates='current_resolution_grid_pixel',
                           scaleless_depth=statistics(geometry),

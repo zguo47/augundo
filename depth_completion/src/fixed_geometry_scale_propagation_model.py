@@ -5,7 +5,8 @@ import torch.nn.functional as functional
 from scale_propagation_model import (
     Conv2d, ConvolutionBlock, ScaleUpdateBlock, ScalePropagation,
     ScalePropagationDepthModel, normalize_scaleless_depth,
-    sparse_depth_at_resolution, measurement_rejection_input, rejection_keep_mask)
+    sparse_depth_at_resolution, measurement_rejection_input, rejection_keep_mask,
+    refine_scale)
 
 
 class GeometryAwarePropagationDecoderBlock(nn.Module):
@@ -44,6 +45,9 @@ class GeometryAwarePropagationDecoderBlock(nn.Module):
         self.scale_update = ScaleUpdateBlock(n_channels)
         self.scale_update.pre_propagation_refinement = True
         self.pre_propagation_refinement = True
+        # A separate head repairs residual errors AFTER sparse propagation.
+        # It uses the original refinement inputs, not geometry-change inputs.
+        self.post_scale_update = ScaleUpdateBlock(n_channels)
         self.scale_propagation = ScalePropagation(n_propagation_iterations)
 
         # Heads see features, current metric depth, and current sparse depth.
@@ -140,7 +144,12 @@ class GeometryAwarePropagationDecoderBlock(nn.Module):
             scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
             sparse_scale)
 
-        # Refinement already happened before propagation; do not restore anchors.
+        # Adaptation and refinement have separate parameters and purposes.
+        # Keep geometry detached inside refinement and do not restore anchors.
+        scale = refine_scale(
+            feature, scaleless_depth, scale, sparse_scale, keep_mask,
+            self.post_scale_update,
+            self.n_scale_refinement)
         return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
 
@@ -151,7 +160,8 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
     Keep the historical model name for existing repository entry points.
     Bottom initialization is unchanged from the original scale model. At finer
     levels, adapt inherited scale immediately after updating geometry, then
-    propagate. Metric loss retains the original geometry-detachment option.
+    propagate and refine the result with a separate head. Metric loss retains
+    the original geometry-detachment option.
     '''
 
     def __init__(self,
@@ -181,6 +191,7 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
         self.training_stage = training_stage
         self.fixed_geometry = False
         self.pre_propagation_refinement = True
+        self.post_propagation_refinement = True
         # Preserve initialization of shared layers for comparison with the old
         # model. Scale-update input width is unchanged; its five scalar inputs
         # now describe geometry change instead of post-propagation anchor error.
@@ -193,5 +204,7 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
                 max_predict_depth=max_predict_depth,
                 n_scale_refinement=n_scale_refinement,
                 use_sparse_depth_features=use_sparse_depth_features)
-            block.load_state_dict(original.state_dict())
+            state = block.state_dict()
+            state.update(original.state_dict())
+            block.load_state_dict(state)
             self.decoder[index] = block

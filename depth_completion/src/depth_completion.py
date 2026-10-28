@@ -362,7 +362,7 @@ def train(train_images_path,
                 model_name=model_name, supervision_type=supervision_type,
                 fixed_geometry_stage=fixed_geometry_stage if is_fixed_geometry else None,
                 geometry_restore_path=geometry_restore_path,
-                geometry_reference='per-level geometry with scale adaptation before propagation'
+                geometry_reference='per-level geometry with scale adaptation before propagation and refinement afterward'
                 if is_fixed_geometry else 'independently updated geometry at each level',
                 encoder_type=encoder_type,
                 use_sparse_depth_features=use_sparse_depth_features,
