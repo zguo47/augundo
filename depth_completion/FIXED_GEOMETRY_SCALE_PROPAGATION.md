@@ -35,12 +35,21 @@ For an existing custom training script, use:
 --w_losses w_supervised=1.0 w_si=1.0 w_log_l1=1.0
 ```
 
-Both objectives are active in joint mode: full-resolution SI for `Z`, and
+Both objectives are active in joint mode: multiscale SI for RGB geometry, and
 multiscale log L1 for metric depth. They are summed in a single backward and
 optimizer step. With `--detach_scaleless_depth true` (default), metric loss
 cannot update geometry through either `Z` OR the RGB guidance features; SI
 still trains the entire RGB U-Net each step. Setting the flag to `false`
 also permits metric gradients into geometry through both routes.
+
+The existing full-resolution head predicts `Z0`. Four auxiliary 3x3 KBNet
+convolution heads predict positive, mean-normalized `Z1` through `Z4` directly
+from the corresponding RGB decoder/bottom features. Each prediction is
+bilinearly upsampled to full GT resolution before SI, weighted by `4**(-r)`.
+This supplies direct supervision to all resolutions without pooling GT.
+Only resized `Z0` is used for scale ratios, propagation, and metric products;
+auxiliary heads cannot change that shared propagation reference. Ordinary
+inference skips the auxiliary heads entirely.
 
 Sparse depth and scale maps never enter the geometry U-Net. Geometry is not
 updated or renormalized independently at decoder levels. Its parameters do
@@ -59,9 +68,17 @@ The final depth is `clamp(Z * M, min_depth, max_depth)`.
 
 The scale loss is the existing **unclamped** log L1 metric loss, summed over
 all five resolutions with weights `1 / 4**r`, with `r=0` at full resolution.
-The joint objective is `w_supervised * (w_si * SI_r0 +
-w_log_l1 * sum_r(4**(-r) * log_L1_r))`. The common 16-map output layout preserves
-TensorBoard geometry/scale views and the debug interface.
+The joint objective is `w_supervised * (w_si * sum_r(4**(-r) * SI_r) +
+w_log_l1 * sum_r(4**(-r) * log_L1_r))`. The first 16 output maps still contain
+the actual propagation geometry, scale, and metric products. Four auxiliary
+geometry maps follow at indices 16-19 and undergo the same reverse geometric
+augmentation before the SI loss. TensorBoard geometry/scale views and stage
+diagnostics keep their existing meaning; `loss_si_r0` through `loss_si_r4`
+report the five independent SI objectives.
+
+The auxiliary heads introduce new checkpoint parameters. Start a new run for
+this experiment; checkpoints from the earlier head-free baseline do not have
+the same network/optimizer layout. No new bash flags are required.
 
 Scripts accept additional CLI arguments at the end, for example:
 
@@ -76,7 +93,7 @@ Coarse sampling and limited propagation reach remain possible limitations.
 
 ## Optional separate-stage ablations
 
-`STAGE=geometry` / `--fixed_geometry_stage geometry` trains only full-resolution
+`STAGE=geometry` / `--fixed_geometry_stage geometry` trains only multiscale
 SI geometry. Displayed metric predictions then use sparse global alignment
 for previews, not a metric training loss. `STAGE=scale` freezes a pretrained
 geometry network and trains only scale propagation with log L1.

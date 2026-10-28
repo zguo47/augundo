@@ -114,20 +114,66 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
             info['loss_si_weighted'].backward()
             self.assertGreater(float(wrapper.model_depth.geometry.depth_output[-1].conv.weight.grad.abs().sum()), 0.0)
 
-    def test_geometry_stage_trains_full_resolution_si_only(self):
+    def test_geometry_stage_trains_resolution_weighted_auxiliary_si_heads(self):
         wrapper = self.wrapper('geometry')
         outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
         loss, info = wrapper.compute_loss_supervised(
             self.target, outputs, dict(w_supervised=2.0, w_si=3.0, w_log_l1=1000.0))
-        expected = loss_utils.scale_invariant_loss_func(
-            outputs[1], self.target, torch.ones_like(self.target))
+        expected = sum(
+            loss_utils.scale_invariant_loss_func(value, self.target, torch.ones_like(self.target)) / (4 ** r)
+            for r, value in enumerate([outputs[1]] + outputs[16:20]))
         torch.testing.assert_close(loss, 6.0 * expected)
+        torch.testing.assert_close(info['loss_si'], sum(
+            info['loss_si_r{}'.format(r)] / (4 ** r) for r in range(5)))
         self.assertEqual(float(info['loss_log_l1_weighted']), 0.0)
         loss.backward()
         self.assertTrue(any(value.grad is not None and value.grad.abs().sum() > 0
                             for value in wrapper.model_depth.geometry.parameters()))
         self.assertTrue(all(value.grad is None for name, value in wrapper.model_depth.named_parameters()
                             if not name.startswith('geometry.')))
+        for head in wrapper.model_depth.geometry.auxiliary_depth_outputs:
+            self.assertIsNotNone(head.conv.weight.grad)
+            self.assertGreater(float(head.conv.weight.grad.abs().sum()), 0.0)
+
+    def test_auxiliary_predictions_never_replace_propagation_geometry(self):
+        wrapper = self.wrapper('joint')
+        model = wrapper.model_depth
+        first = model(self.image, self.sparse, return_all_outputs=True)
+        native_auxiliary = first['auxiliary_scaleless_depths']
+        self.assertEqual([value.shape[-2:] for value in native_auxiliary],
+                         [(17, 25), (9, 13), (5, 7), (3, 4), (2, 2)])
+        self.assertIs(native_auxiliary[0], first['scaleless_depths'][0])
+        with torch.no_grad():
+            for head in model.geometry.auxiliary_depth_outputs:
+                head.conv.weight.add_(torch.randn_like(head.conv.weight))
+        second = model(self.image, self.sparse, return_all_outputs=True)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(
+            native_auxiliary[1:], second['auxiliary_scaleless_depths'][1:])))
+        for key in ['scaleless_depths', 'scale_maps', 'metric_depths_for_loss']:
+            for a, b in zip(first[key], second[key]):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+        torch.testing.assert_close(first['depth'], second['depth'], rtol=0, atol=0)
+
+    def test_metric_loss_does_not_train_auxiliary_heads_even_without_detach(self):
+        wrapper = self.wrapper('joint', detach_scaleless_depth=False)
+        outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
+        _, info = wrapper.compute_loss_supervised(self.target, outputs, {})
+        heads = list(wrapper.model_depth.geometry.auxiliary_depth_outputs.parameters())
+        gradients = torch.autograd.grad(info['loss_log_l1_weighted'], heads, allow_unused=True)
+        self.assertTrue(all(value is None for value in gradients))
+
+    def test_inference_does_not_evaluate_auxiliary_heads(self):
+        model = self.wrapper().model_depth
+        calls = []
+        handles = [head.register_forward_hook(lambda *args: calls.append(1))
+                   for head in model.geometry.auxiliary_depth_outputs]
+        ordinary = model(self.image, self.sparse)
+        self.assertEqual(calls, [])
+        detailed = model(self.image, self.sparse, return_all_outputs=True)
+        self.assertEqual(len(calls), 4)
+        torch.testing.assert_close(ordinary, detailed['depth'], rtol=0, atol=0)
+        for handle in handles:
+            handle.remove()
 
     def test_scale_training_updates_propagation_but_cannot_change_geometry(self):
         wrapper = self.wrapper()
@@ -136,7 +182,7 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
         geometry_before = model.geometry(self.image)[1][0].detach().clone()
         optimizer = torch.optim.Adam(wrapper.parameters_depth(), lr=1e-3, weight_decay=0.01)
         outputs = wrapper.forward_depth(self.image, self.sparse, return_all_outputs=True)
-        self.assertEqual(len(outputs), 16)
+        self.assertEqual(len(outputs), 20)
         loss, info = wrapper.compute_loss_supervised(
             self.target, outputs, dict(w_supervised=2.0, w_si=1000.0, w_log_l1=3.0))
         expected = sum(info['loss_log_l1_r{}'.format(r)] / (4 ** r) for r in range(5))
@@ -218,7 +264,7 @@ class FixedGeometryScalePropagationTest(unittest.TestCase):
         self.assertIsInstance(wrapper.model, FixedGeometryScalePropagationDepthCompletionModel)
         output = wrapper.forward_depth(self.image, self.sparse, None, return_all_outputs=True)
         maps = wrapper.scale_outputs(output)
-        self.assertEqual(len(output), 16)
+        self.assertEqual(len(output), 20)
         self.assertEqual(len(maps['scaleless_depths']), 5)
         self.assertEqual(len(maps['scale_maps']), 5)
         self.assertTrue(all(value.shape == self.sparse.shape for value in output))

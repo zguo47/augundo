@@ -468,7 +468,7 @@ def train(train_images_path,
         if is_fixed_geometry:
             log('fixed_geometry_stage={}  geometry_restore_path={}'.format(
                 fixed_geometry_stage, geometry_restore_path), log_path)
-            log('joint: full-resolution SI + multiscale log L1; optional geometry/scale stages use one objective', log_path)
+            log('joint: multiscale auxiliary SI + multiscale log L1; optional geometry/scale stages use one objective', log_path)
         log('seed={}  use_sparse_depth_features={}'.format(
             seed, use_sparse_depth_features), log_path)
         log('detach_scaleless_depth={}'.format(detach_scaleless_depth), log_path)

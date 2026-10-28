@@ -50,8 +50,16 @@ class RGBGeometryModel(nn.Module):
                 activation_func=nn.LeakyReLU(negative_slope=0.10, inplace=True)),
             Conv2d(
                 n_channels, 1, kernel_size=3, stride=1, activation_func=None))
+        # Independent r1-r4 heads give the RGB features direct SI supervision.
+        # They are auxiliary predictions only: scale propagation must continue
+        # to use resized copies of the final r0 geometry, not these heads.
+        self.auxiliary_depth_outputs = nn.ModuleList([
+            Conv2d(
+                n_channels, 1, kernel_size=3, stride=1, activation_func=None)
+            for _ in range(4)
+        ])
 
-    def forward(self, image):
+    def forward(self, image, return_auxiliary_outputs=False):
         encoder_features = self.encoder(image)
         feature = encoder_features[-1]
         features = [feature]
@@ -67,6 +75,11 @@ class RGBGeometryModel(nn.Module):
             for value in features[1:]]
         # Normalize only once at full resolution. Renormalizing individual
         # levels would change the units of the inherited scale map again.
+        if return_auxiliary_outputs:
+            auxiliary_geometries = [geometry] + [
+                normalize_scaleless_depth(functional.softplus(head(value)) + 1e-3)
+                for head, value in zip(self.auxiliary_depth_outputs, features[1:])]
+            return features, geometries, auxiliary_geometries
         return features, geometries
 
 
@@ -176,13 +189,15 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
 
     def forward(self, image, sparse_depth, return_all_outputs=False,
                 return_rejection_outputs=False):
+        collect_auxiliary = return_all_outputs or return_rejection_outputs
         if self.training_stage != 'scale':
-            features, geometries = self.geometry(image)
+            geometry_outputs = self.geometry(image, return_auxiliary_outputs=collect_auxiliary)
         else:
             # No geometry graph is retained during scale training. Its weights
             # and its normalization/evaluation state remain fixed throughout.
             with torch.no_grad():
-                features, geometries = self.geometry(image)
+                geometry_outputs = self.geometry(image, return_auxiliary_outputs=collect_auxiliary)
+        features, geometries = geometry_outputs[:2]
 
         # Both losses can train in ONE forward/backward pass. With detachment
         # enabled, SI trains geometry and metric loss trains propagation only.
@@ -228,6 +243,7 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
             return depth
         return dict(
             depth=depth, scaleless_depths=geometries, scale_maps=scales,
+            auxiliary_scaleless_depths=geometry_outputs[2],
             metric_depths_for_loss=metric_depths,
             rejection_keep_masks=keep_masks,
             rejection_logits=[torch.zeros_like(value).repeat(1, 2, 1, 1)
