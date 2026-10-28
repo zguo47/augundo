@@ -3,144 +3,155 @@ import torch.nn as nn
 import torch.nn.functional as functional
 
 from scale_propagation_model import (
-    Conv2d,
-    ConvolutionBlock,
-    ScalePropagation,
-    SharedEncoder,
-    normalize_scaleless_depth,
-    sparse_depth_at_resolution)
+    Conv2d, ConvolutionBlock, ScaleUpdateBlock, ScalePropagation,
+    ScalePropagationDepthModel, normalize_scaleless_depth,
+    sparse_depth_at_resolution, measurement_rejection_input, rejection_keep_mask)
 
 
-class GeometryDecoderBlock(nn.Module):
-    '''Upsample RGB features and fuse the corresponding encoder skip.'''
+class GeometryAwarePropagationDecoderBlock(nn.Module):
+    '''Refine scaleless geometry and the inherited scale map at a finer level.'''
 
-    def __init__(self, n_channels):
-        super(GeometryDecoderBlock, self).__init__()
-        self.fusion = ConvolutionBlock(2 * n_channels, n_channels, stride=1)
+    def __init__(
+            self,
+            n_channels,
+            gumbel_temperature,
+            use_outlier_rejection,
+            n_propagation_iterations=4,
+            max_predict_depth=8.0,
+            n_scale_refinement=1,
+            use_sparse_depth_features=False):
+        super(GeometryAwarePropagationDecoderBlock, self).__init__()
 
-    def forward(self, feature, skip):
-        feature = functional.interpolate(
-            feature, size=skip.shape[-2:], mode='bilinear', align_corners=True)
-        return self.fusion(torch.cat([feature, skip], dim=1))
-
-
-class RGBGeometryModel(nn.Module):
-    '''Predict one positive full-resolution geometry using RGB alone.
-
-    No sparse measurements or scale maps enter this network. Its decoder
-    features supply RGB guidance to the separate scale-propagation decoder.
-    The five geometries used by propagation are resized copies of this ONE
-    final prediction, not independent predictions with different meanings.
-    '''
-
-    def __init__(self, n_channels=32, n_head=4, encoder_type='conv'):
-        super(RGBGeometryModel, self).__init__()
-        self.encoder = SharedEncoder(
-            n_channels=n_channels, n_head=n_head, encoder_type=encoder_type,
-            use_sparse_depth_features=False)
-        self.decoder = nn.ModuleList([
-            GeometryDecoderBlock(n_channels) for _ in range(4)
-        ])
-        self.depth_output = nn.Sequential(
-            Conv2d(
-                n_channels, n_channels, kernel_size=3, stride=1,
-                activation_func=nn.LeakyReLU(negative_slope=0.10, inplace=True)),
-            Conv2d(
-                n_channels, n_channels, kernel_size=3, stride=1,
-                activation_func=nn.LeakyReLU(negative_slope=0.10, inplace=True)),
-            Conv2d(
-                n_channels, 1, kernel_size=3, stride=1, activation_func=None))
-        # Independent r1-r4 heads give the RGB features direct SI supervision.
-        # They are auxiliary predictions only: scale propagation must continue
-        # to use resized copies of the final r0 geometry, not these heads.
-        self.auxiliary_depth_outputs = nn.ModuleList([
-            Conv2d(
-                n_channels, 1, kernel_size=3, stride=1, activation_func=None)
-            for _ in range(4)
-        ])
-
-    def forward(self, image, return_auxiliary_outputs=False):
-        encoder_features = self.encoder(image)
-        feature = encoder_features[-1]
-        features = [feature]
-        for decoder_block, skip in zip(self.decoder, encoder_features[-2::-1]):
-            feature = decoder_block(feature, skip)
-            features.append(feature)
-        features = features[::-1]
-        geometry = normalize_scaleless_depth(
-            functional.softplus(self.depth_output(feature)) + 1e-3)
-        geometries = [geometry] + [
-            functional.interpolate(
-                geometry, size=value.shape[-2:], mode='bilinear', align_corners=True)
-            for value in features[1:]]
-        # Normalize only once at full resolution. Renormalizing individual
-        # levels would change the units of the inherited scale map again.
-        if return_auxiliary_outputs:
-            auxiliary_geometries = [geometry] + [
-                normalize_scaleless_depth(functional.softplus(head(value)) + 1e-3)
-                for head, value in zip(self.auxiliary_depth_outputs, features[1:])]
-            return features, geometries, auxiliary_geometries
-        return features, geometries
-
-
-def global_scale_from_sparse(sparse_depth, geometry):
-    '''Estimate one metric scale per image from full-resolution measurements.'''
-    measured = (sparse_depth > 0.0).to(geometry.dtype)
-    ratios = sparse_depth / geometry.detach().clamp_min(1e-7)
-    count = measured.sum(dim=[2, 3], keepdim=True)
-    scale = (ratios * measured).sum(dim=[2, 3], keepdim=True) / count.clamp_min(1.0)
-    # An image with no measurements has no observable metric scale. A neutral
-    # scale keeps its output finite without inventing a measurement.
-    return torch.where(count > 0.0, scale, torch.ones_like(scale))
-
-
-class FixedGeometryPropagationDecoderBlock(nn.Module):
-    '''Upsample the scale prior, then propagate against fixed RGB geometry.'''
-
-    def __init__(self, n_channels, n_propagation_iterations):
-        super(FixedGeometryPropagationDecoderBlock, self).__init__()
+        # Carry features, scaleless geometry, and scale separately. Add this
+        # level's RGB encoder skip, without raw sparse depth: C + C + 1 + 1.
+        # The optional sparse-feature mode adds one raw measurement channel.
+        self.use_sparse_depth_features = use_sparse_depth_features
+        self.fusion = ConvolutionBlock(
+            2 * n_channels + 2 + int(use_sparse_depth_features),
+            n_channels,
+            stride=1)
+        self.gumbel_temperature = gumbel_temperature
+        self.use_outlier_rejection = use_outlier_rejection
         self.n_propagation_iterations = n_propagation_iterations
-        self.use_sparse_depth_features = False
-        # The geometry is guidance, not a prediction to be updated here.
-        # C preceding features + C RGB skip + one geometry + one scale.
-        self.fusion = ConvolutionBlock(2 * n_channels + 2, n_channels, stride=1)
-        self.propagation_map = Conv2d(
-            n_channels + 2, 9, kernel_size=3, stride=1, activation_func=None)
+        self.max_predict_depth = max_predict_depth
+        self.n_scale_refinement = n_scale_refinement
+        self.depth_update = Conv2d(
+            n_channels,
+            1,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        self.scale_update = ScaleUpdateBlock(n_channels)
+        self.scale_update.pre_propagation_refinement = True
+        self.pre_propagation_refinement = True
         self.scale_propagation = ScalePropagation(n_propagation_iterations)
 
-    def forward(self, feature, skip, geometry, scale, sparse_depth, fine_geometry):
-        # The preceding geometry is carried only for the common diagnostic
-        # call signature. Use the precomputed finer copy of the SAME final Z.
-        del geometry
+        # Heads see features, current metric depth, and current sparse depth.
+        # Both heads are freshly evaluated at each level
+        # Rejection additionally receives y/x offsets of the selected source.
+        self.propagation_map = Conv2d(
+            n_channels + 2,
+            9,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        self.rejection_map = Conv2d(
+            n_channels + 4,
+            2,
+            kernel_size=3,
+            stride=1,
+            activation_func=None)
+        self.rejection_bias = nn.Parameter(
+            torch.tensor([2.0, 0.0]).reshape(1, 2, 1, 1))
+
+    def forward(self, feature, skip, scaleless_depth, scale, sparse_depth):
+
         feature = functional.interpolate(
-            feature, size=skip.shape[-2:], mode='bilinear', align_corners=True)
+            feature,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
+        scaleless_depth = functional.interpolate(
+            scaleless_depth,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
         scale = functional.interpolate(
-            scale, size=skip.shape[-2:], mode='bilinear', align_corners=True)
-        geometry = fine_geometry
-        feature = self.fusion(torch.cat([
-            feature, skip, geometry, scale.detach()
-        ], dim=1))
-        sparse = sparse_depth_at_resolution(sparse_depth, geometry.shape[-2:])
-        keep_mask = (sparse > 0.0).to(sparse.dtype)
-        logits = self.propagation_map(torch.cat([
-            feature, geometry * scale, sparse
-        ], dim=1))
-        sparse_scale = sparse / geometry.clamp_min(1e-7)
+            scale,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
+        input_size = sparse_depth.shape[-2:]
+        sparse_depth, measurement_indices = sparse_depth_at_resolution(
+            sparse_depth=sparse_depth,
+            output_size=skip.shape[-2:],
+            return_indices=True)
+
+        fusion_inputs = [
+            feature,
+            skip,
+            scaleless_depth.detach(),
+            scale.detach()
+        ]
+        if self.use_sparse_depth_features:
+            fusion_inputs.append(sparse_depth)
+        feature = self.fusion(torch.cat(fusion_inputs, dim=1))
+        previous_geometry = scaleless_depth.detach()
+        # SI directly trains scaleless
+        scaleless_depth = normalize_scaleless_depth(
+            scaleless_depth * torch.exp(torch.tanh(self.depth_update(feature))))
+        # Adapt the inherited scale to the UPDATED geometry before propagation.
+        # C+5 channels: features, new Z, scale, old Z, current metric depth,
+        # and log(new Z / old Z). Geometry inputs remain detached.
+        # Zero-initialized output weights make the initial adaptation identity.
+        geometry = scaleless_depth.detach()
+        geometry_change = torch.log(geometry.clamp_min(1e-7)) - \
+            torch.log(previous_geometry.clamp_min(1e-7))
+        for _ in range(self.n_scale_refinement):
+            adaptation_input = torch.cat([
+                feature, geometry, scale, previous_geometry,
+                geometry * scale, geometry_change
+            ], dim=1)
+            scale = scale * torch.exp(torch.tanh(self.scale_update(adaptation_input)))
+        depth = geometry * scale
+
+        propagation_input = torch.cat([feature, depth, sparse_depth], dim=1)
+        if self.use_outlier_rejection:
+            rejection_input = measurement_rejection_input(
+                feature=feature,
+                depth=depth / self.max_predict_depth,
+                sparse_depth=sparse_depth / self.max_predict_depth,
+                measurement_indices=measurement_indices,
+                input_size=input_size)
+            rejection_logits = \
+                self.rejection_map(rejection_input) + self.rejection_bias
+            keep_mask = rejection_keep_mask(
+                rejection_logits=rejection_logits,
+                sparse_depth=sparse_depth,
+                temperature=self.gumbel_temperature,
+                training=self.training)
+        else:
+            rejection_logits = torch.zeros_like(sparse_depth).repeat(1, 2, 1, 1)
+            keep_mask = (sparse_depth > 0.0).to(sparse_depth.dtype)
+
+        propagation_logits = self.propagation_map(propagation_input)
+        sparse_scale = sparse_depth / scaleless_depth.detach().clamp_min(1e-7)
         scale = self.scale_propagation(
-            scale, geometry, sparse, keep_mask, logits, sparse_scale)
-        # Reuse the existing six-output diagnostic convention, without a
-        # rejection head, stochastic decisions, or free scale-refinement head.
-        rejection_logits = torch.zeros_like(sparse).repeat(1, 2, 1, 1)
-        return feature, geometry, scale, logits, rejection_logits, keep_mask
+            scale, scaleless_depth, sparse_depth, keep_mask, propagation_logits,
+            sparse_scale)
+
+        # Refinement already happened before propagation; do not restore anchors.
+        return feature, scaleless_depth, scale, propagation_logits, rejection_logits, keep_mask
 
 
-class FixedGeometryScalePropagationDepthModel(nn.Module):
-    '''Joint RGB-geometry and hierarchical scale-propagation baseline.
 
-    Stage joint: train geometry and propagation together in one run (default).
-    Optional stages geometry/scale retain the separate pretrain/freeze ablation.
-    Mode global: bypass propagation to evaluate global scaling of the exact
-    same geometry checkpoint. This is an evaluation control, not a third head.
+class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
+    '''Joint geometry/scale decoder replacing the fixed-geometry experiment.
+
+    Keep the historical model name for existing repository entry points.
+    Bottom initialization is unchanged from the original scale model. At finer
+    levels, adapt inherited scale immediately after updating geometry, then
+    propagate. Metric loss retains the original geometry-detachment option.
     '''
 
     def __init__(self,
@@ -152,99 +163,35 @@ class FixedGeometryScalePropagationDepthModel(nn.Module):
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  training_stage='joint',
                  propagation_mode='hierarchical',
-                 detach_scaleless_depth=True):
-        super(FixedGeometryScalePropagationDepthModel, self).__init__()
-        self.min_predict_depth = min_predict_depth
-        self.max_predict_depth = max_predict_depth
+                 detach_scaleless_depth=True,
+                 use_outlier_rejection=False,
+                 n_scale_refinement=1,
+                 use_sparse_depth_features=False):
+        if training_stage != 'joint' or propagation_mode != 'hierarchical':
+            raise ValueError('This replacement uses joint hierarchical training; '
+                             'former geometry/scale stages and global mode are unsupported.')
+        super(FixedGeometryScalePropagationDepthModel, self).__init__(
+            min_predict_depth=min_predict_depth, max_predict_depth=max_predict_depth,
+            n_channels=n_channels, n_head=n_head, encoder_type=encoder_type,
+            n_propagation_iterations=n_propagation_iterations,
+            detach_scaleless_depth=detach_scaleless_depth,
+            use_outlier_rejection=use_outlier_rejection,
+            n_scale_refinement=n_scale_refinement,
+            use_sparse_depth_features=use_sparse_depth_features)
         self.training_stage = training_stage
-        self.propagation_mode = propagation_mode
-        self.n_propagation_iterations = n_propagation_iterations
-        self.fixed_geometry = True
-        self.detach_scaleless_depth = detach_scaleless_depth
-        self.use_outlier_rejection = False
-        self.use_sparse_depth_features = False
-        self.n_scale_refinement = 0
-
-        self.geometry = RGBGeometryModel(n_channels, n_head, encoder_type)
-        self.propagation_map = Conv2d(
-            n_channels + 2, 9, kernel_size=3, stride=1, activation_func=None)
-        self.scale_propagation = ScalePropagation(n_propagation_iterations[0])
-        self.decoder = nn.ModuleList([
-            FixedGeometryPropagationDecoderBlock(n_channels, n_iteration)
-            for n_iteration in n_propagation_iterations[1:]
-        ])
-        # Joint training enables both networks. The optional scale-only stage
-        # still freezes the entire RGB network, not just its output tensor.
-        for name, parameter in self.named_parameters():
-            parameter.requires_grad_(
-                training_stage == 'joint' or
-                (name.startswith('geometry.') == (training_stage == 'geometry')))
-        self.train()
-
-    def train(self, mode=True):
-        super(FixedGeometryScalePropagationDepthModel, self).train(mode)
-        if self.training_stage == 'scale':
-            self.geometry.eval()
-        return self
-
-    def forward(self, image, sparse_depth, return_all_outputs=False,
-                return_rejection_outputs=False):
-        collect_auxiliary = return_all_outputs or return_rejection_outputs
-        if self.training_stage != 'scale':
-            geometry_outputs = self.geometry(image, return_auxiliary_outputs=collect_auxiliary)
-        else:
-            # No geometry graph is retained during scale training. Its weights
-            # and its normalization/evaluation state remain fixed throughout.
-            with torch.no_grad():
-                geometry_outputs = self.geometry(image, return_auxiliary_outputs=collect_auxiliary)
-        features, geometries = geometry_outputs[:2]
-
-        # Both losses can train in ONE forward/backward pass. With detachment
-        # enabled, SI trains geometry and metric loss trains propagation only.
-        # Detach RGB guidance too: otherwise metric gradients could change Z
-        # indirectly through its encoder/decoder features. Setting the common
-        # detach flag false permits metric gradients through both routes.
-        detach_geometry = self.detach_scaleless_depth or self.training_stage == 'geometry'
-        scale_features = [value.detach() for value in features] if detach_geometry else features
-        scale_geometries = [value.detach() for value in geometries] if detach_geometry else geometries
-        global_scale = global_scale_from_sparse(sparse_depth, geometries[0])
-        if self.training_stage == 'geometry' or self.propagation_mode == 'global':
-            # Metric images during SI pretraining are previews using sparse
-            # global alignment; they do not contribute to geometry training.
-            scales = [global_scale.expand_as(value) for value in geometries]
-            keep_masks = [(sparse_depth_at_resolution(sparse_depth, value.shape[-2:]) > 0.0)
-                          .to(value.dtype) for value in geometries]
-        else:
-            feature, geometry = scale_features[-1], scale_geometries[-1]
-            sparse = sparse_depth_at_resolution(sparse_depth, geometry.shape[-2:])
-            keep_mask = (sparse > 0.0).to(sparse.dtype)
-            scale = global_scale.expand_as(geometry)
-            logits = self.propagation_map(torch.cat([
-                feature, geometry * scale, sparse
-            ], dim=1))
-            scale = self.scale_propagation(
-                scale, geometry, sparse, keep_mask, logits,
-                sparse / geometry.clamp_min(1e-7))
-            scales, keep_masks = [scale], [keep_mask]
-            for decoder_block, level in zip(self.decoder, range(3, -1, -1)):
-                feature, geometry, scale, _, _, keep_mask = decoder_block(
-                    feature, scale_features[level], geometry, scale, sparse_depth,
-                    scale_geometries[level])
-                scales.append(scale)
-                keep_masks.append(keep_mask)
-            scales, keep_masks = scales[::-1], keep_masks[::-1]
-
-        # Geometry is shared across levels within this forward pass, but in
-        # joint mode its parameters are updated at every optimizer step.
-        metric_depths = [value * scale for value, scale in zip(scale_geometries, scales)]
-        depth = torch.clamp(
-            metric_depths[0], min=self.min_predict_depth, max=self.max_predict_depth)
-        if not return_all_outputs and not return_rejection_outputs:
-            return depth
-        return dict(
-            depth=depth, scaleless_depths=geometries, scale_maps=scales,
-            auxiliary_scaleless_depths=geometry_outputs[2],
-            metric_depths_for_loss=metric_depths,
-            rejection_keep_masks=keep_masks,
-            rejection_logits=[torch.zeros_like(value).repeat(1, 2, 1, 1)
-                              for value in keep_masks])
+        self.fixed_geometry = False
+        self.pre_propagation_refinement = True
+        # Preserve initialization of shared layers for comparison with the old
+        # model. Scale-update input width is unchanged; its five scalar inputs
+        # now describe geometry change instead of post-propagation anchor error.
+        for index, original in enumerate(self.decoder):
+            block = GeometryAwarePropagationDecoderBlock(
+                n_channels=n_channels,
+                gumbel_temperature=self.gumbel_temperature,
+                use_outlier_rejection=use_outlier_rejection,
+                n_propagation_iterations=n_propagation_iterations[index + 1],
+                max_predict_depth=max_predict_depth,
+                n_scale_refinement=n_scale_refinement,
+                use_sparse_depth_features=use_sparse_depth_features)
+            block.load_state_dict(original.state_dict())
+            self.decoder[index] = block

@@ -52,13 +52,13 @@ parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder architecture; match the choice used during training')
 parser.add_argument('--fixed_geometry_stage',
-    choices=['joint', 'geometry', 'scale'], default='joint',
-    help='Shared-geometry baseline stage; joint training needs no geometry pretraining')
+    choices=['joint'], default='joint',
+    help='Replacement scale-adaptation experiment: joint geometry/scale model')
 parser.add_argument('--fixed_geometry_mode',
-    choices=['hierarchical', 'global'], default='hierarchical',
-    help='Fixed-geometry baseline: learned propagation or global-scale-only evaluation control')
+    choices=['hierarchical'], default='hierarchical',
+    help='Replacement model uses hierarchical scale adaptation and propagation')
 parser.add_argument('--geometry_restore_path',
-    type=str, default=None, help='Initialize only the fixed RGB geometry from its checkpoint')
+    type=str, default=None, help='Legacy option; unsupported by the replacement model')
 parser.add_argument('--n_propagation_iterations',
     nargs=5, type=int, default=[2, 4, 6, 8, 12],
     help='Match training: scale exchanges from bottom to full resolution')

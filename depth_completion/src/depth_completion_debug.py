@@ -146,7 +146,7 @@ class DepthCompletionDebug(StageDiagnostics):
                      os.path.abspath('utils/src/data_utils.py')]:
             with open(path, 'rb') as stream:
                 sources[os.path.abspath(path)] = hashlib.sha256(stream.read()).hexdigest()
-        if getattr(self.model, 'fixed_geometry', False):
+        if getattr(self.model, 'fixed_geometry', False) or getattr(self.model, 'pre_propagation_refinement', False):
             # The independent baseline reuses encoder and propagation helpers.
             # Snapshot those definitions as well as its own network/wrapper.
             for name in ['scale_propagation_model.py',
@@ -257,6 +257,26 @@ class DepthCompletionDebug(StageDiagnostics):
                     else:
                         value = output['depth'] if isinstance(output, dict) else output
                         if name == 'scale_update' or name.endswith('.scale_update'):
+                            if getattr(module, 'pre_propagation_refinement', False):
+                                geometry = inputs[0][:, -5:-4]
+                                scale = inputs[0][:, -4:-3]
+                                refined = scale * torch.exp(torch.tanh(value))
+                                level = name.rsplit('.', 1)[0]
+                                key = (name, str(value.device))
+                                iteration = self.refinement_counts.get(key, 0) + 1
+                                self.refinement_counts[key] = iteration
+                                if iteration == 1:
+                                    self.capture_stage(level, 'after_geometry_update', geometry, scale)
+                                self.capture_stage(level, 'scale_adaptation_{}'.format(iteration),
+                                                   geometry, refined,
+                                                   multiplier=torch.exp(torch.tanh(value)))
+                                self.emit('scale_adaptation', level=level,
+                                          refinement_iteration=iteration,
+                                          scale_before_adaptation=statistics(scale),
+                                          scale_after_adaptation=statistics(refined),
+                                          geometry_log_change=statistics(inputs[0][:, -1:]),
+                                          output_stage='before_propagation')
+                                return
                             scale = inputs[0][:, -4:-3]
                             accepted_scale = inputs[0][:, -3:-2]
                             keep = inputs[0][:, -2:-1]
@@ -314,8 +334,10 @@ class DepthCompletionDebug(StageDiagnostics):
                     if level in self.rejection_observations:
                         self.rejection_observations[level]['keep'] = accepted.detach()
                     self.anchor_context[level] = dict(keep=keep)
-                    geometry_stage = 'fixed_geometry' if getattr(self.model, 'fixed_geometry', False) \
-                        else 'after_geometry_update'
+                    adapted = level != 'bottom' and getattr(self.model, 'pre_propagation_refinement', False)
+                    geometry_stage = 'after_scale_adaptation' if adapted else (
+                        'fixed_geometry' if getattr(self.model, 'fixed_geometry', False)
+                        else 'after_geometry_update')
                     self.capture_stage(level, 'initial_global_scale' if level == 'bottom' else geometry_stage,
                                        geometry, scale)
                     self.capture_stage(level, 'after_propagation', geometry, propagated_scale,
@@ -323,7 +345,9 @@ class DepthCompletionDebug(StageDiagnostics):
                                        outgoing_weights=weights, **self.anchor_context[level])
                 self.emit('scale_propagation', level=level,
                           propagation_iterations=module.n_propagation_iterations,
-                          output_stage='before_refinement',
+                          output_stage='final_level_scale' if (
+                              level != 'bottom' and getattr(self.model, 'pre_propagation_refinement', False)
+                          ) else 'before_refinement',
                           inherited_scale=statistics(scale),
                           injected_scale=statistics(keep * target + (1.0 - keep) * scale),
                           propagated_scale=statistics(propagated_scale),
@@ -331,7 +355,9 @@ class DepthCompletionDebug(StageDiagnostics):
                           keep_fraction_at_sparse=float(keep.sum() / (sparse > 0.0).sum().clamp_min(1)),
                           available_sparse_count=int((sparse > 0.0).sum()),
                           accepted_scale_residual=statistics((propagated_scale - target)[accepted]),
-                          accepted_scale_residual_scope='propagated_scale_before_refinement',
+                          accepted_scale_residual_scope='final_level_scale' if (
+                              level != 'bottom' and getattr(self.model, 'pre_propagation_refinement', False)
+                          ) else 'propagated_scale_before_refinement',
                           sparse_scale_coordinates='current_resolution_grid_pixel',
                           scaleless_depth=statistics(geometry),
                           outgoing_weight_sum=statistics(weights.sum(dim=1)),

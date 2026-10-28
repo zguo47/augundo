@@ -74,7 +74,10 @@ class DepthCompletionModel(object):
                 training_stage=fixed_geometry_stage,
                 propagation_mode=fixed_geometry_mode,
                 geometry_restore_path=geometry_restore_path,
-                detach_scaleless_depth=detach_scaleless_depth)
+                detach_scaleless_depth=detach_scaleless_depth,
+                use_outlier_rejection=use_outlier_rejection,
+                n_scale_refinement=n_scale_refinement,
+                use_sparse_depth_features=use_sparse_depth_features)
         elif 'scale_propagation' in model_name:
             from scale_propagation_depth_completion_model import \
                 ScalePropagationDepthCompletionModel

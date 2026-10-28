@@ -79,11 +79,11 @@ parser.add_argument('--encoder_type',
     choices=['conv', 'conv_attention'], default='conv',
     help='Scale encoder: current 3/3/3/3/3 conv or 3/6/6/4+2SA/4+2SA')
 parser.add_argument('--fixed_geometry_stage',
-    choices=['joint', 'geometry', 'scale'], default='joint',
-    help='Shared-geometry baseline: joint one-run training (default), or optional geometry/scale stages')
+    choices=['joint'], default='joint',
+    help='Replacement scale-adaptation experiment: joint geometry/scale training')
 parser.add_argument('--geometry_restore_path',
     type=str, default=None,
-    help='Fixed-geometry baseline: initialize ONLY RGB geometry from its stage-one checkpoint; start a new optimizer/step')
+    help='Legacy option; unsupported by the replacement scale-adaptation experiment')
 parser.add_argument('--use_sparse_depth_features',
     type=parse_boolean, default=False,
     help='Concatenate raw sparse depth to the scale encoder input and decoder fusion')

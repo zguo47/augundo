@@ -127,16 +127,6 @@ def train(train_images_path,
 
     set_random_seed(seed)
     is_fixed_geometry = 'fixed_geometry_scale_propagation' in model_name
-    if is_fixed_geometry:
-        # This independent baseline deliberately has no rejection, raw sparse
-        # feature fusion, or unconstrained scale-refinement head.
-        use_outlier_rejection = False
-        use_sparse_depth_features = False
-        supervise_outlier_rejection = False
-        n_scale_refinement = 0
-        if fixed_geometry_stage == 'scale' and not geometry_restore_path and not restore_paths:
-            raise ValueError('Scale training requires --geometry_restore_path or --restore_paths; '
-                             'pretrain with --fixed_geometry_stage geometry first.')
     # Separate loader generators keep shuffling independent of model size and
     # prevent validation iterator creation from advancing training's RNG stream.
     train_generator = torch.Generator().manual_seed(seed)
@@ -372,7 +362,7 @@ def train(train_images_path,
                 model_name=model_name, supervision_type=supervision_type,
                 fixed_geometry_stage=fixed_geometry_stage if is_fixed_geometry else None,
                 geometry_restore_path=geometry_restore_path,
-                geometry_reference='one RGB-only full-resolution Z resized without renormalization'
+                geometry_reference='per-level geometry with scale adaptation before propagation'
                 if is_fixed_geometry else 'independently updated geometry at each level',
                 encoder_type=encoder_type,
                 use_sparse_depth_features=use_sparse_depth_features,
@@ -1235,11 +1225,6 @@ def run(image_path,
         fixed_geometry_mode='hierarchical',
         geometry_restore_path=None,
         n_propagation_iterations=(2, 4, 6, 8, 12)):
-
-    if 'fixed_geometry_scale_propagation' in model_name:
-        use_outlier_rejection = False
-        use_sparse_depth_features = False
-        n_scale_refinement = 0
 
     # Select device to run on
     if device == 'cuda' or device == 'gpu':
