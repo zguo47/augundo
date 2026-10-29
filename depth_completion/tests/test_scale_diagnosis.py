@@ -14,6 +14,7 @@ from PIL import Image
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import diagnose_scale_propagation as diagnostic
 import diagnose_hierarchical_rejection as hierarchy
+import diagnose_anchor_retention as anchors
 
 
 class DiagnosisTest(unittest.TestCase):
@@ -172,6 +173,79 @@ class DiagnosisTest(unittest.TestCase):
         self.assertEqual(result['mean_image_rmse_delta_m'], -1)
         self.assertEqual(result['image_bootstrap_95pct_m'], [-1., -1.])
 
+    def test_soft_anchor_formula_and_prediction_gradients(self):
+        # The left accepted source is 9; its neighbor predicts 1. Only the
+        # right pixel sends left, with weight 0.5. Initial injection is kept.
+        scale = torch.tensor([[[[2., 1.]]]], requires_grad=True)
+        ratio = torch.tensor([[[[9., 0.]]]])
+        keep = torch.tensor([[[[1., 0.]]]], requires_grad=True)
+        logits = torch.full((1, 9, 1, 2), -100.)
+        logits[0, 3, 0, 1] = 0.
+        logits.requires_grad_()
+        old = diagnostic.original.propagate_scale(scale, ratio, keep, logits, 1, 0.)
+        soft = diagnostic.original.propagate_scale(scale, ratio, keep, logits, 1, 2.)
+        self.assertAlmostEqual(float(old[0, 0, 0, 0]), 9.5 / 1.5, places=5)
+        self.assertAlmostEqual(float(soft[0, 0, 0, 0]), 27.5 / 3.5, places=5)
+        self.assertLess(abs(float(soft[0, 0, 0, 0]) - 9), abs(float(old[0, 0, 0, 0]) - 9))
+        soft[0, 0, 0, 0].backward()
+        self.assertGreater(float(scale.grad[0, 0, 0, 1]), 0)
+        self.assertGreater(float(logits.grad.abs().sum()), 0)
+        self.assertGreater(float(keep.grad.abs().sum()), 0)
+        # The pre-existing one-time hard injection still replaces the inherited
+        # scale at this accepted pixel; soft tethering does not undo that fact.
+        self.assertEqual(float(scale.grad[0, 0, 0, 0]), 0)
+
+    def test_soft_anchor_zero_eligibility_preserves_old_update(self):
+        scale = torch.rand(1, 1, 3, 5)
+        ratio = torch.rand_like(scale) * 10
+        keep = (torch.rand_like(scale) > .5).float()
+        logits = torch.randn(1, 9, 3, 5)
+        old = diagnostic.original.propagate_scale(scale, ratio, keep, logits, 6, 0.)
+        masked = diagnostic.original.propagate_scale(
+            scale, ratio, keep, logits, 6, 2., torch.zeros_like(keep))
+        torch.testing.assert_close(old, masked, rtol=0, atol=0)
+
+    def test_anchor_strength_reaches_every_level_without_new_parameters(self):
+        for wrapper_class in (diagnostic.ScalePropagationDepthCompletionModel,
+                              diagnostic.FixedGeometryScalePropagationDepthCompletionModel):
+            kwargs = dict(device=torch.device('cpu'), encoder_type='conv',
+                          n_propagation_iterations=(1,) * 5)
+            previous = wrapper_class(propagation_anchor_strength=0., **kwargs)
+            updated = wrapper_class(propagation_anchor_strength=2., **kwargs)
+            updated.model_depth.load_state_dict(previous.model_depth.state_dict(), strict=True)
+            modules = [m for m in updated.model_depth.modules()
+                       if isinstance(m, diagnostic.original.ScalePropagation)]
+            self.assertEqual(len(modules), 5)
+            self.assertTrue(all(m.propagation_anchor_strength == 2. for m in modules))
+
+    def test_anchor_suite_frozen_masks_and_checkpoint_unchanged(self):
+        # Production defaults enable tethering, but the diagnostic baseline
+        # must explicitly be the previous equation, as in the CLI loader.
+        for module in self.wrapper.model_depth.modules():
+            if isinstance(module, diagnostic.original.ScalePropagation):
+                module.propagation_anchor_strength = 0.
+        self.args.seeds = [42]
+        self.args.anchor_strengths = [2.]
+        self.args.n_propagation_iterations = [1] * 5
+        rows = []
+        before = {k: v.clone() for k, v in self.wrapper.model_depth.state_dict().items()}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            anchors.diagnose_anchor_sample(
+                self.wrapper, self.image, self.sparse, self.target, self.args, 0,
+                directory, lambda kind, **values: rows.append(dict(type=kind, **values)),
+                save_maps=True)
+            anchors.write_anchor_summary(directory, rows)
+            summary = json.loads((directory / 'anchor_summary.json').read_text())
+            self.assertEqual(len(summary['policies']), 5)
+            self.assertEqual(len(summary['comparisons']), 4)
+            self.assertTrue((directory / 'anchor_sample_0_seed_42.npz').exists())
+        self.assertEqual(sum(r['type'] == 'anchor_local_replay' for r in rows), 15)
+        self.assertEqual(next(r['max_depth_difference_m'] for r in rows if r['type'] == 'anchor_replay'), 0)
+        for key, value in self.wrapper.model_depth.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+        self.assertTrue(all(len(m._forward_hooks) == 0 for m in self.wrapper.model_depth.modules()))
+
     def test_cli_produces_shareable_zip_from_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -206,6 +280,15 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertIn('hierarchy/hierarchy_summary.json', bundle.namelist())
                 rows = [json.loads(line) for line in bundle.read('hierarchy/diagnostics.jsonl').splitlines()]
                 self.assertEqual(sum(r['type'] == 'hierarchy_result' for r in rows), 16)
+            arguments[arguments.index('--output') + 1] = str(root / 'anchors')
+            arguments[arguments.index('--suite') + 1] = 'anchors'
+            arguments += ['--anchor_strengths', '2']
+            with patch.object(sys, 'argv', arguments):
+                diagnostic.main()
+            with zipfile.ZipFile(root / 'anchors.zip') as bundle:
+                self.assertIn('anchors/anchor_summary.json', bundle.namelist())
+                rows = [json.loads(line) for line in bundle.read('anchors/diagnostics.jsonl').splitlines()]
+                self.assertEqual(sum(r['type'] == 'anchor_result' for r in rows), 10)
 
 
 if __name__ == '__main__':

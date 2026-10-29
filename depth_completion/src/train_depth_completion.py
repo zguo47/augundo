@@ -111,6 +111,9 @@ parser.add_argument('--n_propagation_iterations',
 parser.add_argument('--n_scale_refinement',
     type=int, default=2,
     help='Number of weight-shared scale refinement passes at every level; 0 disables refinement')
+parser.add_argument('--propagation_anchor_strength',
+    type=float, default=2.0,
+    help='Soft accepted-anchor weight at every propagation iteration; 0 restores the old update')
 parser.add_argument('--rejection_keep_tolerance',
     nargs=2, type=float, default=[0.1, 0.02], metavar=('METERS', 'FRACTION'),
     help='Label keep when error <= max(METERS, FRACTION * GT)')
@@ -351,5 +354,6 @@ if __name__ == '__main__':
           rejection_keep_weight=args.rejection_keep_weight,
           n_propagation_iterations=args.n_propagation_iterations,
           n_scale_refinement=args.n_scale_refinement,
+          propagation_anchor_strength=args.propagation_anchor_strength,
           rejection_keep_tolerance=args.rejection_keep_tolerance,
           rejection_reject_tolerance=args.rejection_reject_tolerance)

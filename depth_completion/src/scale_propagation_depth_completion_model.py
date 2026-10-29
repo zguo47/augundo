@@ -19,6 +19,7 @@ class ScalePropagationDepthCompletionModel(object):
                  detach_scaleless_depth=True,
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  n_scale_refinement=2,
+                 propagation_anchor_strength=2.0,
                  encoder_type='conv',
                  use_sparse_depth_features=False):
         del dataset_name, network_modules
@@ -30,6 +31,7 @@ class ScalePropagationDepthCompletionModel(object):
             detach_scaleless_depth=detach_scaleless_depth,
             n_propagation_iterations=n_propagation_iterations,
             n_scale_refinement=n_scale_refinement,
+            propagation_anchor_strength=propagation_anchor_strength,
             encoder_type=encoder_type,
             use_sparse_depth_features=use_sparse_depth_features)
 

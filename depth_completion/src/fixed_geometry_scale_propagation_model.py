@@ -176,6 +176,7 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
                  detach_scaleless_depth=True,
                  use_outlier_rejection=False,
                  n_scale_refinement=1,
+                 propagation_anchor_strength=2.0,
                  use_sparse_depth_features=False):
         if training_stage != 'joint' or propagation_mode != 'hierarchical':
             raise ValueError('This replacement uses joint hierarchical training; '
@@ -187,6 +188,7 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
             detach_scaleless_depth=detach_scaleless_depth,
             use_outlier_rejection=use_outlier_rejection,
             n_scale_refinement=n_scale_refinement,
+            propagation_anchor_strength=propagation_anchor_strength,
             use_sparse_depth_features=use_sparse_depth_features)
         self.training_stage = training_stage
         self.fixed_geometry = False
@@ -208,3 +210,4 @@ class FixedGeometryScalePropagationDepthModel(ScalePropagationDepthModel):
             state.update(original.state_dict())
             block.load_state_dict(state)
             self.decoder[index] = block
+            block.scale_propagation.propagation_anchor_strength = propagation_anchor_strength

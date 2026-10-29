@@ -225,7 +225,9 @@ def propagate_scale(
         sparse_scale,
         keep_mask,
         propagation_logits,
-        n_propagation_iterations=1):
+        n_propagation_iterations=1,
+        propagation_anchor_strength=0.0,
+        anchor_mask=None):
     '''Inject accepted scale estimates once, then relay the persistent scale map.
 
     Arg(s):
@@ -240,6 +242,10 @@ def propagate_scale(
             B x 9 x H x W outgoing weights, indexed at the source pixel
         n_propagation_iterations : int
             number of neighboring exchanges at this resolution
+        propagation_anchor_strength : float
+            finite weight of persistent accepted measurements; zero is the old update
+        anchor_mask : torch.Tensor or None
+            diagnostic-only subset of accepted anchors; None uses keep_mask
     Returns:
             torch.Tensor[float32] : B x 1 x H x W refined scale map
 
@@ -251,6 +257,10 @@ def propagate_scale(
     # Inject only once, without restoring anchors inside or after the loop.
     scale = keep_mask * sparse_scale + (1.0 - keep_mask) * scale
     outgoing_weights = torch.sigmoid(propagation_logits)
+    # Soft source evidence competes with the current and incoming predictions.
+    # This is not an overwrite: gradients still pass through those predictions.
+    anchor_weight = propagation_anchor_strength * (
+        keep_mask if anchor_mask is None else keep_mask * anchor_mask)
 
     # Each column of fold is one source pixel's 3 x 3 outgoing message patch.
     # Overlapping patches sum at their destinations. 
@@ -268,22 +278,25 @@ def propagate_scale(
 
         # Average the current scale with incoming scales. The denominator
         # depends on propagation weights.
-        scale = (scale + incoming_scale) / (1.0 + incoming_weight)
+        scale = (scale + incoming_scale + anchor_weight * sparse_scale) / (
+            1.0 + incoming_weight + anchor_weight)
     return scale
 
 
 class ScalePropagation(nn.Module):
     '''Expose propagation as a module so optional debug hooks see its inputs.'''
 
-    def __init__(self, n_propagation_iterations):
+    def __init__(self, n_propagation_iterations, propagation_anchor_strength=0.0):
         super(ScalePropagation, self).__init__()
         self.n_propagation_iterations = n_propagation_iterations
+        self.propagation_anchor_strength = propagation_anchor_strength
 
     def forward(
             self, scale, scaleless_depth, sparse_depth, keep_mask, logits,
             sparse_scale):
         return propagate_scale(
-            scale, sparse_scale, keep_mask, logits, self.n_propagation_iterations)
+            scale, sparse_scale, keep_mask, logits, self.n_propagation_iterations,
+            self.propagation_anchor_strength)
 
 
 def normalize_scaleless_depth(depth):
@@ -496,6 +509,7 @@ class ScalePropagationDepthModel(nn.Module):
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  detach_scaleless_depth=True,
                  n_scale_refinement=1,
+                 propagation_anchor_strength=2.0,
                  encoder_type='conv',
                  use_sparse_depth_features=False):
         super(ScalePropagationDepthModel, self).__init__()
@@ -552,6 +566,9 @@ class ScalePropagationDepthModel(nn.Module):
                 use_sparse_depth_features=use_sparse_depth_features)
             for n_iteration in n_propagation_iterations[1:]
         ])
+        for module in self.modules():
+            if isinstance(module, ScalePropagation):
+                module.propagation_anchor_strength = propagation_anchor_strength
 
     def forward(self, image, sparse_depth, return_all_outputs=False,
                 return_rejection_outputs=False):

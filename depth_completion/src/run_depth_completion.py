@@ -67,6 +67,8 @@ parser.add_argument('--use_sparse_depth_features',
     help='Match the scale checkpoint: raw sparse depth in encoder input and decoder fusion')
 parser.add_argument('--use_outlier_rejection',
     type=parse_boolean, default=True, help='Whether to reject sparse depth outliers')
+parser.add_argument('--propagation_anchor_strength', type=float, default=2.0,
+    help='Soft accepted-anchor weight per iteration; 0 restores the old update')
 parser.add_argument('--n_scale_refinement',
     type=int, default=1,
     help='Number of weight-shared scale refinement passes at every level; match training, 0 disables refinement')
@@ -139,4 +141,5 @@ if __name__ == '__main__':
         geometry_restore_path=args.geometry_restore_path,
         n_propagation_iterations=args.n_propagation_iterations,
         use_sparse_depth_features=args.use_sparse_depth_features,
-        n_scale_refinement=args.n_scale_refinement)
+        n_scale_refinement=args.n_scale_refinement,
+        propagation_anchor_strength=args.propagation_anchor_strength)

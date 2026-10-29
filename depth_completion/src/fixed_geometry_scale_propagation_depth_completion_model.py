@@ -25,6 +25,7 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
                  detach_scaleless_depth=True,
                  use_outlier_rejection=False,
                  n_scale_refinement=1,
+                 propagation_anchor_strength=2.0,
                  use_sparse_depth_features=False):
         del dataset_name, network_modules
         if geometry_restore_path:
@@ -40,6 +41,7 @@ class FixedGeometryScalePropagationDepthCompletionModel(ScalePropagationDepthCom
             detach_scaleless_depth=detach_scaleless_depth,
             use_outlier_rejection=use_outlier_rejection,
             n_scale_refinement=n_scale_refinement,
+            propagation_anchor_strength=propagation_anchor_strength,
             use_sparse_depth_features=use_sparse_depth_features)
         self.min_predict_depth = min_predict_depth
         self.max_predict_depth = max_predict_depth

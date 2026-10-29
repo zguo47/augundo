@@ -33,6 +33,7 @@ class DepthCompletionModel(object):
                  detach_scaleless_depth=True,
                  n_propagation_iterations=(2, 4, 6, 8, 12),
                  n_scale_refinement=2,
+                 propagation_anchor_strength=2.0,
                  encoder_type='conv',
                  use_sparse_depth_features=False,
                  fixed_geometry_stage='joint',
@@ -77,6 +78,7 @@ class DepthCompletionModel(object):
                 detach_scaleless_depth=detach_scaleless_depth,
                 use_outlier_rejection=use_outlier_rejection,
                 n_scale_refinement=n_scale_refinement,
+                propagation_anchor_strength=propagation_anchor_strength,
                 use_sparse_depth_features=use_sparse_depth_features)
         elif 'scale_propagation' in model_name:
             from scale_propagation_depth_completion_model import \
@@ -92,6 +94,7 @@ class DepthCompletionModel(object):
                 detach_scaleless_depth=detach_scaleless_depth,
                 n_propagation_iterations=n_propagation_iterations,
                 n_scale_refinement=n_scale_refinement,
+                propagation_anchor_strength=propagation_anchor_strength,
                 encoder_type=encoder_type,
                 use_sparse_depth_features=use_sparse_depth_features)
         elif 'partition_attention_patch_token_ablation' in model_name:
