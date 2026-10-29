@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import diagnose_scale_propagation as diagnostic
 import diagnose_hierarchical_rejection as hierarchy
 import diagnose_anchor_retention as anchors
+import diagnose_propagation_separation as separation
 
 
 class DiagnosisTest(unittest.TestCase):
@@ -205,6 +206,47 @@ class DiagnosisTest(unittest.TestCase):
             scale, ratio, keep, logits, 6, 2., torch.zeros_like(keep))
         torch.testing.assert_close(old, masked, rtol=0, atol=0)
 
+    def test_separation_geometry_preserves_incoming_depth_and_corrects_transfer(self):
+        # A correct source at 10m sends to a 30m destination. Predicted Z says
+        # both have equal geometry: ordinary scale sharing damages the target.
+        scale = torch.tensor([[[[10., 30.]]]])
+        geometry = torch.ones_like(scale)
+        sparse = torch.tensor([[[[10., 0.]]]])
+        keep = (sparse > 0).float()
+        logits = torch.full((1, 9, 1, 2), -100.)
+        logits[0, 5, 0, 0] = 100.  # Left source sends right.
+        inputs = (scale, geometry, sparse, keep, logits, sparse)
+        expected = diagnostic.original.propagate_scale(scale, sparse, keep, logits, 1, 2.)
+        baseline, _ = separation.intervene(inputs, scale, 1, 2., {})
+        torch.testing.assert_close(baseline, expected)
+        self.assertAlmostEqual(float(baseline[0, 0, 0, 1]), 20.)
+        for policy in [dict(geometry=True), dict(connections=True)]:
+            corrected, coverage = separation.intervene(inputs, scale, 1, 2., policy)
+            torch.testing.assert_close(corrected, scale)
+            self.assertEqual(coverage['jump_edges'], 2)
+        # G alone does not improve a pre-existing prediction without exchange:
+        # with no accepted anchors, zero iterations preserves it exactly.
+        wrong = scale * .5
+        inputs = (wrong, geometry, sparse, keep * 0, logits, sparse)
+        unchanged, _ = separation.intervene(inputs, scale, 0, 2., dict(geometry=True))
+        torch.testing.assert_close(unchanged, wrong)
+
+    def test_separation_measurements_and_unknown_edges(self):
+        scale = torch.tensor([[[[10., 30.]]]])
+        sparse = torch.tensor([[[[20., 40.]]]])
+        target = torch.tensor([[[[10., 0.]]]])
+        geometry = torch.ones_like(scale)
+        keep = torch.ones_like(scale)
+        logits = torch.zeros(1, 9, 1, 2)
+        inputs = (scale, geometry, sparse, keep, logits, sparse)
+        corrected, coverage = separation.intervene(inputs, target, 0, 2., dict(measurements=True))
+        torch.testing.assert_close(corrected, torch.tensor([[[[10., 40.]]]]))
+        self.assertEqual(coverage['accepted_known_bad'], 1)
+        self.assertEqual(coverage['known_offcenter_edges'], 0)
+        blocked, _ = separation.intervene(inputs, target, 2, 2., dict(connections=True))
+        plain, _ = separation.intervene(inputs, target, 2, 2., {})
+        torch.testing.assert_close(blocked, plain)
+
     def test_anchor_strength_reaches_every_level_without_new_parameters(self):
         for wrapper_class in (diagnostic.ScalePropagationDepthCompletionModel,
                               diagnostic.FixedGeometryScalePropagationDepthCompletionModel):
@@ -289,6 +331,16 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertIn('anchors/anchor_summary.json', bundle.namelist())
                 rows = [json.loads(line) for line in bundle.read('anchors/diagnostics.jsonl').splitlines()]
                 self.assertEqual(sum(r['type'] == 'anchor_result' for r in rows), 10)
+            arguments[arguments.index('--output') + 1] = str(root / 'separation')
+            arguments[arguments.index('--suite') + 1] = 'separation'
+            with patch.object(sys, 'argv', arguments):
+                diagnostic.main()
+            with zipfile.ZipFile(root / 'separation.zip') as bundle:
+                self.assertIn('separation/separation_summary.json', bundle.namelist())
+                rows = [json.loads(line) for line in bundle.read('separation/diagnostics.jsonl').splitlines()]
+                self.assertEqual(sum(r['type'] == 'separation_result' for r in rows), 18)
+                baseline = next(r for r in rows if r['type'] == 'separation_replay')
+                self.assertEqual(baseline['native_anchor_strength'], 2.)
 
 
 if __name__ == '__main__':

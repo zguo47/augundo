@@ -165,6 +165,11 @@ class Probe:
     def propagation(self, module, inputs, output, level):
         scale, geometry, sparse, keep, logits, ratio = inputs
         chosen = self.intervention
+        if chosen.get('kind') == 'separation' and level == 0:
+            from diagnose_propagation_separation import intervene
+            output, self.separation_details = intervene(
+                inputs, self.target, module.n_propagation_iterations,
+                module.propagation_anchor_strength, chosen)
         if chosen.get('kind') == 'soft_anchor' and level in chosen['levels']:
             anchor_mask = None
             if chosen.get('good_only'):
@@ -446,7 +451,9 @@ def parser():
     result.add_argument('--ground_truths', required=True)
     result.add_argument('--model', choices=['original', 'adaptation'], default='adaptation')
     result.add_argument('--indices', nargs='+', type=int, default=None)
-    result.add_argument('--suite', choices=['isolated', 'hierarchy', 'anchors'], default='isolated')
+    result.add_argument('--suite', choices=['isolated', 'hierarchy', 'anchors', 'separation'], default='isolated')
+    result.add_argument('--propagation_anchor_strength', type=float, default=2.0,
+                        help='Native baseline strength for separation suite; match checkpoint training')
     result.add_argument('--anchor_strengths', nargs='+', type=float, default=[1.0, 2.0, 4.0],
                         help='Persistent source weights for paired anchor tests; not trained parameters')
     result.add_argument('--sample_count', type=int, default=None,
@@ -571,7 +578,7 @@ def main():
         detach_scaleless_depth=args.detach_scaleless_depth, use_outlier_rejection=True,
         n_propagation_iterations=args.n_propagation_iterations,
         n_scale_refinement=args.n_scale_refinement, use_sparse_depth_features=args.use_sparse_depth_features,
-        propagation_anchor_strength=0.0)
+        propagation_anchor_strength=args.propagation_anchor_strength if args.suite == 'separation' else 0.0)
     step, _ = wrapper.restore_model(args.checkpoint)
     wrapper.eval()
     source_files = [Path(__file__), Path(original.__file__), Path(revised.__file__),
@@ -585,6 +592,10 @@ def main():
         import diagnose_anchor_retention as anchors
         import diagnose_hierarchical_rejection as hierarchy
         source_files.extend([Path(anchors.__file__), Path(hierarchy.__file__)])
+    if args.suite == 'separation':
+        import diagnose_propagation_separation as separation
+        import diagnose_hierarchical_rejection as hierarchy
+        source_files.extend([Path(separation.__file__), Path(hierarchy.__file__)])
     provenance = dict(arguments=vars(args), checkpoint_step=step, checkpoint_sha256=digest(args.checkpoint),
                       torch_version=torch.__version__, cuda_version=torch.version.cuda,
                       python_version=sys.version,
@@ -622,7 +633,12 @@ def main():
             target = torch.from_numpy(data_utils.load_depth(paths[2][index], data_format='CHW')).unsqueeze(0)
             if image.shape[-2:] != target.shape[-2:] or sparse.shape != target.shape:
                 raise ValueError('Image/sparse/GT are not spatially aligned for sample {}'.format(index))
-            if args.suite == 'anchors':
+            if args.suite == 'separation':
+                separation.diagnose_sample(
+                    wrapper, image, sparse, target, args, index, directory, emit,
+                    save_maps=sample_order < args.hierarchy_map_samples)
+                separation.write_summary(directory, records)
+            elif args.suite == 'anchors':
                 anchors.diagnose_anchor_sample(
                     wrapper, image, sparse, target, args, index, directory, emit,
                     save_maps=sample_order < args.hierarchy_map_samples)
