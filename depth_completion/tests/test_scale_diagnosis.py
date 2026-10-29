@@ -13,6 +13,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import diagnose_scale_propagation as diagnostic
+import diagnose_hierarchical_rejection as hierarchy
 
 
 class DiagnosisTest(unittest.TestCase):
@@ -113,6 +114,64 @@ class DiagnosisTest(unittest.TestCase):
         for key, value in self.wrapper.model_depth.state_dict().items():
             torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
+    def test_hierarchy_oracle_restores_good_and_preserves_r0(self):
+        # Good, bad, unknown available, missing; all initially rejected.
+        sparse = torch.tensor([[[[2., 9., 3., 0.]]]])
+        labels = torch.tensor([[[[0, 1, -1, -1]]]])
+        selected = {r: sparse.clone() for r in range(5)}
+        classified = {r: labels.clone() for r in range(5)}
+        learned = {r: torch.zeros_like(sparse) for r in range(5)}
+        masks = hierarchy.policy_masks(learned, selected, classified)
+        for name in hierarchy.POLICIES:
+            if name != 'A_keep_all':
+                torch.testing.assert_close(masks[name][0], learned[0])
+        for r in range(1, 5):
+            torch.testing.assert_close(masks['E_oracle_hierarchy'][r], torch.tensor([[[[1., 0., 1., 0.]]]]))
+            for level in range(1, 5):
+                expected = torch.tensor([[[[1., 0., 1., 0.]]]]) if level == r else (sparse > 0).float()
+                torch.testing.assert_close(masks['D_oracle_r{}'.format(r)][level], expected)
+        self.assertEqual(float(learned[1].sum()), 0)  # Policy construction never mutates baseline.
+
+    def test_hierarchy_paired_run_and_summary(self):
+        self.args.seeds = [42, 43]
+        rows = []
+        before = {k: v.clone() for k, v in self.wrapper.model_depth.state_dict().items()}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            hierarchy.diagnose_hierarchy_sample(self.wrapper, self.image, self.sparse, self.target,
+                self.args, 0, directory, lambda kind, **values: rows.append(dict(type=kind, **values)), save_maps=True)
+            hierarchy.write_hierarchy_summary(directory, rows, 1)
+            self.assertTrue((directory / 'hierarchy_sample_0_seed_42.npz').exists())
+            self.assertFalse((directory / 'hierarchy_sample_0_seed_43.npz').exists())
+            summary = json.loads((directory / 'hierarchy_summary.json').read_text())
+            self.assertEqual(len(summary['policies']), 8)
+            self.assertTrue(all(c['n_images'] == 1 for c in summary['comparisons']))
+            self.assertTrue(all('image_bootstrap_95pct_m' not in c for c in summary['comparisons']))
+        policies = [r for r in rows if r['type'] == 'hierarchy_result']
+        self.assertEqual(len(policies), 16)
+        for seed in self.args.seeds:
+            group = [r for r in policies if r['seed'] == seed]
+            r0 = next(r['rejection']['r0'] for r in group if r['policy'] == 'C_learned')
+            for row in group:
+                if row['policy'] != 'A_keep_all':
+                    self.assertEqual(row['rejection']['r0'], r0)
+                self.assertAlmostEqual(row['delta_sse_vs_B'], row['sse_added_vs_B'] - row['sse_removed_vs_B'], places=6)
+                if row['policy'] == 'B_r0_only':
+                    self.assertEqual(row['delta_sse_vs_B'], 0)
+        for key, value in self.wrapper.model_depth.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+        self.assertTrue(all(len(m._forward_hooks) == 0 for m in self.wrapper.model_depth.modules()))
+
+    def test_paired_intervals_cluster_images_not_seeds(self):
+        rows = [dict(sample=sample, seed=seed, policy=policy,
+                     metrics={'rmse_m': value})
+                for sample in (0, 1) for seed in (42, 43, 44)
+                for policy, value in [('B_r0_only', 2.), ('E_oracle_hierarchy', 1.)]]
+        result = hierarchy.paired_comparison(rows, 'E_oracle_hierarchy', 'B_r0_only')
+        self.assertEqual(result['n_images'], 2)
+        self.assertEqual(result['mean_image_rmse_delta_m'], -1)
+        self.assertEqual(result['image_bootstrap_95pct_m'], [-1., -1.])
+
     def test_cli_produces_shareable_zip_from_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -139,6 +198,14 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertEqual(provenance['checkpoint_step'], 123)
                 rows = [json.loads(line) for line in bundle.read('result/diagnostics.jsonl').splitlines()]
                 self.assertTrue(any(row['type'] == 'input_audit' for row in rows))
+            arguments[arguments.index('--output') + 1] = str(root / 'hierarchy')
+            arguments += ['--suite', 'hierarchy', '--seeds', '42', '43', '--hierarchy_map_samples', '0']
+            with patch.object(sys, 'argv', arguments):
+                diagnostic.main()
+            with zipfile.ZipFile(root / 'hierarchy.zip') as bundle:
+                self.assertIn('hierarchy/hierarchy_summary.json', bundle.namelist())
+                rows = [json.loads(line) for line in bundle.read('hierarchy/diagnostics.jsonl').splitlines()]
+                self.assertEqual(sum(r['type'] == 'hierarchy_result' for r in rows), 16)
 
 
 if __name__ == '__main__':

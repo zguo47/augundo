@@ -437,7 +437,14 @@ def parser():
     result.add_argument('--sparse_depths', required=True)
     result.add_argument('--ground_truths', required=True)
     result.add_argument('--model', choices=['original', 'adaptation'], default='adaptation')
-    result.add_argument('--indices', nargs='+', type=int, default=[0, 499, 999])
+    result.add_argument('--indices', nargs='+', type=int, default=None)
+    result.add_argument('--suite', choices=['isolated', 'hierarchy'], default='isolated')
+    result.add_argument('--sample_count', type=int, default=None,
+                        help='Uniformly spaced dataset indices; 0 means all. Explicit --indices takes precedence.')
+    result.add_argument('--seeds', nargs='+', type=int, default=None,
+                        help='Paired hierarchy repetitions; defaults to --seed.')
+    result.add_argument('--hierarchy_map_samples', type=int, default=3,
+                        help='Save policy maps for the first N selected images, first seed only.')
     result.add_argument('--points_per_group', type=int, default=2)
     result.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
     result.add_argument('--seed', type=int, default=42)
@@ -533,6 +540,18 @@ def main():
     paths = [data_utils.read_paths(path) for path in (args.images, args.sparse_depths, args.ground_truths)]
     if len({len(values) for values in paths}) != 1:
         raise ValueError('Image/sparse/GT lists have unequal lengths.')
+    if (args.sample_count is not None and args.sample_count < 0) or args.hierarchy_map_samples < 0:
+        raise ValueError('Sample/map counts must be nonnegative.')
+    if args.indices is None:
+        if args.sample_count is None:
+            args.indices = [0, 499, 999]
+        else:
+            count = len(paths[0]) if args.sample_count == 0 else min(args.sample_count, len(paths[0]))
+            args.indices = np.linspace(0, len(paths[0]) - 1, count, dtype=int).tolist()
+    args.indices = list(dict.fromkeys(args.indices))
+    args.seeds = list(dict.fromkeys(args.seeds if args.seeds is not None else [args.seed]))
+    if not args.indices:
+        raise ValueError('The selected dataset is empty.')
     if not all(0 <= index < len(paths[0]) for index in args.indices):
         raise ValueError('Sample indices outside dataset; choose --indices explicitly.')
     wrapper_class = FixedGeometryScalePropagationDepthCompletionModel if args.model == 'adaptation' else ScalePropagationDepthCompletionModel
@@ -548,6 +567,9 @@ def main():
                     Path(loss_utils.__file__), Path(sys.modules[ScalePropagationDepthCompletionModel.__module__].__file__),
                     Path(sys.modules[FixedGeometryScalePropagationDepthCompletionModel.__module__].__file__),
                     Path(sys.modules[original.Conv2d.__module__].__file__), Path(data_utils.__file__)]
+    if args.suite == 'hierarchy':
+        import diagnose_hierarchical_rejection as hierarchy
+        source_files.append(Path(hierarchy.__file__))
     provenance = dict(arguments=vars(args), checkpoint_step=step, checkpoint_sha256=digest(args.checkpoint),
                       torch_version=torch.__version__, cuda_version=torch.version.cuda,
                       python_version=sys.version,
@@ -579,14 +601,20 @@ def main():
             stream.write(json.dumps(clean(row)) + '\n')
             stream.flush()
             records.append(row)
-        for index in args.indices:
+        for sample_order, index in enumerate(args.indices):
             image = torch.from_numpy(data_utils.load_image(paths[0][index], normalize=True, data_format='CHW')).unsqueeze(0).to(wrapper.device)
             sparse = torch.from_numpy(data_utils.load_depth(paths[1][index], data_format='CHW')).unsqueeze(0).to(wrapper.device)
             target = torch.from_numpy(data_utils.load_depth(paths[2][index], data_format='CHW')).unsqueeze(0)
             if image.shape[-2:] != target.shape[-2:] or sparse.shape != target.shape:
                 raise ValueError('Image/sparse/GT are not spatially aligned for sample {}'.format(index))
-            diagnose_sample(wrapper, image, sparse, target, args, index, directory, emit)
-            write_summary(directory, records, time.time() - started)
+            if args.suite == 'hierarchy':
+                hierarchy.diagnose_hierarchy_sample(
+                    wrapper, image, sparse, target, args, index, directory, emit,
+                    save_maps=sample_order < args.hierarchy_map_samples)
+                hierarchy.write_hierarchy_summary(directory, records, time.time() - started)
+            else:
+                diagnose_sample(wrapper, image, sparse, target, args, index, directory, emit)
+                write_summary(directory, records, time.time() - started)
     archive = directory.with_suffix('.zip') if directory.suffix else Path(str(directory) + '.zip')
     with zipfile.ZipFile(str(archive), 'x', compression=zipfile.ZIP_DEFLATED) as bundle:
         for path in sorted(directory.rglob('*')):

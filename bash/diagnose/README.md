@@ -1,5 +1,10 @@
 # Isolated scale-propagation diagnosis
 
+For the A--E comparison of no rejection, r0-only, learned hierarchy, and
+GT-guided hierarchy, see [HIERARCHY.md](HIERARCHY.md) and the new
+`hierarchy_kitti.sh` / `hierarchy_void.sh` scripts. The original suite below
+remains the default.
+
 Run from an existing checkpoint, with no training or model changes. Defaults
 match the recent KITTI joint adaptation + post-refinement experiment. Match
 the encoder, model family, iterations, refinement count, input-feature flag,
