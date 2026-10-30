@@ -247,6 +247,83 @@ class DiagnosisTest(unittest.TestCase):
         plain, _ = separation.intervene(inputs, target, 2, 2., {})
         torch.testing.assert_close(blocked, plain)
 
+    def test_separation_geometry_null_controls_and_source_scope(self):
+        scale = torch.tensor([[[[10., 30., 40.]]]])
+        geometry = torch.ones_like(scale)
+        sparse = torch.tensor([[[[10., 0., 0.]]]])
+        keep = (sparse > 0).float()
+        logits = torch.zeros(1, 9, 1, 3)
+        inputs = (scale, geometry, sparse, keep, logits, sparse)
+        for key in ('no_mixing', 'bypass'):
+            plain, _ = separation.intervene(inputs, scale, 3, 2., {key: True})
+            oracle, _ = separation.intervene(inputs, scale, 3, 2., {key: True, 'geometry': True})
+            torch.testing.assert_close(plain, oracle)
+        _, source = separation.intervene(inputs, scale, 2, 2., dict(geometry=True, geometry_scope='anchor'))
+        _, other = separation.intervene(inputs, scale, 2, 2., dict(geometry=True, geometry_scope='nonanchor'))
+        self.assertEqual(source['geometry_changed_pixels'], 1)
+        self.assertEqual(other['geometry_changed_pixels'], 2)
+
+    def test_separation_exact_anchors_and_matched_graph(self):
+        scale = torch.tensor([[[[2., 4., 8.]]]])
+        geometry = torch.ones_like(scale)
+        sparse = torch.tensor([[[[9., 0., 0.]]]])
+        keep = (sparse > 0).float()
+        logits = torch.zeros(1, 9, 1, 3)
+        inputs = (scale, geometry, sparse, keep, logits, sparse)
+        exact, _ = separation.intervene(inputs, scale, 3, 2., dict(exact_anchor=True))
+        corrected, _ = separation.intervene(inputs, scale, 3, 2., dict(exact_anchor=True, measurements=True))
+        self.assertEqual(float(exact[0, 0, 0, 0]), 9.)
+        self.assertEqual(float(corrected[0, 0, 0, 0]), 2.)
+        target = torch.tensor([[[[2., 0., 8.]]]])
+        # No two observed pixels touch: matched graph has only self messages.
+        for name in ('matched', 'matched_G', 'matched_C', 'matched_GC'):
+            value, coverage = separation.intervene(inputs, target, 3, 2., separation.policies(True)[name])
+            torch.testing.assert_close(value, torch.tensor([[[[9., 4., 8.]]]]))
+            self.assertEqual(coverage['observable_graph_pixels'], 0)
+
+    def test_separation_coarse_gt_does_not_average_or_confuse_measurements(self):
+        target = torch.tensor([[[[1., 2., 0., 4., 5.], [6., 7., 0., 9., 10.],
+                                [11., 12., 0., 14., 15.]]]])
+        sparse = torch.zeros_like(target)
+        sparse[0, 0, 1, 1] = 7.
+        grid, anchors_gt = separation.targets_at_level(target, sparse, (2, 3))
+        torch.testing.assert_close(grid, torch.tensor([[[[1., 0., 5.], [11., 0., 15.]]]]))
+        selected, indices = diagnostic.original.sparse_depth_at_resolution(sparse, (2, 3), True)
+        expected = target.flatten(2).gather(2, indices.flatten(2)).reshape_as(grid)
+        torch.testing.assert_close(anchors_gt, expected)
+        torch.testing.assert_close(anchors_gt[selected > 0], selected[selected > 0])
+
+    def test_extended_separation_all_levels_and_no_training_mutation(self):
+        self.args.seeds = [42]
+        self.args.n_propagation_iterations = [1] * 5
+        self.args.separation_levels = [0, 1, 2, 3, 4]
+        self.args.separation_protocol = 'extended'
+        rows = []
+        before = {key: value.clone() for key, value in self.wrapper.model_depth.state_dict().items()}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            separation.diagnose_sample(self.wrapper, self.image, self.sparse, self.target,
+                self.args, 0, directory, lambda kind, **values: rows.append(dict(type=kind, **values)), True)
+            separation.write_summary(directory, rows)
+            summary = json.loads((directory / 'separation_summary.json').read_text())
+            self.assertEqual(set(summary['levels']), {'r0', 'r1', 'r2', 'r3', 'r4'})
+            self.assertEqual(len(summary['policies']), 20)
+            self.assertEqual(len(summary['null_controls']), 10)
+            for level in summary['levels'].values():
+                self.assertIn('matched_local', level['comparisons'])
+                self.assertEqual(level['policies']['baseline']['metrics'], summary['policies']['baseline']['metrics'])
+            saved = np.load(str(directory / 'separation_sample_0_seed_42.npz'))
+            self.assertIn('r4_anchor_gt', saved.files)
+            self.assertIn('r0_G_bypass_final', saved.files)
+        self.assertEqual(sum(r['type'] == 'separation_result' for r in rows), 100)
+        for row in rows:
+            if row['type'] == 'separation_null_control':
+                self.assertLess(row['local_max_difference_m'], 1e-4)
+                self.assertLess(row['final_max_difference_m'], 1e-4)
+        for key, value in self.wrapper.model_depth.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+        self.assertTrue(all(len(m._forward_hooks) == 0 for m in self.wrapper.model_depth.modules()))
+
     def test_anchor_strength_reaches_every_level_without_new_parameters(self):
         for wrapper_class in (diagnostic.ScalePropagationDepthCompletionModel,
                               diagnostic.FixedGeometryScalePropagationDepthCompletionModel):
@@ -333,6 +410,7 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertEqual(sum(r['type'] == 'anchor_result' for r in rows), 10)
             arguments[arguments.index('--output') + 1] = str(root / 'separation')
             arguments[arguments.index('--suite') + 1] = 'separation'
+            arguments += ['--separation_protocol', 'original']
             with patch.object(sys, 'argv', arguments):
                 diagnostic.main()
             with zipfile.ZipFile(root / 'separation.zip') as bundle:
@@ -341,6 +419,18 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertEqual(sum(r['type'] == 'separation_result' for r in rows), 18)
                 baseline = next(r for r in rows if r['type'] == 'separation_replay')
                 self.assertEqual(baseline['native_anchor_strength'], 2.)
+            arguments[arguments.index('--output') + 1] = str(root / 'extended')
+            arguments[arguments.index('--separation_protocol') + 1] = 'extended'
+            arguments += ['--separation_levels', '0', '4', '--seeds', '42']
+            with patch.object(sys, 'argv', arguments):
+                diagnostic.main()
+            with zipfile.ZipFile(root / 'extended.zip') as bundle:
+                summary = json.loads(bundle.read('extended/separation_summary.json'))
+                self.assertEqual(set(summary['levels']), {'r0', 'r4'})
+                self.assertEqual(len(summary['policies']), 20)
+                provenance = json.loads(bundle.read('extended/provenance.json'))
+                self.assertEqual(provenance['arguments']['separation_levels'], [0, 4])
+                self.assertEqual(len(summary['null_controls']), 4)
 
 
 if __name__ == '__main__':

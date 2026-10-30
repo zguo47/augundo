@@ -165,11 +165,13 @@ class Probe:
     def propagation(self, module, inputs, output, level):
         scale, geometry, sparse, keep, logits, ratio = inputs
         chosen = self.intervention
-        if chosen.get('kind') == 'separation' and level == 0:
-            from diagnose_propagation_separation import intervene
+        if chosen.get('kind') == 'separation' and level == chosen.get('level', 0):
+            from diagnose_propagation_separation import intervene, targets_at_level
+            local_target, anchor_target = targets_at_level(
+                self.target, self.sparse, scale.shape[-2:])
             output, self.separation_details = intervene(
-                inputs, self.target, module.n_propagation_iterations,
-                module.propagation_anchor_strength, chosen)
+                inputs, local_target, module.n_propagation_iterations,
+                module.propagation_anchor_strength, chosen, anchor_target)
         if chosen.get('kind') == 'soft_anchor' and level in chosen['levels']:
             anchor_mask = None
             if chosen.get('good_only'):
@@ -452,6 +454,10 @@ def parser():
     result.add_argument('--model', choices=['original', 'adaptation'], default='adaptation')
     result.add_argument('--indices', nargs='+', type=int, default=None)
     result.add_argument('--suite', choices=['isolated', 'hierarchy', 'anchors', 'separation'], default='isolated')
+    result.add_argument('--separation_protocol', choices=['original', 'extended'], default='extended',
+                        help='Extended controls distinguish geometry, connections and residual dilution')
+    result.add_argument('--separation_levels', nargs='+', type=int, choices=range(5), default=[0],
+                        help='Intervene at ONE of these levels per trial; 0 is full resolution')
     result.add_argument('--propagation_anchor_strength', type=float, default=2.0,
                         help='Native baseline strength for separation suite; match checkpoint training')
     result.add_argument('--anchor_strengths', nargs='+', type=float, default=[1.0, 2.0, 4.0],
@@ -637,7 +643,10 @@ def main():
                 separation.diagnose_sample(
                     wrapper, image, sparse, target, args, index, directory, emit,
                     save_maps=sample_order < args.hierarchy_map_samples)
-                separation.write_summary(directory, records)
+                # JSONL is flushed per trial; avoid repeating hundreds of
+                # image-bootstrap comparisons after every individual image.
+                if (sample_order + 1) % 10 == 0 or sample_order + 1 == len(args.indices):
+                    separation.write_summary(directory, records)
             elif args.suite == 'anchors':
                 anchors.diagnose_anchor_sample(
                     wrapper, image, sparse, target, args, index, directory, emit,

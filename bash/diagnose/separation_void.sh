@@ -7,6 +7,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 "${PYTHON:-python}" depth_completion/src/diagnose_scale_propagation.py \
     --suite separation --checkpoint "$CHECKPOINT" \
+    --separation_protocol extended --separation_levels 0 1 2 3 4 \
     --output "${OUTPUT:-diagnose_outputs/separation_void_$(date +%Y%m%d_%H%M%S)}" \
     --images testing/void/void_test_image_1500.txt \
     --sparse_depths testing/void/void_test_sparse_depth_1500.txt \

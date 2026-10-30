@@ -7,6 +7,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 "${PYTHON:-python}" depth_completion/src/diagnose_scale_propagation.py \
     --suite separation --checkpoint "$CHECKPOINT" \
+    --separation_protocol extended --separation_levels 0 1 2 3 4 \
     --output "${OUTPUT:-diagnose_outputs/separation_kitti_$(date +%Y%m%d_%H%M%S)}" \
     --images validation/kitti/kitti_val_image.txt \
     --sparse_depths validation/kitti/kitti_val_sparse_depth.txt \
