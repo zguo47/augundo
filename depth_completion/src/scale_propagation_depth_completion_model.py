@@ -9,6 +9,8 @@ from utils.src import loss_utils
 class ScalePropagationDepthCompletionModel(object):
     '''Repository wrapper for shared-encoder multi-scale propagation.'''
 
+    accepts_geometry_intrinsics = True
+
     def __init__(self,
                  dataset_name='kitti',
                  network_modules=None,
@@ -125,7 +127,7 @@ class ScalePropagationDepthCompletionModel(object):
         '''Extract aligned maps from the explicit full-resolution output list.'''
         return dict(scaleless_depths=outputs[1:6], scale_maps=outputs[6:11])
 
-    def compute_loss_supervised(self, target_depth, output_depth, w_losses):
+    def compute_loss_supervised(self, target_depth, output_depth, w_losses, intrinsics=None):
         '''Supervise all five geometries and metric products, including bottom.'''
 
         validity = (target_depth > 0.0).to(target_depth.dtype)
@@ -139,6 +141,8 @@ class ScalePropagationDepthCompletionModel(object):
 
         loss_si = target_depth.new_zeros(())
         loss_log_l1 = target_depth.new_zeros(())
+        loss_affine = target_depth.new_zeros(())
+        loss_aligned_l1 = target_depth.new_zeros(())
         loss_info = {}
         for resolution, (geometry, metric) in enumerate(zip(
                 output_depth[1:6], output_depth[11:16])):
@@ -153,12 +157,30 @@ class ScalePropagationDepthCompletionModel(object):
             loss_log_l1 = loss_log_l1 + weight * metric_loss
             loss_info['loss_si_r{}'.format(resolution)] = scale_invariant
             loss_info['loss_log_l1_r{}'.format(resolution)] = metric_loss
+            # Optional geometry experiments use the same five-level weights.
+            # SI can remain active or be disabled with w_si=0 for replacement.
+            if w_losses.get('w_scale_aligned_l1', 0.0) != 0:
+                aligned, alignment = loss_utils.scale_aligned_l1(geometry, target_depth, validity)
+                loss_aligned_l1 = loss_aligned_l1 + weight * aligned
+                loss_info['loss_scale_aligned_l1_r{}'.format(resolution)] = aligned
+                loss_info['geometry_alignment_scale_r{}'.format(resolution)] = alignment.detach().mean()
+            if w_losses.get('w_affine', 0.0) != 0:
+                affine, alignment, shift = loss_utils.affine_invariant_loss(
+                    geometry, target_depth, validity, intrinsics)
+                loss_affine = loss_affine + weight * affine
+                loss_info['loss_affine_r{}'.format(resolution)] = affine
+                loss_info['geometry_affine_scale_r{}'.format(resolution)] = alignment.detach().mean()
+                loss_info['geometry_affine_shift_r{}'.format(resolution)] = shift.detach().mean()
+                loss_info['geometry_affine_valid_r{}'.format(resolution)] = (alignment.detach() > 0).float().mean()
         w_supervised = w_losses.get('w_supervised', 1.0)
         w_si = w_losses.get('w_si', 1.0)
         w_log_l1 = w_losses.get('w_log_l1', 1.0)
         loss_si_weighted = w_supervised * w_si * loss_si
         loss_log_l1_weighted = w_supervised * w_log_l1 * loss_log_l1
         loss = loss_si_weighted + loss_log_l1_weighted
+        loss_affine_weighted = w_supervised * w_losses.get('w_affine', 0.0) * loss_affine
+        loss_aligned_l1_weighted = w_supervised * w_losses.get('w_scale_aligned_l1', 0.0) * loss_aligned_l1
+        loss = loss + loss_affine_weighted + loss_aligned_l1_weighted
 
         loss_info.update({
             'loss': loss,
@@ -167,6 +189,9 @@ class ScalePropagationDepthCompletionModel(object):
             'loss_si_weighted': loss_si_weighted,
             'loss_log_l1_weighted': loss_log_l1_weighted
         })
+        loss_info.update(loss_affine=loss_affine, loss_affine_weighted=loss_affine_weighted,
+                         loss_scale_aligned_l1=loss_aligned_l1,
+                         loss_scale_aligned_l1_weighted=loss_aligned_l1_weighted)
         return loss, loss_info
 
     def parameters(self):

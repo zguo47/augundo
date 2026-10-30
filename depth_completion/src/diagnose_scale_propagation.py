@@ -245,7 +245,9 @@ class Probe:
 
 def objective(wrapper, outputs, probe, target, sparse, args):
     loss, info = wrapper.compute_loss_supervised(target, outputs, {
-        'w_supervised': args.w_supervised, 'w_si': args.w_si, 'w_log_l1': args.w_log_l1})
+        'w_supervised': args.w_supervised, 'w_si': args.w_si, 'w_log_l1': args.w_log_l1,
+        'w_affine': args.w_affine, 'w_scale_aligned_l1': args.w_scale_aligned_l1},
+        intrinsics=getattr(wrapper, 'loss_intrinsics', None))
     if args.rejection_loss != 'none':
         index = 0 if args.rejection_loss == 'l1' else 1
         values = [probe.gates[r][index] for r in range(5)]
@@ -453,7 +455,10 @@ def parser():
     result.add_argument('--ground_truths', required=True)
     result.add_argument('--model', choices=['original', 'adaptation'], default='adaptation')
     result.add_argument('--indices', nargs='+', type=int, default=None)
-    result.add_argument('--suite', choices=['isolated', 'hierarchy', 'anchors', 'separation'], default='isolated')
+    result.add_argument('--suite', choices=['isolated', 'hierarchy', 'anchors', 'separation', 'geometry'], default='isolated')
+    result.add_argument('--intrinsics_path', default=None, help='Camera .npy path list; required for affine loss/geometry suite')
+    result.add_argument('--w_affine', type=float, default=0.0)
+    result.add_argument('--w_scale_aligned_l1', type=float, default=0.0)
     result.add_argument('--separation_protocol', choices=['original', 'extended'], default='extended',
                         help='Extended controls distinguish geometry, connections and residual dilution')
     result.add_argument('--separation_levels', nargs='+', type=int, choices=range(5), default=[0],
@@ -561,6 +566,11 @@ def main():
     torch.backends.cudnn.deterministic = True
     seed_everything(args.seed)
     paths = [data_utils.read_paths(path) for path in (args.images, args.sparse_depths, args.ground_truths)]
+    intrinsic_paths = data_utils.read_paths(args.intrinsics_path) if args.intrinsics_path else None
+    if (args.w_affine != 0 or args.suite == 'geometry') and intrinsic_paths is None:
+        raise ValueError('Provide --intrinsics_path for affine XYZ supervision/diagnosis.')
+    if intrinsic_paths is not None and len(intrinsic_paths) != len(paths[0]):
+        raise ValueError('Intrinsics list length differs from image list.')
     if len({len(values) for values in paths}) != 1:
         raise ValueError('Image/sparse/GT lists have unequal lengths.')
     if (args.sample_count is not None and args.sample_count < 0) or args.hierarchy_map_samples < 0:
@@ -584,13 +594,18 @@ def main():
         detach_scaleless_depth=args.detach_scaleless_depth, use_outlier_rejection=True,
         n_propagation_iterations=args.n_propagation_iterations,
         n_scale_refinement=args.n_scale_refinement, use_sparse_depth_features=args.use_sparse_depth_features,
-        propagation_anchor_strength=args.propagation_anchor_strength if args.suite == 'separation' else 0.0)
+        propagation_anchor_strength=args.propagation_anchor_strength if args.suite in ('separation', 'geometry') else 0.0)
     step, _ = wrapper.restore_model(args.checkpoint)
     wrapper.eval()
     source_files = [Path(__file__), Path(original.__file__), Path(revised.__file__),
                     Path(loss_utils.__file__), Path(sys.modules[ScalePropagationDepthCompletionModel.__module__].__file__),
                     Path(sys.modules[FixedGeometryScalePropagationDepthCompletionModel.__module__].__file__),
                     Path(sys.modules[original.Conv2d.__module__].__file__), Path(data_utils.__file__)]
+    from utils.src import geometry_losses, geometry_alignment
+    source_files.extend([Path(geometry_losses.__file__), Path(geometry_alignment.__file__)])
+    if args.suite == 'geometry':
+        import diagnose_geometry_losses as geometry_diagnosis
+        source_files.append(Path(geometry_diagnosis.__file__))
     if args.suite == 'hierarchy':
         import diagnose_hierarchical_rejection as hierarchy
         source_files.append(Path(hierarchy.__file__))
@@ -613,6 +628,10 @@ def main():
                       selected_file_sha256={values[i]: digest(values[i]) for i in args.indices for values in paths},
                       selected_paths={str(i): [values[i] for values in paths] for i in args.indices})
     (directory / 'provenance.json').write_text(json.dumps(provenance, indent=2))
+    if intrinsic_paths is not None:
+        provenance['intrinsics_list_sha256'] = digest(args.intrinsics_path)
+        provenance['selected_intrinsics_sha256'] = {intrinsic_paths[i]: digest(intrinsic_paths[i]) for i in args.indices}
+        (directory / 'provenance.json').write_text(json.dumps(provenance, indent=2))
     source_dir = directory / 'sources'
     source_dir.mkdir()
     for path in source_files:
@@ -634,12 +653,18 @@ def main():
             stream.flush()
             records.append(row)
         for sample_order, index in enumerate(args.indices):
+            wrapper.loss_intrinsics = torch.from_numpy(np.load(intrinsic_paths[index])).float().unsqueeze(0).to(wrapper.device) \
+                if intrinsic_paths is not None else None
             image = torch.from_numpy(data_utils.load_image(paths[0][index], normalize=True, data_format='CHW')).unsqueeze(0).to(wrapper.device)
             sparse = torch.from_numpy(data_utils.load_depth(paths[1][index], data_format='CHW')).unsqueeze(0).to(wrapper.device)
             target = torch.from_numpy(data_utils.load_depth(paths[2][index], data_format='CHW')).unsqueeze(0)
             if image.shape[-2:] != target.shape[-2:] or sparse.shape != target.shape:
                 raise ValueError('Image/sparse/GT are not spatially aligned for sample {}'.format(index))
-            if args.suite == 'separation':
+            if args.suite == 'geometry':
+                geometry_diagnosis.diagnose_sample(wrapper, image, sparse, target, args, index, directory, emit,
+                    sample_order < args.hierarchy_map_samples)
+                geometry_diagnosis.write_summary(directory, records)
+            elif args.suite == 'separation':
                 separation.diagnose_sample(
                     wrapper, image, sparse, target, args, index, directory, emit,
                     save_maps=sample_order < args.hierarchy_map_samples)

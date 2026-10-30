@@ -283,10 +283,12 @@ class DepthCompletionModel(object):
 
         if supervision_type == 'supervised':
             if hasattr(self.model, 'compute_loss_supervised'):
+                geometry_args = {'intrinsics': intrinsics} if getattr(
+                    self.model, 'accepts_geometry_intrinsics', False) else {}
                 return self.model.compute_loss_supervised(
                     target_depth=ground_truth0,
                     output_depth=output_depth0,
-                    w_losses=w_losses)
+                    w_losses=w_losses, **geometry_args)
             else:
                 return self.model.compute_loss(
                     target_depth=ground_truth0,

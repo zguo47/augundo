@@ -158,6 +158,11 @@ class StageDiagnostics(object):
             self.emit('gradient_objectives', unavailable='SI/metric graph terms not exposed')
             return
         names = ['si', 'metric']
+        for name in ('affine', 'scale_aligned_l1'):
+            term = loss_info.get('loss_{}_weighted'.format(name))
+            if torch.is_tensor(term) and term.requires_grad:
+                names.append(name)
+                terms.append(term)
         rejection_term = loss_info.get('loss_rejection_weighted')
         if torch.is_tensor(rejection_term) and rejection_term.requires_grad:
             names.append('rejection')

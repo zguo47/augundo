@@ -143,6 +143,8 @@ class DepthCompletionDebug(StageDiagnostics):
                      os.path.join(root, 'train_depth_completion.py'),
                      os.path.abspath('utils/src/eval_utils.py'),
                      os.path.abspath('utils/src/loss_utils.py'),
+                     os.path.abspath('utils/src/geometry_losses.py'),
+                     os.path.abspath('utils/src/geometry_alignment.py'),
                      os.path.abspath('utils/src/data_utils.py')]:
             with open(path, 'rb') as stream:
                 sources[os.path.abspath(path)] = hashlib.sha256(stream.read()).hexdigest()

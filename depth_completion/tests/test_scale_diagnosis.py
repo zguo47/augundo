@@ -432,6 +432,28 @@ class DiagnosisTest(unittest.TestCase):
                 self.assertEqual(provenance['arguments']['separation_levels'], [0, 4])
                 self.assertEqual(len(summary['null_controls']), 4)
 
+            arguments[arguments.index('--output') + 1] = str(root / 'geometry')
+            arguments[arguments.index('--suite') + 1] = 'geometry'
+            camera = np.array([[20., 0., 12.], [0., 20., 8.], [0., 0., 1.]], dtype=np.float32)
+            np.save(str(root / 'camera.npy'), camera)
+            (root / 'camera.txt').write_text(str(root / 'camera.npy') + '\n')
+            arguments += ['--intrinsics_path', str(root / 'camera.txt'), '--w_si', '0', '--w_affine', '1']
+            from utils.src.geometry_losses import affine_invariant_loss
+            def small_fit(z, g, m, k):
+                return affine_invariant_loss(z, g, m, k, resolution=4)
+            with patch.object(sys, 'argv', arguments), \
+                    patch.object(diagnostic.loss_utils, 'affine_invariant_loss', side_effect=small_fit):
+                diagnostic.main()
+            with zipfile.ZipFile(root / 'geometry.zip') as bundle:
+                summary = json.loads(bundle.read('geometry/geometry_summary.json'))
+                self.assertEqual(len(summary['levels']), 5)
+                self.assertGreater(summary['final']['count_including_seed_repeats'], 0)
+                provenance = json.loads(bundle.read('geometry/provenance.json'))
+                self.assertIn('intrinsics_list_sha256', provenance)
+                rows = [json.loads(line) for line in bundle.read('geometry/diagnostics.jsonl').splitlines()]
+                self.assertEqual(sum(r['type'] == 'geometry_level' for r in rows), 5)
+                self.assertIn('geometry/sources/geometry_losses.py', bundle.namelist())
+
 
 if __name__ == '__main__':
     unittest.main()

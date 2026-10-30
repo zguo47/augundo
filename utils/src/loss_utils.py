@@ -1,4 +1,5 @@
 import torch
+from .geometry_losses import scale_aligned_l1, affine_invariant_loss
 
 
 EPSILON = 1e-8
